@@ -120,7 +120,10 @@ STAGES = ("U", "Q", "UG", "RQ", "DOWN")
 FOLD_RQ = os.environ.get("LAGUNA_FOLD_RQ", "1") == "1"
 # MID scales as bytes, a DOWN lane's MGROUPS / 8 groups adjacent: one scale load an expert instead of
 # MGROUPS / 8 (ATT, TP4 M8: DOWN is buffer_load issue-bound, 16 loads an expert a lane for 160 B)
-MS_PACK = os.environ.get("LAGUNA_MS_PACK", "1") == "1"  # TP4 M8 DOWN 183 -> 161 us, TP8 95 -> 90
+MS_PACK = os.environ.get("LAGUNA_MS_PACK", "1") == "1"
+# W2 scales: aiter's shuffle_scale dword holds rows (r, r + 16) x K groups (c, c + 4) = a DOWN lane's
+# groups j, j + 1 (j even): one dword load a pair instead of one a group (routed experts only)
+W2S_PAIR = os.environ.get("LAGUNA_W2S_PAIR", "1") == "1"  # bit-identical; DOWN TP4 M8 160 -> 158 us  # TP4 M8 DOWN 183 -> 161 us, TP8 95 -> 90
 
 
 def _ms_pos(grp):
@@ -446,7 +449,15 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
                 dsp = s2
             # weights: nontemporal (as aiter's b_nt), streamed once a step: -6..7 % at M 4..16
             dww = [fx.Vector(bo.buffer_load(rsrc(dbase), dwi[q], vec_width=4, dtype=T.i32, cache_modifier=CM_NT)) for q in range(DNG)]
-            dsc = [_byte(dsp, dsi[q]) for q in range(DNG)]
+            if const_expr(W2S_PAIR and not shared):
+                # dsi[q] = scale_index(row, g): byte a (row // 16 % 2) of g's dword for j even, 2 + a for j + 1
+                d_a = (d_row // 16) % 2
+                dsc = []
+                for q in range_constexpr(0, DNG, 2):
+                    d_sw = fx.Int32(bo.buffer_load(rsrc(dsp), dsi[q] // 4, vec_width=1, dtype=T.i32))
+                    dsc += [(d_sw >> (d_a * 8)) & fx.Int32(0xFF), (d_sw >> ((2 + d_a) * 8)) & fx.Int32(0xFF)]
+            else:
+                dsc = [_byte(dsp, dsi[q]) for q in range(DNG)]
             # only lanes whose token is routed to this expert read its mid (the rest: zero)
             don = d_col_ok & (((dm >> d_col) & fx.Int32(1)) != fx.Int32(0))
             dmv = [fx.Vector(bo.buffer_load(
@@ -517,6 +528,7 @@ def build_routed(tokens: int, upto: str = "DOWN", shared: bool = False):
         INTER,
         FOLD_RQ,
         MS_PACK,
+        W2S_PAIR,
         os.environ.get("LAGUNA_DN_BATCH", "4"),
         upto,
         shared,
