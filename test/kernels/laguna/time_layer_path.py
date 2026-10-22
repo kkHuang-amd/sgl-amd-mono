@@ -42,7 +42,8 @@ scr = [torch.zeros(layer.SCRATCH_BYTES // 4, dtype=torch.int32, device=dev) for 
 P = lambda t: t.data_ptr()
 cs = torch.cuda.current_stream
 # program order of the marks (layer.py 0-6, routed.py 7-12)
-ORDER = [(0, "start"), (1, "S1 seam"), (2, "xf sync"), (3, "S2 logits+push, S4 Q/GU"), (4, "topk, S4 GR/RQ, rt sync"),
+ORDER = [(0, "start"), (1, "S1 seam"), (2, "xf sync"), (3, "S2 logits+push, S4 Q/GU"),
+         (13, "logits in (topk CTAs)"), (14, "topk (topk CTAs)"), (15, "rt put, S4 GR/RQ"), (4, "rt wait"),
          (7, "S3 U"), (8, "S3 Q"), (9, "S3 qf wait"), (10, "S3 UG"), (11, "S3 rf wait"), (12, "S3 DOWN"),
          (5, "S3 out, S4 DOWN, barrier"), (6, "S5 seam")]
 
@@ -74,11 +75,13 @@ for m in widths:
     mid = range(1, L - 1)
     med = torch.zeros(len(ORDER), dtype=torch.float64); mx = torch.zeros(len(ORDER), dtype=torch.float64)
     gap = 0.0
+    cta0 = torch.zeros(len(ORDER), dtype=torch.float64)  # CTA 0 (a topk CTA) on its own
     for l in mid:
         t0 = marks[l][:, 0].min()
         rel = (marks[l] - t0).double() / 100.0  # 100 MHz -> us
         for j, (i, _) in enumerate(ORDER):
             med[j] += rel[:, i].median() / len(mid); mx[j] += rel[:, i].max() / len(mid)
+            cta0[j] += rel[0, i] / len(mid)
         gap += float(t0 - marks[l - 1][:, 6].max()) / 100.0 / len(mid)
     tot = torch.tensor([mx[-1].item()], device=dev); allt = [torch.zeros_like(tot) for _ in range(ws)]
     dist.all_gather(allt, tot)
@@ -96,4 +99,7 @@ for m in widths:
                     line.append(f"{name} +{md[j] - pm:.1f}/+{mm[j] - pM:.1f}")
                 pm, pM = md[j], mm[j]
             print(f"  rank {r} (median CTA / last CTA, us): " + " | ".join(line), flush=True)
+        c0 = cta0.tolist()
+        print("  rank 0 CTA 0: " + " | ".join(f"{name} +{c0[j] - c0[j - 1]:.1f}" for j, (_, name) in enumerate(ORDER) if j),
+              flush=True)
 dist.barrier(); pf.close()

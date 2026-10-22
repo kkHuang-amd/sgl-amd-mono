@@ -15,6 +15,8 @@ One launch, BLOCKS CTAs x THREADS threads:
     topk  : CTA t < tokens, wave 0: the token's 512 logits, 16 rounds of a wave max
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
@@ -22,7 +24,10 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common import guard
-from sgl_amd_mono.common.ops import bf2_f32, butterfly, hw_exp2, hw_rcp, load_ptr64, rsrc, uniform
+from sgl_amd_mono.common.ops import (
+    bf2_f32, bpermute_i32, butterfly, hw_exp2, hw_rcp, load_ptr64, read_lane_i32, rsrc, uniform, wave_umax,
+    write_lane_i32,
+)
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, kernel_sources
 from sgl_amd_mono.common.sync import Mailbox, preg, sreg
 
@@ -39,6 +44,14 @@ LOG2E = 1.4426950408889634
 
 
 STAGES = ("part", "push", "topk")
+# top-16 with ordered u32 keys: each lane presorts its 8 (key desc, id asc), a round = 2 wave u32 maxima
+# (key, then lowest id) + a shift of the winner's list; the picks' activations gathered once at the end
+# (the 3 butterflies a round cost ~7 us a layer on the critical path, fused layer TP8 M1-16)
+TOPK_FAST = os.environ.get("LAGUNA_TOPK_FAST", "1") == "1"  # bit-exact; layer TP8 / TP4 -4..-6 us
+ENV_KEY = (TOPK_FAST,)  # for the fused layer's kernel cache key
+# Batcher's odd-even merge sort, 8 inputs (19 compare-exchanges)
+_SORT8 = ((0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7), (1, 2), (5, 6), (0, 4), (1, 5), (2, 6),
+          (3, 7), (2, 4), (3, 5), (1, 2), (3, 4), (5, 6))
 
 
 def local_experts(npes: int) -> int:
@@ -74,6 +87,7 @@ def emit_router(ctx, args, npes, tokens, stages=STAGES, in_cm=0, out_cm=0):
     W = npes
     EL = local_experts(W)
     tid, bid, lane, wave, box, part = (ctx[n] for n in ("tid", "bid", "lane", "wave", "box", "rpart"))
+    mark = ctx.get("mark", lambda i: None)  # the fused layer's prof build: per-CTA time marks
     x, weight, bias, ids_out, wts_out = (args[n] for n in ("x", "weight", "bias", "ids_out", "wts_out"))
     peers, rank = args["peers"], args["rank"]
     box["pq"] = sreg(args["scratch"], 0, "pq")
@@ -129,6 +143,7 @@ def emit_router(ctx, args, npes, tokens, stages=STAGES, in_cm=0, out_cm=0):
         if (bid < tokens) & (wave == 0):
             li = fx.Int32(lane)
             got2 = box["mb"].poll([(box["lg"], bid * EXPERTS + lane + 64 * j, 1) for j in range(PER_LANE)])
+            mark(13)  # every rank's logits are in
             act = []
             key = []
             for j in range_constexpr(PER_LANE):
@@ -137,33 +152,69 @@ def emit_router(ctx, args, npes, tokens, stages=STAGES, in_cm=0, out_cm=0):
                 bv = fx.Float32(bo.buffer_load(rsrc(bias), lane + 64 * j, vec_width=1, dtype=T.f32))
                 act.append(av)
                 key.append(av + bv)
-            neg = fx.Float32(-3.0e38)
-            tsum = fx.Float32(0.0)
-            pick_id = []
-            pick_w = []
-            for r in range_constexpr(TOPK):
-                m = key[0]
-                for j in range_constexpr(1, PER_LANE):
-                    m = _max(m, key[j])
-                m = butterfly(m, (32, 16, 8, 4, 2, 1), _max)
-                cand = fx.Int32(1 << 30)
+            if const_expr(TOPK_FAST):
+                assert PER_LANE == 8 and TOPK <= 64
+                ks, ids = [], [li + 64 * j for j in range(PER_LANE)]
                 for j in range_constexpr(PER_LANE):
-                    cand = _min_i(cand, (key[j] == m).select(li + 64 * j, fx.Int32(1 << 30)))
-                win = butterfly(cand, (32, 16, 8, 4, 2, 1), _min_i)
-                wa = neg
-                for j in range_constexpr(PER_LANE):
-                    hit = (li + 64 * j) == win
-                    wa = _max(wa, hit.select(act[j], neg))
-                    key[j] = hit.select(neg, key[j])
-                wa = butterfly(wa, (32, 16, 8, 4, 2, 1), _max)
-                pick_id.append(win)
-                pick_w.append(wa)
-                tsum = tsum + wa
-            inv = fx.Float32(1.0) / (tsum + fx.Float32(1e-20))
-            if lane == 0:
+                    kb = key[j].bitcast(fx.Int32)
+                    ks.append(fx.Uint32((kb >= 0).select(kb ^ fx.Int32(-(2**31)), ~kb)))
+                for a, b in _SORT8:
+                    first = (ks[a] > ks[b]) | ((ks[a] == ks[b]) & (ids[a] < ids[b]))
+                    ka, kb2, ia, ib = ks[a], ks[b], ids[a], ids[b]
+                    ks[a], ks[b] = first.select(ka, kb2), first.select(kb2, ka)
+                    ids[a], ids[b] = first.select(ia, ib), first.select(ib, ia)
+                ks = [fx.Int32(k) for k in ks] + [fx.Int32(0)]  # 0: below every key
+                ids = ids + [fx.Int32(EXPERTS)]
+                mv = fx.Int32(0)  # lane r: the expert of pick r
                 for r in range_constexpr(TOPK):
-                    bo.buffer_store(fx.Int32(pick_id[r]), rsrc(ids_out), bid * TOPK + r, cache_modifier=out_cm)
-                    bo.buffer_store(fx.Float32(pick_w[r] * inv), rsrc(wts_out), bid * TOPK + r, cache_modifier=out_cm)
+                    m = wave_umax(ks[0])
+                    win = fx.Int32(1023) - wave_umax((ks[0] == m).select(fx.Int32(1023) - ids[0], fx.Int32(0)))
+                    hit = (ks[0] == m) & (ids[0] == win)
+                    ks = [hit.select(ks[i + 1], ks[i]) for i in range(PER_LANE)] + [ks[PER_LANE]]
+                    ids = [hit.select(ids[i + 1], ids[i]) for i in range(PER_LANE)] + [ids[PER_LANE]]
+                    mv = write_lane_i32(win, r, mv)
+                e = mv
+                got = [bpermute_i32((e % 64) * 4, act[j].bitcast(fx.Int32)) for j in range(PER_LANE)]
+                aw = got[0]
+                for j in range_constexpr(1, PER_LANE):
+                    aw = (e // 64 == j).select(got[j], aw)
+                tsum = fx.Float32(0.0)
+                for r in range_constexpr(TOPK):  # in pick order, as the reference
+                    tsum = tsum + read_lane_i32(aw, r).bitcast(fx.Float32)
+                inv = fx.Float32(1.0) / (tsum + fx.Float32(1e-20))
+                if li < TOPK:
+                    bo.buffer_store(e, rsrc(ids_out), bid * TOPK + li, cache_modifier=out_cm)
+                    bo.buffer_store(aw.bitcast(fx.Float32) * inv, rsrc(wts_out), bid * TOPK + li, cache_modifier=out_cm)
+                mark(14)
+            else:
+                neg = fx.Float32(-3.0e38)
+                tsum = fx.Float32(0.0)
+                pick_id = []
+                pick_w = []
+                for r in range_constexpr(TOPK):
+                    m = key[0]
+                    for j in range_constexpr(1, PER_LANE):
+                        m = _max(m, key[j])
+                    m = butterfly(m, (32, 16, 8, 4, 2, 1), _max)
+                    cand = fx.Int32(1 << 30)
+                    for j in range_constexpr(PER_LANE):
+                        cand = _min_i(cand, (key[j] == m).select(li + 64 * j, fx.Int32(1 << 30)))
+                    win = butterfly(cand, (32, 16, 8, 4, 2, 1), _min_i)
+                    wa = neg
+                    for j in range_constexpr(PER_LANE):
+                        hit = (li + 64 * j) == win
+                        wa = _max(wa, hit.select(act[j], neg))
+                        key[j] = hit.select(neg, key[j])
+                    wa = butterfly(wa, (32, 16, 8, 4, 2, 1), _max)
+                    pick_id.append(win)
+                    pick_w.append(wa)
+                    tsum = tsum + wa
+                inv = fx.Float32(1.0) / (tsum + fx.Float32(1e-20))
+                if lane == 0:
+                    for r in range_constexpr(TOPK):
+                        bo.buffer_store(fx.Int32(pick_id[r]), rsrc(ids_out), bid * TOPK + r, cache_modifier=out_cm)
+                        bo.buffer_store(fx.Float32(pick_w[r] * inv), rsrc(wts_out), bid * TOPK + r, cache_modifier=out_cm)
+                mark(14)
 
 
 def build_router_tp(npes: int, tokens: int):
@@ -171,7 +222,7 @@ def build_router_tp(npes: int, tokens: int):
     assert BLOCKS % EL == 0 and HIDDEN // (BLOCKS // EL) // WAVES % 512 == 0, "local experts x K parts = one CTA each"
     assert 1 <= tokens <= MAX_TOKENS
     W = npes
-    keyed = (W, tokens, kernel_sources(__name__), kernel_sources(guard.__name__))
+    keyed = (W, tokens, TOPK_FAST, kernel_sources(__name__), kernel_sources(guard.__name__))
     name = f"laguna_router_tp{W}_t{tokens}"
 
     @fx.struct

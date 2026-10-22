@@ -135,6 +135,9 @@ def _xs_pos(g):
 
 UGS_PAIR = os.environ.get("LAGUNA_UGS_PAIR", "1") == "1"  # the same for UG's W13 scales (routed experts): TP4 M8 UG 324 -> 317 us
 W2S_PAIR = os.environ.get("LAGUNA_W2S_PAIR", "1") == "1"  # bit-identical; DOWN TP4 M8 160 -> 158 us  # TP4 M8 DOWN 183 -> 161 us, TP8 95 -> 90
+# every env switch above: the fused layer's kernel cache key must carry them (its key has the module
+# sources, not the env, and the binary cache outlives the process)
+ENV_KEY = (FOLD_RQ, MS_PACK, XS_PACK, UGS_PAIR, W2S_PAIR, os.environ.get("LAGUNA_DN_BATCH", "4"))
 
 
 def _ms_pos(grp):

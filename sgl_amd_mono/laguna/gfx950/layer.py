@@ -84,7 +84,7 @@ def build_layer(npes: int, tokens: int, eps: float, prof: bool = False):
     LG, FLAGS, _ = peer_layout(W)
     U = routed.U_MAX
     keyed = (
-        W, tokens, eps, prof, routed.INTER, Q_EARLY,
+        W, tokens, eps, prof, routed.INTER, Q_EARLY, routed.ENV_KEY, router_tp.ENV_KEY, seam.ENV_KEY,
         kernel_sources(__name__), kernel_sources(seam.__name__), kernel_sources(router_tp.__name__),
         kernel_sources(routed.__name__), kernel_sources(shared.__name__), kernel_sources(mxq.__name__), kernel_sources(guard.__name__),
     )
@@ -181,6 +181,7 @@ def build_layer(npes: int, tokens: int, eps: float, prof: bool = False):
             if (bid < tokens) & (tid == 0):
                 box["mb"].put(box["rt"], bid, fx.Int32(1))
             shared.emit_shared(ctx, sh_args, tokens, ("GR", "RQ"))
+            mark(15)
             if tid < tokens:
                 box["mb"].poll([(box["rt"], tid, 1)])
             gpu.barrier()

@@ -77,6 +77,7 @@ def ag_offset(npes: int) -> int:
 # rank (all-gather): ~4x fewer xGMI bytes than one-shot (every partial to every rank), one
 # more hop. Same sums, same rounding: bit-identical results.
 TWO_SHOT_MIN = int(os.environ.get("LAGUNA_SEAM_TWO_SHOT_MIN", "2"))  # seam M1-16: 8.0/10.2/13.1/19.2/32.9 -> 8.5/9.2/10.9/13.9/20.6 us
+ENV_KEY = (TWO_SHOT_MIN,)  # for the fused layer's kernel cache key
 
 
 def peer_bytes(npes: int) -> int:
