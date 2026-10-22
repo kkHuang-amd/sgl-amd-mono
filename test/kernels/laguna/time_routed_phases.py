@@ -36,6 +36,6 @@ for m in widths:
         t[skip] = s.elapsed_time(e) * 1e3 / 30
     nu = int(torch.unique(ids).numel())
     ug, dn = t[0] - t[1], t[0] - t[2]
-    print(f"M={m:2d} union={nu}: full {t[0]:.1f} | UG {ug:.1f} us ({nu * 8.65e6 / ug / 1e6:.2f} TB/s) | "
-          f"DOWN {dn:.1f} us ({nu * 4.33e6 / dn / 1e6:.2f} TB/s) | rest {t[3]:.1f} us | UG tails {t[0] - t[4]:.1f} us",
+    print(f"M={m:2d} union={nu}: full {t[0]:.1f} | UG {ug:.1f} us ({nu * 8.65e6 * routed.INTER / 512 / ug / 1e6:.2f} TB/s) | "
+          f"DOWN {dn:.1f} us ({nu * 4.33e6 * routed.INTER / 512 / dn / 1e6:.2f} TB/s) | rest {t[3]:.1f} us | UG tails {t[0] - t[4]:.1f} us",
           flush=True)
