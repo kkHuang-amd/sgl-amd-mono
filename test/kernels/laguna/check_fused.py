@@ -9,7 +9,8 @@ ap.add_argument("--replays", type=int, default=30)
 a = ap.parse_args()
 sys.path.insert(0, "/workspace/claude-skills/proxy-moe/scripts")
 import ep_moe_check as E  # noqa: E402
-E.I, E.E_LOCAL = 512, 512
+from sgl_amd_mono.laguna import INTER_TOTAL, TP  # noqa: E402
+E.I, E.E_LOCAL = INTER_TOTAL // TP, 512
 from aiter import ActivationType, QuantType  # noqa: E402
 from aiter.fused_moe import fused_moe  # noqa: E402
 from aiter.ops.flydsl.moe_common import GateMode  # noqa: E402

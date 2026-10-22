@@ -15,7 +15,8 @@ torch.cuda.set_device(rank); dev = torch.device("cuda", rank)
 dist.init_process_group("nccl", device_id=dev); gloo = dist.new_group(backend="gloo")
 sys.path.insert(0, "/workspace/claude-skills/proxy-moe/scripts")
 import ep_moe_check as E  # noqa: E402
-E.I, E.E_LOCAL = 512, 512
+from sgl_amd_mono.laguna import INTER_TOTAL, TP  # noqa: E402
+E.I, E.E_LOCAL = INTER_TOTAL // TP, 512
 from sgl_amd_mono.common import guard  # noqa: E402
 from sgl_amd_mono.common.peer import PeerBuffer  # noqa: E402
 from sgl_amd_mono.laguna.gfx950 import layer, routed, router_tp, seam, shared  # noqa: E402

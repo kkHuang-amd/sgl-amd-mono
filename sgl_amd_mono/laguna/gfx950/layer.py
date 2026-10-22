@@ -73,12 +73,12 @@ SCRATCH_BYTES = PROF + BLOCKS * MARKS * 8
 def build_layer(npes: int, tokens: int, eps: float, prof: bool = False):
     """The FFN launch for ``tokens`` rows at TP ``npes``; ``eps`` of both norms. ``prof``: CTA b's
     thread 0 stores the clock at the stage boundaries to PROF[b][0..6] (a timing aid)."""
-    assert npes == WAVES and 1 <= tokens <= MAX_TOKENS
+    assert WAVES % npes == 0 and 1 <= tokens <= MAX_TOKENS
     W = npes
     LG, FLAGS, _ = peer_layout(W)
     U = routed.U_MAX
     keyed = (
-        W, tokens, eps, prof,
+        W, tokens, eps, prof, routed.INTER,
         kernel_sources(__name__), kernel_sources(seam.__name__), kernel_sources(router_tp.__name__),
         kernel_sources(routed.__name__), kernel_sources(shared.__name__), kernel_sources(mxq.__name__), kernel_sources(guard.__name__),
     )

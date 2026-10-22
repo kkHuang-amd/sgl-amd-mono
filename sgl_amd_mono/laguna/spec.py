@@ -82,8 +82,8 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         "hidden_size": 16384,
         "num_experts": 512,
         "num_experts_per_tok": 16,
-        "moe_intermediate_size": 512 * TP,
-        "shared_expert_intermediate_size": 512 * TP,
+        "moe_intermediate_size": 4096,
+        "shared_expert_intermediate_size": 4096,
         "hidden_act": "silu",
     }
     # the proxy checkpoint's config.json has null here: SGLang's Laguna router is sigmoid then

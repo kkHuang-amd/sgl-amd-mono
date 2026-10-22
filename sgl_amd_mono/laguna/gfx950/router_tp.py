@@ -80,21 +80,27 @@ def emit_router(ctx, args, npes, tokens, stages=STAGES, in_cm=0, out_cm=0):
     lg_off = args.get("lg_off", 0)
     box["lg"] = preg(args["sym"], lg_off, "lg")
 
-    el = bid // QUARTERS
-    q = bid % QUARTERS
+    QW = BLOCKS // EL  # K parts an expert: 4 at TP8 (64 local experts), 2 at TP4 (128)
+    KQW = HIDDEN // QW
+    KWW = KQW // WAVES
+    el = bid // QW
+    q = bid % QW
 
     if const_expr("part" in stages):
         # part: local expert el, quarter q
-        kk = q * KQ + wave * KW + lane * 8
-        w0 = fx.Vector(bo.buffer_load(rsrc(weight), el * HIDDEN + kk, vec_width=4, dtype=T.f32))
-        w1 = fx.Vector(bo.buffer_load(rsrc(weight), el * HIDDEN + kk + 4, vec_width=4, dtype=T.f32))
-        wv = [fx.Float32(w0[i]) for i in range(4)] + [fx.Float32(w1[i]) for i in range(4)]
+        kks = [q * KQW + wave * KWW + c * 512 + lane * 8 for c in range(KWW // 512)]  # 8 elements a lane a chunk
+        wv = []
+        for kk in kks:
+            w0 = fx.Vector(bo.buffer_load(rsrc(weight), el * HIDDEN + kk, vec_width=4, dtype=T.f32))
+            w1 = fx.Vector(bo.buffer_load(rsrc(weight), el * HIDDEN + kk + 4, vec_width=4, dtype=T.f32))
+            wv += [fx.Float32(w0[i]) for i in range(4)] + [fx.Float32(w1[i]) for i in range(4)]
         for t in range_constexpr(tokens):
-            xv = fx.Vector(bo.buffer_load(rsrc(x), (t * HIDDEN + kk) // 2, vec_width=4, dtype=T.i32, cache_modifier=in_cm))
             a = fx.Float32(0.0)
-            for i in range_constexpr(4):
-                lo, hi = bf2_f32(fx.Int32(xv[i]))
-                a = a + lo * wv[2 * i] + hi * wv[2 * i + 1]
+            for c, kk in enumerate(kks):
+                xv = fx.Vector(bo.buffer_load(rsrc(x), (t * HIDDEN + kk) // 2, vec_width=4, dtype=T.i32, cache_modifier=in_cm))
+                for i in range_constexpr(4):
+                    lo, hi = bf2_f32(fx.Int32(xv[i]))
+                    a = a + lo * wv[8 * c + 2 * i] + hi * wv[8 * c + 2 * i + 1]
             a = butterfly(a, (32, 16, 8, 4, 2, 1))
             if lane == 0:
                 fx.ptr_store(a, part + wave * MAX_TOKENS + t)
@@ -103,18 +109,18 @@ def emit_router(ctx, args, npes, tokens, stages=STAGES, in_cm=0, out_cm=0):
             tot = fx.ptr_load(part + tid)
             for w in range_constexpr(1, WAVES):
                 tot = tot + fx.ptr_load(part + w * MAX_TOKENS + tid)
-            box["mb"].put(box["pq"], (tid * EL + el) * QUARTERS + q, tot)
+            box["mb"].put(box["pq"], (tid * EL + el) * QW + q, tot)
 
     if const_expr("push" in stages):
         # push: quarter-0 CTAs; wave = peer (the peer table is read wave-uniform), lane = token
-        assert WAVES == W
+        assert WAVES % W == 0
         pt = lane % tokens
-        box["dst"] = preg(load_ptr64(peers, wave), lg_off, "lg")
-        if q == 0:
+        box["dst"] = preg(load_ptr64(peers, fx.Int32(wave) % W), lg_off, "lg")
+        if (q == 0) & (wave < W):
             if lane < tokens:
-                got = box["mb"].poll([(box["pq"], (pt * EL + el) * QUARTERS + qq, 1) for qq in range(QUARTERS)])
+                got = box["mb"].poll([(box["pq"], (pt * EL + el) * QW + qq, 1) for qq in range(QW)])
                 lgt = got[0][0].bitcast(fx.Float32)
-                for qq in range_constexpr(1, QUARTERS):
+                for qq in range_constexpr(1, QW):
                     lgt = lgt + got[qq][0].bitcast(fx.Float32)
                 box["mb"].put(box["dst"], pt * EXPERTS + rank * EL + el, lgt)
 
@@ -162,7 +168,7 @@ def emit_router(ctx, args, npes, tokens, stages=STAGES, in_cm=0, out_cm=0):
 
 def build_router_tp(npes: int, tokens: int):
     EL = local_experts(npes)
-    assert EL * QUARTERS == BLOCKS, "TP8: 64 local experts x 4 quarters = one CTA each"
+    assert BLOCKS % EL == 0 and HIDDEN // (BLOCKS // EL) // WAVES % 512 == 0, "local experts x K parts = one CTA each"
     assert 1 <= tokens <= MAX_TOKENS
     W = npes
     keyed = (W, tokens, kernel_sources(__name__), kernel_sources(guard.__name__))

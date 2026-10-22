@@ -36,11 +36,12 @@ from sgl_amd_mono.common.ops import (
 )
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, kernel_sources
 from sgl_amd_mono.common.sync import Mailbox, sreg
+from sgl_amd_mono.laguna import INTER_TOTAL, TP
 from sgl_amd_mono.laguna.gfx950 import mxq
 from sgl_amd_mono.laguna.gfx950.mxq import decode_word, pow2, quant_group
 
 HIDDEN = 16384
-INTER = 512
+INTER = INTER_TOTAL // TP  # per rank: 512 at TP8, 1024 at TP4
 EXPERTS = 512
 TOPK = 16
 MAX_TOKENS = 16
@@ -52,7 +53,7 @@ MGROUPS = INTER // 32
 W13_BYTES = 2 * INTER * HIDDEN // 2  # one expert
 W2_BYTES = HIDDEN * INTER // 2
 LOG2E = 1.4426950408889634
-assert EXPERTS == THREADS and GROUPS == THREADS and 2 * BLOCKS == INTER
+assert EXPERTS == THREADS and GROUPS == THREADS and MGROUPS % 8 == 0
 
 # scratch layout (bytes)
 XQ = 0
@@ -404,7 +405,8 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
         d_ni = lane % 16
         d_sub = lane // 16
         d_row = bid * 64 + (wave // 2) * 16 + d_ni
-        d_gis = [(wave % 2) * 8 + d_j * 4 + d_sub for d_j in range(2)]
+        DNG = MGROUPS // 8  # MFMA K steps a wave an expert (2 at TP8, 4 at TP4)
+        d_gis = [(wave % 2) * (MGROUPS // 2) + d_j * 4 + d_sub for d_j in range(DNG)]
         d_col = fx.min(d_ni, fx.Int32(tokens - 1))
         d_col_ok = d_ni < tokens
         d_zero4 = fx.Vector.filled(4, 0, fx.Int32)
@@ -425,8 +427,8 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
                 dbase = w2 + fx.Int64(de) * W2_BYTES
                 dsp = s2
             # weights: nontemporal (as aiter's b_nt), streamed once a step: -6..7 % at M 4..16
-            dww = [fx.Vector(bo.buffer_load(rsrc(dbase), dwi[q], vec_width=4, dtype=T.i32, cache_modifier=CM_NT)) for q in range(2)]
-            dsc = [_byte(dsp, dsi[q]) for q in range(2)]
+            dww = [fx.Vector(bo.buffer_load(rsrc(dbase), dwi[q], vec_width=4, dtype=T.i32, cache_modifier=CM_NT)) for q in range(DNG)]
+            dsc = [_byte(dsp, dsi[q]) for q in range(DNG)]
             # only lanes whose token is routed to this expert read its mid (the rest: zero)
             don = d_col_ok & (((dm >> d_col) & fx.Int32(1)) != fx.Int32(0))
             dmv = [fx.Vector(bo.buffer_load(
@@ -440,7 +442,7 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
         d_acc = fx.Vector.filled(4, 0.0, fx.Float32)
         # BATCH experts an iteration, all of their loads issued before any of their math
         # (straight-line code: no loop-carried loads for the wait analysis to drain)
-        BATCH = 4
+        BATCH = 4 if DNG == 2 else 2  # the same weight bytes in flight a lane at TP8 and TP4
         d_nu = ((skip & fx.Int32(2)) == fx.Int32(0)).select(nu, fx.Int32(0))  # timing aid
         for d_ub in range(0, d_nu, BATCH):
             d_ld = [d_load(d_ub + d_k) for d_k in range(BATCH)]
@@ -450,9 +452,9 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
                 d_live = (d_ub + d_k) < d_nu
                 d_on = d_live & d_col_ok & (((d_m >> d_col) & fx.Int32(1)) != fx.Int32(0))
                 d_cc = fx.Vector.filled(4, 0.0, fx.Float32)
-                for d_j in range_constexpr(2):
-                    d_cc = mfma_scaled(d_cur[2 + d_j], d_on.select(d_cur[6 + d_j], d_zero4), d_cc, d_cur[4 + d_j],
-                                       d_on.select(d_cur[8 + d_j], fx.Int32(127)), FP4, FP4)
+                for d_j in range_constexpr(DNG):
+                    d_cc = mfma_scaled(d_cur[2 + d_j], d_on.select(d_cur[2 + 2 * DNG + d_j], d_zero4), d_cc,
+                                       d_cur[2 + DNG + d_j], d_on.select(d_cur[2 + 3 * DNG + d_j], fx.Int32(127)), FP4, FP4)
                 d_wt = d_on.select(fx.ptr_load(uw + fx.min(d_ub + d_k, nu - 1) * MAX_TOKENS + d_col),
                                    fx.Float32(0.0))
                 d_acc = fx.Vector.from_elements(
@@ -487,6 +489,7 @@ def build_routed(tokens: int, upto: str = "DOWN", shared: bool = False):
     last = STAGES.index(upto)
     keyed = (
         tokens,
+        INTER,
         FOLD_RQ,
         os.environ.get("LAGUNA_DN_BATCH", "4"),
         upto,

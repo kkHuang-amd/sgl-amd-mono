@@ -29,17 +29,18 @@ from sgl_amd_mono.common.mx import FP4, mfma_scaled
 from sgl_amd_mono.common.ops import CM_DEV, bf2_f32, bf16_round, hw_exp2, hw_rcp, rsrc, uniform
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, kernel_sources
 from sgl_amd_mono.common.sync import Mailbox, sreg
+from sgl_amd_mono.laguna import INTER_TOTAL, TP
 from sgl_amd_mono.laguna.gfx950 import mxq
 from sgl_amd_mono.laguna.gfx950.mxq import decode_word, pow2, quant_group
 
 HIDDEN = 16384
-INTER = 512  # shared expert inter per rank (TP8)
+INTER = INTER_TOTAL // TP  # shared expert inter per rank: 512 at TP8, 1024 at TP4
 MAX_TOKENS = 16
 LAYER_SLOTS = 64
 GROUPS = HIDDEN // 32  # 512 K groups of x
 MGROUPS = INTER // 32  # 16 groups of MID
 LOG2E = 1.4426950408889634
-assert 2 * BLOCKS == INTER and GROUPS == THREADS and HIDDEN == 64 * BLOCKS
+assert BLOCKS % (INTER // 16) == 0 and MGROUPS % 8 == 0 and GROUPS == THREADS and HIDDEN == 64 * BLOCKS
 
 # scratch layout (bytes)
 XQ = 0
@@ -47,7 +48,9 @@ XS = XQ + MAX_TOKENS * HIDDEN // 2
 MID = XS + MAX_TOKENS * GROUPS * 4
 MQ = MID + MAX_TOKENS * INTER * 2
 MS = MQ + MAX_TOKENS * INTER // 2
-KSLICES = 8  # GU splits K over 8 CTAs a 16-channel block
+KSLICES = BLOCKS // (INTER // 16)  # GU splits K over 8 CTAs a 16-channel block at TP8, 4 at TP4
+KG = GROUPS // KSLICES  # K groups a CTA
+KGW = KG // WAVES  # K groups a wave (two MFMA steps at TP8, four at TP4)
 PART = MS + MAX_TOKENS * MGROUPS * 4  # fp32 [slice][row 1024][token]
 QF = PART + KSLICES * 2 * INTER * MAX_TOKENS * 4  # flags: [token][wave]
 GF = QF + MAX_TOKENS * WAVES * 8  # [CTA]: its K-slice partials are out
@@ -127,8 +130,8 @@ def emit_shared(ctx, args, tokens, stages=STAGES, in_cm=0, out_cm=0):
         grow = [cb * 16 + ni, INTER + cb * 16 + ni]
         cacc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
         ld = []
-        for j in range_constexpr(2):
-            gk = ks * 64 + wave * 8 + j * 4 + sub
+        for j in range_constexpr(KGW // 4):
+            gk = ks * KG + wave * KGW + j * 4 + sub
             ld.append((
                 [fx.Vector(bo.buffer_load(rsrc(w13), (gr * (HIDDEN // 2) + gk * 16) // 4, vec_width=4, dtype=T.i32))
                  for gr in grow],
@@ -138,7 +141,7 @@ def emit_shared(ctx, args, tokens, stages=STAGES, in_cm=0, out_cm=0):
                 fx.Int32(bo.buffer_load(rsrc(scratch), (XS + (col * GROUPS + gk) * 4) // 4, vec_width=1,
                                         dtype=T.i32, cache_modifier=CM_DEV)),
             ))
-        for j in range_constexpr(2):
+        for j in range_constexpr(KGW // 4):
             wv2, ws2, xv, xs = ld[j]
             bv = col_ok.select(xv, zero4)
             bs = col_ok.select(xs, fx.Int32(127))
@@ -197,10 +200,12 @@ def emit_shared(ctx, args, tokens, stages=STAGES, in_cm=0, out_cm=0):
 
     if const_expr("RQ" in stages):
         # ---- RQ: requantize MID group (token, group) = (b // 16, b % 16)
-        if bid < MGROUPS * tokens:
-            t = bid // MGROUPS
-            grp = bid % MGROUPS
-            if wave == 0:
+        # (wave w of CTA b takes task b + 256 w: wave 0 only at TP8; TP4 M > 8 needs wave 1)
+        rq_task = bid + wave * BLOCKS
+        if rq_task < MGROUPS * tokens:
+            t = rq_task // MGROUPS
+            grp = rq_task % MGROUPS
+            if True:
                 box["mb"].poll([(box["hf"], grp * 2 + i, 1) for i in range(2)])
                 if lane == 0:
                     vals = []
@@ -229,8 +234,8 @@ def emit_shared(ctx, args, tokens, stages=STAGES, in_cm=0, out_cm=0):
         gpu.barrier()
         drow = bid * 64 + (wave // 2) * 16 + ni
         dacc = fx.Vector.filled(4, 0.0, fx.Float32)
-        for j in range_constexpr(2):
-            dg = (wave % 2) * 8 + j * 4 + sub
+        for j in range_constexpr(MGROUPS // 8):
+            dg = (wave % 2) * (MGROUPS // 2) + j * 4 + sub
             dw = fx.Vector(bo.buffer_load(rsrc(w2), (drow * (INTER // 2) + dg * 16) // 4, vec_width=4, dtype=T.i32))
             dsc = _byte(s2, drow * MGROUPS + dg)
             dmv = fx.Vector(bo.buffer_load(rsrc(scratch), (MQ + col * (INTER // 2) + dg * 16) // 4, vec_width=4,
@@ -262,6 +267,7 @@ def build_shared(tokens: int):
     assert 1 <= tokens <= MAX_TOKENS
     keyed = (
         tokens,
+        INTER,
         kernel_sources(__name__),
         kernel_sources(mxq.__name__),
         kernel_sources(guard.__name__),
