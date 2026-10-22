@@ -4,11 +4,15 @@
 A routed decode step runs ``_Built.forward``, which takes and returns what
 ``LagunaForCausalLM.forward`` does: the embedding, then per layer SGLang's input
 RMSNorm and attention (o_proj leaves a TP partial) followed by the FFN launch,
-then SGLang's final norm and logits processor. P0: the FFN launch is
-``_ffn_reference``, SGLang's ops in the normal path's order.
+then the logits processor. The FFN launch (``gfx950/layer.py``, one a layer) runs
+from the o_proj partial to the next layer's input norm (or the final norm):
+attention all-reduce, residual, post-attention norm, router, routed + shared
+experts, MoE all-reduce, residual, norm. ``SGLANG_AMD_MONO_LAGUNA_REFERENCE=1``
+runs ``_ffn_reference`` (SGLang's ops in the normal path's order) instead.
 
-``SGLANG_AMD_MONO_CHECK=1`` (eager steps) runs ``_ffn_reference`` on a copy of
-every launch's inputs and logs the largest difference over the layers. Rerunning
+``SGLANG_AMD_MONO_CHECK=1`` (eager steps) runs ``_ffn_reference`` and SGLang's
+norm on a copy of every launch's inputs and logs the largest difference of the
+next layer's input and residual over the layers. Rerunning
 the attention instead is not a usable check: SGLang's own path differs from itself
 by ~3e-2 at the attention output when a decode step is run twice.
 """
@@ -51,6 +55,10 @@ SGLANG_READS = {
         "mlp",
         "norm",
         "layers_to_capture",
+        "routed_scaling_factor",
+        "shared_expert",
+        "gate",
+        "e_score_correction_bias",
         "is_layer_sparse",
         "logits_processor",
         "lm_head",
@@ -69,6 +77,24 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     reasons = []
     if getattr(hf_config, "num_hidden_layers", None) is None:
         reasons.append("no num_hidden_layers in the HF config")
+    # the FFN launch's fixed shape (gfx950/layer.py) and routing
+    want = {
+        "hidden_size": 16384,
+        "num_experts": 512,
+        "num_experts_per_tok": 16,
+        "moe_intermediate_size": 512 * TP,
+        "shared_expert_intermediate_size": 512 * TP,
+        "hidden_act": "silu",
+    }
+    # the proxy checkpoint's config.json has null here: SGLang's Laguna router is sigmoid then
+    if getattr(hf_config, "moe_router_score_func", None) not in (None, "sigmoid"):
+        reasons.append(f"router score {hf_config.moe_router_score_func} (the FFN launch serves sigmoid)")
+    for k, v in want.items():
+        got = getattr(hf_config, k, None)
+        if got != v:
+            reasons.append(f"{k} {got} (the FFN launch serves {v})")
+    if getattr(hf_config, "num_hidden_layers", 0) > 64:
+        reasons.append("more than 64 layers (the launch's mailbox tag slots)")
     return reasons
 
 
@@ -102,14 +128,27 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
         if moe.router_logit_softcapping > 0.0:
             reasons.append(f"layer {i}: router logit softcapping")
             break
+        if moe.routed_scaling_factor != 1.0:
+            reasons.append(f"layer {i}: routed scaling {moe.routed_scaling_factor}")
+            break
+        if getattr(moe.experts, "apply_router_weight_on_input", False):
+            reasons.append(f"layer {i}: router weight applied on the input")
+            break
+        if getattr(moe.shared_expert.gate_up_proj, "dequantized_bf16", False):
+            reasons.append(f"layer {i}: shared expert dequantized to bf16")
+            break
+        eps = {layer.input_layernorm.variance_epsilon, layer.post_attention_layernorm.variance_epsilon}
+        if eps != {m.layers[0].post_attention_layernorm.variance_epsilon}:
+            reasons.append(f"layer {i}: RMSNorm eps {eps} differ")
+            break
     return reasons
 
 
 class _Built:
     """One rank's monokernels and the forward that runs them."""
 
-    def __init__(self, lm):
-        self.lm, self.model = lm, lm.model
+    def __init__(self, lm, rt=None):
+        self.lm, self.model, self.rt = lm, lm.model, rt
         self.check = os.environ.get("SGLANG_AMD_MONO_CHECK", "0") == "1"
         self._checked = 0
 
@@ -130,27 +169,29 @@ class _Built:
             partial = layer.self_attn(
                 positions=positions, hidden_states=x, forward_batch=forward_batch
             )
+            norm = layers[i + 1].input_layernorm if i + 1 < len(layers) else m.norm
             if check:  # the reference sees the launch's exact inputs
                 ref_out, ref_res = _ffn_reference(
                     layer, partial.clone(), residual.clone(), forward_batch
                 )
-            out, residual = self._ffn(layer, partial, residual, forward_batch)
+                ref_x, ref_res = norm(ref_out, ref_res)
+            if self.rt is None:
+                out, residual = _ffn_reference(layer, partial, residual, forward_batch)
+                x, residual = norm(out, residual)
+            else:
+                x, residual = self.rt.launch(i, partial.contiguous(), residual)
             if check:
-                rels.append((_rel(out, ref_out), _rel(residual, ref_res)))
-            norm = layers[i + 1].input_layernorm if i + 1 < len(layers) else m.norm
-            x, residual = norm(out, residual)
+                rels.append((_rel(x, ref_x), _rel(residual, ref_res)))
+        if self.rt is not None:
+            self.rt.advance_step()
         if check and self._checked < 50:
             self._checked += 1
             logger.info(
-                "SGLANG_AMD_MONO_CHECK laguna rows=%d ffn out / residual rel_l2 max over layers %.3e / %.3e",
+                "SGLANG_AMD_MONO_CHECK laguna rows=%d next input / residual rel_l2 max over layers %.3e / %.3e%s",
                 x.shape[0], max(r[0] for r in rels), max(r[1] for r in rels),
+                "" if self.rt is None else f" guard errors {self.rt.errors()}",
             )
         return x
-
-    def _ffn(self, layer, partial, residual, forward_batch):
-        """The FFN launch (P0: the reference)."""
-        return _ffn_reference(layer, partial, residual, forward_batch)
-
 
 def _rel(a, b) -> float:
     return ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-30)).item()
@@ -169,7 +210,21 @@ def _ffn_reference(layer, partial, residual, forward_batch):
 
 
 def _build(model, hf_config, ctx) -> _Built:
-    return _Built(model)
+    if os.environ.get("SGLANG_AMD_MONO_LAGUNA_REFERENCE", "0") == "1":
+        return _Built(model)
+    from sglang.srt.runtime_context import get_parallel
+
+    from sgl_amd_mono.laguna.gfx950.runner import LagunaFfnRuntime
+
+    p = get_parallel()
+    m = model.model
+    device = m.layers[0].input_layernorm.weight.device
+    eps = m.layers[0].post_attention_layernorm.variance_epsilon
+    widths = [w for w in ctx.widths if w <= MAX_ROWS]
+    rt = LagunaFfnRuntime(model, widths, p.tp_size, p.tp_rank, p.tp_group.cpu_group, device, eps, ctx.deadline_s)
+    rt.precompile()
+    logger.info("laguna FFN launch: widths %s, %d layers, deadline %.0f s", widths, len(m.layers), ctx.deadline_s)
+    return _Built(model, rt)
 
 
 SPEC = MonoSpec(
