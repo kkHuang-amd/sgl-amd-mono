@@ -21,6 +21,8 @@ One launch, BLOCKS CTAs x THREADS threads, stages in order:
 
 import os
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
@@ -112,6 +114,9 @@ def _w2_group_index(row, grp):
 
 
 STAGES = ("U", "Q", "UG", "RQ", "DOWN")
+# UG requantizes MID itself (task pairs a CTA): no RQ stage, one grid sync before DOWN
+# (S3 M1/2/4/8/16 50.7/86.8/158.5/268.9/455.2 -> 47.5/82.5/156.7/269.5/447.3 us; LAGUNA_FOLD_RQ=0: old path)
+FOLD_RQ = os.environ.get("LAGUNA_FOLD_RQ", "1") == "1"
 
 
 @flyc.jit
@@ -261,9 +266,21 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
             return [(g_l[6 * g_j:6 * g_j + 2], g_l[6 * g_j + 2:6 * g_j + 4], g_l[6 * g_j + 4], g_l[6 * g_j + 5])
                     for g_j in range(4)]
 
-        _, g_c0, g_e0, g_m0 = g_task_info(bid)
+        def g_map(g_kk):
+            """This CTA's g_kk-th task. FOLD_RQ: the two 16-channel halves of a 32-channel MID
+            group back to back (pairs dealt round-robin), so the CTA requantizes the group itself."""
+            if const_expr(FOLD_RQ):
+                return 2 * ((g_kk // 2) * BLOCKS + bid) + g_kk % 2
+            return bid + g_kk * BLOCKS
+
+        if const_expr(FOLD_RQ):
+            g_nk = 2 * fx.max((g_ntask // 2 - bid + BLOCKS - 1) // BLOCKS, fx.Int32(0))
+        else:
+            g_nk = fx.max((g_ntask - bid + BLOCKS - 1) // BLOCKS, fx.Int32(0))
+        _, g_c0, g_e0, g_m0 = g_task_info(g_map(0))
         g_first = g_quarter_of(g_e0, g_c0, 0, g_m0)  # the first task's first quarter, in flight
-        for g_task in range(bid, g_ntask, BLOCKS):
+        for g_k in range(0, g_nk):
+            g_task = g_map(g_k)
             g_u, g_cb, g_e, g_m = g_task_info(g_task)
             g_base = w13 + fx.Int64(g_e) * W13_BYTES
             g_rows = [g_cb * 16 + g_ni, INTER + g_cb * 16 + g_ni]
@@ -279,7 +296,7 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
                     g_next = g_quarter(g_q + 1)
                 else:
                     # the next task's first quarter goes out before this task's tail
-                    _, g_cn, g_en, g_mn = g_task_info(g_task + BLOCKS)
+                    _, g_cn, g_en, g_mn = g_task_info(g_map(g_k + 1))
                     g_first = g_quarter_of(g_en, g_cn, 0, g_mn)
                 for g_j in range_constexpr(4):
                     g_w, g_ws, g_xv, g_xs = g_ld[g_j]
@@ -291,7 +308,7 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
                 # quarter's loads / waits across the MFMAs (M16 S3 503 -> 456 us)
                 rocdl.sched_barrier(0)
             # C: lane holds rows 4 (lane // 16) + i of column lane % 16 (a token)
-            g_par = (g_task // BLOCKS % 2) * (WAVES * 32 * MAX_TOKENS)
+            g_par = (g_k % 2) * (WAVES * 32 * MAX_TOKENS)
             for g_r in range_constexpr(2):
                 for g_i in range_constexpr(4):
                     fx.ptr_store(
@@ -320,12 +337,33 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
                         fx.Vector.from_elements(g_h2, fx.Float32).to(fx.BFloat16), rsrc(scratch),
                         MID // 2 + (g_u * MAX_TOKENS + g_t2) * INTER + g_cb * 16 + g_c2, cache_modifier=CM_DEV,
                     )
+            if const_expr(FOLD_RQ):
+                if g_k % 2 == 1:
+                    # the pair's 32-channel group of MID is out: requantize it here (thread = token)
+                    _release()
+                    gpu.barrier()
+                    if (tid < tokens) & (((g_m >> tid) & fx.Int32(1)) != fx.Int32(0)):
+                        f_grp = g_cb // 2
+                        f_vals = []
+                        for f_c in range_constexpr(4):
+                            f_wv4 = fx.Vector(bo.buffer_load(
+                                rsrc(scratch), (MID + ((g_u * MAX_TOKENS + tid) * INTER + f_grp * 32) * 2) // 4 + 4 * f_c,
+                                vec_width=4, dtype=T.i32, cache_modifier=CM_DEV))
+                            for f_i in range_constexpr(4):
+                                f_a, f_b = bf2_f32(fx.Int32(f_wv4[f_i]))
+                                f_vals += [f_a, f_b]
+                        f_words, f_byte = _quant_for(f_vals, shared, g_e == fx.Int32(SHARED_ID))
+                        bo.buffer_store(fx.Vector.from_elements(f_words, fx.Int32), rsrc(scratch),
+                                        (MQ + (g_u * MAX_TOKENS + tid) * (INTER // 2) + f_grp * 16) // 4,
+                                        cache_modifier=CM_DEV)
+                        bo.buffer_store(f_byte, rsrc(scratch), (MS + ((g_u * MAX_TOKENS + tid) * MGROUPS + f_grp) * 4) // 4,
+                                        cache_modifier=CM_DEV)
         _release()
         gpu.barrier()
         if tid == 0:
-            box["mb"].put(box["gf"], bid, fx.Int32(1))
+            box["mb"].put(box["rf" if FOLD_RQ else "gf"], bid, fx.Int32(1))
 
-    if const_expr(last >= 3):
+    if const_expr(last >= 3 and not FOLD_RQ):
         # ---- RQ: q_a thread q_a (expert, token, group) of MID
         if tid < BLOCKS:
             box["mb"].poll([(box["gf"], tid, 1)])
@@ -449,6 +487,7 @@ def build_routed(tokens: int, upto: str = "DOWN", shared: bool = False):
     last = STAGES.index(upto)
     keyed = (
         tokens,
+        FOLD_RQ,
         os.environ.get("LAGUNA_DN_BATCH", "4"),
         upto,
         shared,
