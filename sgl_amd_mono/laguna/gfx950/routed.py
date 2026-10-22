@@ -28,7 +28,7 @@ from flydsl.expr.typing import Int32, Int64, T
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.mx import FP4, mfma_scaled, scale_index
 from sgl_amd_mono.common.ops import (
-    CM_DEV, ballot, bf2_f32, bf16_round, butterfly, hw_exp2, hw_rcp, lanes_below, popcount, rsrc, uniform, xshfl,
+    CM_DEV, CM_NT, ballot, bf2_f32, bf16_round, butterfly, hw_exp2, hw_rcp, lanes_below, popcount, rsrc, uniform, xshfl,
 )
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, kernel_sources
 from sgl_amd_mono.common.sync import Mailbox, sreg
@@ -244,7 +244,7 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
                 if const_expr(shared):  # the shared expert: quark row-major [N, K/2] / [N, K/32]
                     g_wi = [g_sh.select((g_rr[g_r] * (HIDDEN // 2) + g_gi * 16) // 4, g_wi[g_r]) for g_r in range(2)]
                     g_si = [g_sh.select(g_rr[g_r] * GROUPS + g_gi, g_si[g_r]) for g_r in range(2)]
-                g_w = [fx.Vector(bo.buffer_load(rsrc(g_bb), g_wi[g_r], vec_width=4, dtype=T.i32)) for g_r in range(2)]
+                g_w = [fx.Vector(bo.buffer_load(rsrc(g_bb), g_wi[g_r], vec_width=4, dtype=T.i32, cache_modifier=CM_NT)) for g_r in range(2)]
                 g_ws = [_byte(g_sp, g_si[g_r]) for g_r in range(2)]
                 g_xv = fx.Vector(bo.buffer_load(
                     rsrc(scratch, SCRATCH_BYTES), g_on.select((g_xq + g_col * (HIDDEN // 2) + g_gi * 16) // 4, fx.Int32(OOB)), vec_width=4,
@@ -381,7 +381,8 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
             else:
                 dbase = w2 + fx.Int64(de) * W2_BYTES
                 dsp = s2
-            dww = [fx.Vector(bo.buffer_load(rsrc(dbase), dwi[q], vec_width=4, dtype=T.i32)) for q in range(2)]
+            # weights: nontemporal (as aiter's b_nt), streamed once a step: -6..7 % at M 4..16
+            dww = [fx.Vector(bo.buffer_load(rsrc(dbase), dwi[q], vec_width=4, dtype=T.i32, cache_modifier=CM_NT)) for q in range(2)]
             dsc = [_byte(dsp, dsi[q]) for q in range(2)]
             # only lanes whose token is routed to this expert read its mid (the rest: zero)
             don = d_col_ok & (((dm >> d_col) & fx.Int32(1)) != fx.Int32(0))
