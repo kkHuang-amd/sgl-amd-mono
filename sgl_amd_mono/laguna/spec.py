@@ -32,7 +32,7 @@ from sglang.srt.monokernels.spec import (
 )
 
 from sgl_amd_mono.common.plan import BLOCKS
-from sgl_amd_mono.laguna import MAX_ROWS, TP
+from sgl_amd_mono.laguna import SERVED_ROWS, TP
 
 logger = logging.getLogger(__name__)
 
@@ -303,7 +303,7 @@ def _build(model, hf_config, ctx) -> _Built:
     m = model.model
     device = m.layers[0].input_layernorm.weight.device
     eps = m.layers[0].post_attention_layernorm.variance_epsilon
-    widths = [w for w in ctx.widths if w <= MAX_ROWS]
+    widths = [w for w in ctx.widths if w <= SERVED_ROWS]
     rt = LagunaFfnRuntime(model, widths, p.tp_size, p.tp_rank, p.tp_group.cpu_group, device, eps, ctx.deadline_s)
     rt.precompile()
     logger.info("laguna FFN launch: widths %s, %d layers, deadline %.0f s", widths, len(m.layers), ctx.deadline_s)
@@ -314,7 +314,7 @@ SPEC = MonoSpec(
     name="laguna_ffn_hip",
     devices={
         "gfx950": DeviceLimits(
-            widths=tuple(range(1, MAX_ROWS + 1)),
+            widths=tuple(range(1, SERVED_ROWS + 1)),
             tp_sizes=(TP,),
             resident_blocks=BLOCKS,
         )
