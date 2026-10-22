@@ -124,7 +124,7 @@ def build_routed(tokens: int, upto: str = "DOWN"):
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def k(
         x: Int64, ids: Int64, wts: Int64, w13: Int64, s13: Int64, w2: Int64, s2: Int64, out: Int64,
-        scratch: Int64, epoch: Int64, layer: Int32,
+        scratch: Int64, epoch: Int64, layer: Int32, skip: Int32,
     ):
         _ = keyed
         with guard.scope(guard.Guard(epoch)):
@@ -213,12 +213,44 @@ def build_routed(tokens: int, upto: str = "DOWN"):
                 g_sub = lane // 16
                 g_col_ok = g_ni < tokens
                 g_col = fx.min(g_ni, fx.Int32(tokens - 1))
-                g_ntask = nu * (INTER // 16)
+                g_ntask = ((skip & fx.Int32(1)) == fx.Int32(0)).select(nu * (INTER // 16), fx.Int32(0))  # timing aid
                 g_zero4 = fx.Vector.filled(4, 0, fx.Int32)
+
+                def g_task_info(g_tk):
+                    g_tc = fx.min(g_tk, fx.max(g_ntask - 1, fx.Int32(0)))
+                    g_uu = g_tc // (INTER // 16)
+                    g_cc = g_tc % (INTER // 16)
+                    g_ee = uniform(fx.ptr_load(uexp + g_uu))
+                    return g_uu, g_cc, g_ee
+
+                def g_quarter_of(g_ee, g_cc, g_q):
+                    g_bb = w13 + fx.Int64(g_ee) * W13_BYTES
+                    g_rr = [g_cc * 16 + g_ni, INTER + g_cc * 16 + g_ni]
+                    g_l = []
+                    for g_j in range_constexpr(4):
+                        g_gi = wave * 64 + (g_q * 4 + g_j) * 4 + g_sub
+                        g_w = [
+                            fx.Vector(bo.buffer_load(rsrc(g_bb), _w13_index(g_rr[g_r], g_gi), vec_width=4, dtype=T.i32))
+                            for g_r in range(2)
+                        ]
+                        g_ws = [_byte(s13, scale_index(g_ee * (2 * INTER) + g_rr[g_r], g_gi, GROUPS)) for g_r in range(2)]
+                        g_xv = fx.Vector(bo.buffer_load(
+                            rsrc(scratch), (XQ + g_col * (HIDDEN // 2) + g_gi * 16) // 4, vec_width=4,
+                            dtype=T.i32, cache_modifier=CM_DEV))
+                        g_xs = fx.Int32(bo.buffer_load(
+                            rsrc(scratch), (XS + (g_col * GROUPS + g_gi) * 4) // 4, vec_width=1,
+                            dtype=T.i32, cache_modifier=CM_DEV))
+                        g_l += g_w + g_ws + [g_xv, g_xs]
+                    return g_l
+
+                def g_unpack(g_l):
+                    return [(g_l[6 * g_j:6 * g_j + 2], g_l[6 * g_j + 2:6 * g_j + 4], g_l[6 * g_j + 4], g_l[6 * g_j + 5])
+                            for g_j in range(4)]
+
+                _, g_c0, g_e0 = g_task_info(bid)
+                g_first = g_quarter_of(g_e0, g_c0, 0)  # the first task's first quarter, in flight
                 for g_task in range(bid, g_ntask, BLOCKS):
-                    g_u = g_task // (INTER // 16)
-                    g_cb = g_task % (INTER // 16)
-                    g_e = uniform(fx.ptr_load(uexp + g_u))
+                    g_u, g_cb, g_e = g_task_info(g_task)
                     g_m = uniform(fx.ptr_load(umask + g_u))
                     g_base = w13 + fx.Int64(g_e) * W13_BYTES
                     g_rows = [g_cb * 16 + g_ni, INTER + g_cb * 16 + g_ni]
@@ -244,11 +276,15 @@ def build_routed(tokens: int, upto: str = "DOWN"):
                         return g_l
 
                     g_c = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
-                    g_next = g_quarter(0)
+                    g_next = g_unpack(g_first)
                     for g_q in range_constexpr(4):
                         g_ld = g_next
                         if const_expr(g_q + 1 < 4):
                             g_next = g_quarter(g_q + 1)
+                        else:
+                            # the next task's first quarter goes out before this task's tail
+                            _, g_cn, g_en = g_task_info(g_task + BLOCKS)
+                            g_first = g_quarter_of(g_en, g_cn, 0)
                         for g_j in range_constexpr(4):
                             g_w, g_ws, g_xv, g_xs = g_ld[g_j]
                             g_b = g_col_ok.select(g_xv, g_zero4)
@@ -341,25 +377,27 @@ def build_routed(tokens: int, upto: str = "DOWN"):
                         for dg in d_gis
                     ]
                     dsc = [_byte(s2, scale_index(de * HIDDEN + d_row, dg, MGROUPS)) for dg in d_gis]
-                    return [de, dm] + dww + dsc
+                    dmv = [fx.Vector(bo.buffer_load(
+                        rsrc(scratch), (MQ + (d_c * MAX_TOKENS + d_col) * (INTER // 2) + dg * 16) // 4,
+                        vec_width=4, dtype=T.i32, cache_modifier=CM_DEV)) for dg in d_gis]
+                    dms = [fx.Int32(bo.buffer_load(
+                        rsrc(scratch), (MS + ((d_c * MAX_TOKENS + d_col) * MGROUPS + dg) * 4) // 4,
+                        vec_width=1, dtype=T.i32, cache_modifier=CM_DEV)) for dg in d_gis]
+                    return [de, dm] + dww + dsc + dmv + dms
 
                 d_acc = fx.Vector.filled(4, 0.0, fx.Float32)
-                d_pre = d_load(fx.Int32(0))
-                d_pre2 = d_load(fx.Int32(1))
-                for d_u in range(nu):
-                    d_cur = d_pre
-                    d_pre = d_pre2
-                    d_pre2 = d_load(d_u + 2)
+                DEPTH = 2  # experts in flight ahead of the one computing (4 measured no better)
+                d_fly = [d_load(fx.Int32(d_i)) for d_i in range(DEPTH)]
+                d_nu = ((skip & fx.Int32(2)) == fx.Int32(0)).select(nu, fx.Int32(0))  # timing aid
+                for d_u in range(d_nu):
+                    d_cur = d_fly[0]
+                    d_fly = d_fly[1:] + [d_load(d_u + DEPTH)]
                     d_m = d_cur[1]
                     d_on = d_col_ok & (((d_m >> d_col) & fx.Int32(1)) != fx.Int32(0))
                     d_cc = fx.Vector.filled(4, 0.0, fx.Float32)
                     for d_j in range_constexpr(2):
-                        d_mv = fx.Vector(bo.buffer_load(
-                            rsrc(scratch), (MQ + (d_u * MAX_TOKENS + d_col) * (INTER // 2) + d_gis[d_j] * 16) // 4,
-                            vec_width=4, dtype=T.i32, cache_modifier=CM_DEV))
-                        d_ms = fx.Int32(bo.buffer_load(
-                            rsrc(scratch), (MS + ((d_u * MAX_TOKENS + d_col) * MGROUPS + d_gis[d_j]) * 4) // 4,
-                            vec_width=1, dtype=T.i32, cache_modifier=CM_DEV))
+                        d_mv = d_cur[6 + d_j]
+                        d_ms = d_cur[8 + d_j]
                         d_cc = mfma_scaled(d_cur[2 + d_j], d_on.select(d_mv, d_zero4), d_cc, d_cur[4 + d_j],
                                            d_on.select(d_ms, fx.Int32(127)), FP4, FP4)
                     d_wt = d_on.select(fx.ptr_load(uw + d_u * MAX_TOKENS + d_col), fx.Float32(0.0))
@@ -388,10 +426,11 @@ def build_routed(tokens: int, upto: str = "DOWN"):
     @flyc.jit
     def launch(
         x: Int64, ids: Int64, wts: Int64, w13: Int64, s13: Int64, w2: Int64, s2: Int64, out: Int64,
-        scratch: Int64, epoch: Int64, layer: Int32, stream: fx.Stream = fx.Stream(None),
+        scratch: Int64, epoch: Int64, layer: Int32, skip: Int32 = 0, stream: fx.Stream = fx.Stream(None),
     ):
+        """``skip``: timing aid (bit 0 skips UG's tasks, bit 1 DOWN's experts; the same binary)."""
         _ = keyed
-        k(x, ids, wts, w13, s13, w2, s2, out, scratch, epoch, layer).launch(
+        k(x, ids, wts, w13, s13, w2, s2, out, scratch, epoch, layer, skip).launch(
             grid=(BLOCKS,), block=(THREADS,), stream=stream
         )
 
