@@ -25,7 +25,8 @@ from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common import guard
-from sgl_amd_mono.common.ops import CM_DEV, bf2_f32, bf16_round, butterfly, hw_exp2, hw_rcp, rsrc, uniform
+from sgl_amd_mono.common.mx import FP4, mfma_scaled
+from sgl_amd_mono.common.ops import CM_DEV, bf2_f32, bf16_round, hw_exp2, hw_rcp, rsrc, uniform
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, kernel_sources
 from sgl_amd_mono.common.sync import Mailbox, sreg
 from sgl_amd_mono.laguna.gfx950 import mxq
@@ -46,9 +47,12 @@ XS = XQ + MAX_TOKENS * HIDDEN // 2
 MID = XS + MAX_TOKENS * GROUPS * 4
 MQ = MID + MAX_TOKENS * INTER * 2
 MS = MQ + MAX_TOKENS * INTER // 2
-QF = MS + MAX_TOKENS * MGROUPS * 4  # flags: [token][wave]
-GF = QF + MAX_TOKENS * WAVES * 8  # [CTA]
-RF = GF + BLOCKS * 8  # [token][group]
+KSLICES = 8  # GU splits K over 8 CTAs a 16-channel block
+PART = MS + MAX_TOKENS * MGROUPS * 4  # fp32 [slice][row 1024][token]
+QF = PART + KSLICES * 2 * INTER * MAX_TOKENS * 4  # flags: [token][wave]
+GF = QF + MAX_TOKENS * WAVES * 8  # [CTA]: its K-slice partials are out
+HF = GF + BLOCKS * 8  # [channel block]: its MID channels are out
+RF = HF + (INTER // 16) * 8  # [token][group]
 SCRATCH_BYTES = RF + MAX_TOKENS * MGROUPS * 8
 
 
@@ -80,8 +84,7 @@ def build_shared(tokens: int):
 
     @fx.struct
     class Smem:
-        part: fx.Array[fx.Float32, WAVES * 4 * MAX_TOKENS, 16]
-        gu: fx.Array[fx.Float32, 4 * MAX_TOKENS, 16]
+        part: fx.Array[fx.Float32, WAVES * 32 * MAX_TOKENS, 16]
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def k(
@@ -96,13 +99,13 @@ def build_shared(tokens: int):
             wave = tid // 64
             lds = fx.SharedAllocator().allocate(Smem).peek()
             part = lds.part.ptr
-            gu = lds.gu.ptr
             step = uniform(bo.buffer_load(rsrc(epoch), 0, vec_width=1, dtype=T.i32))
             box = {
                 "mb": Mailbox(step * LAYER_SLOTS + layer + 1),
                 "qf": sreg(scratch, QF, "qf"),
                 "gf": sreg(scratch, GF, "gf"),
                 "rf": sreg(scratch, RF, "rf"),
+                "hf": sreg(scratch, HF, "hf"),
             }
 
             # ---- Q: quantize x (triton rule), a thread a group
@@ -125,71 +128,95 @@ def build_shared(tokens: int):
                 if lane == 0:
                     box["mb"].put(box["qf"], bid * WAVES + wave, fx.Int32(1))
 
-            # ---- GU: channels 2b, 2b + 1 (rows n0, n1, 512 + n0, 512 + n1)
-            box["mb"].poll([(box["qf"], t * WAVES + w, 1) for t in range(tokens) for w in range(WAVES)])
-            gi = wave * 64 + lane  # this lane's K group
-            rows = [bid * 2, bid * 2 + 1, INTER + bid * 2, INTER + bid * 2 + 1]
-            wsc = [pow2(_byte(s13, r * GROUPS + gi)) for r in rows]
-            ww = [
-                fx.Vector(bo.buffer_load(rsrc(w13), (r * (HIDDEN // 2) + gi * 16) // 4, vec_width=4, dtype=T.i32))
-                for r in rows
-            ]
-            acc = [[fx.Float32(0.0) for _ in range(tokens)] for _ in range(4)]
-            xw = [
-                fx.Vector(
-                    bo.buffer_load(
-                        rsrc(scratch), (XQ + t * (HIDDEN // 2) + gi * 16) // 4, vec_width=4, dtype=T.i32,
-                        cache_modifier=CM_DEV,
-                    )
-                )
-                for t in range(tokens)
-            ]
-            xsc = [
-                pow2(fx.Int32(bo.buffer_load(rsrc(scratch), (XS + (t * GROUPS + gi) * 4) // 4, vec_width=1,
-                                             dtype=T.i32, cache_modifier=CM_DEV)))
-                for t in range(tokens)
-            ]
-            for c in range_constexpr(4):
-                wd = [decode_word(fx.Int32(ww[r][c]), wsc[r]) for r in range(4)]
-                for t in range_constexpr(tokens):
-                    xd = decode_word(fx.Int32(xw[t][c]), xsc[t])
-                    for r in range_constexpr(4):
-                        s = acc[r][t]
-                        for j in range_constexpr(8):
-                            s = s + wd[r][j] * xd[j]
-                        acc[r][t] = s
-            for r in range_constexpr(4):
-                for t in range_constexpr(tokens):
-                    v = butterfly(acc[r][t], (32, 16, 8, 4, 2, 1))
-                    if lane == 0:
-                        fx.ptr_store(v, part + (wave * 4 + r) * MAX_TOKENS + t)
+            # ---- GU (MFMA): CTA b = (16-channel block cb = b // 8, K slice ks = b % 8 of 64
+            # groups); wave w: groups 64 ks + 8 w .. + 8 in two 128-K steps. A = 16 gate (and 16
+            # up) rows, row-major quark layout (lane: row lane % 16, 16 B of K group lane // 16),
+            # B = 16 token columns of x (zero past the batch); fp32 slice partials -> PART
+            if tid < tokens * WAVES:
+                box["mb"].poll([(box["qf"], tid, 1)])
             gpu.barrier()
-            if tid < 4 * tokens:
-                r = tid // tokens
-                t = tid % tokens
-                tot = fx.ptr_load(part + r * MAX_TOKENS + t)
+            ni = lane % 16
+            sub = lane // 16
+            col_ok = ni < tokens
+            col = fx.min(ni, fx.Int32(tokens - 1))
+            zero4 = fx.Vector.filled(4, 0, fx.Int32)
+            cb = bid // KSLICES
+            ks = bid % KSLICES
+            grow = [cb * 16 + ni, INTER + cb * 16 + ni]
+            cacc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
+            ld = []
+            for j in range_constexpr(2):
+                gk = ks * 64 + wave * 8 + j * 4 + sub
+                ld.append((
+                    [fx.Vector(bo.buffer_load(rsrc(w13), (gr * (HIDDEN // 2) + gk * 16) // 4, vec_width=4, dtype=T.i32))
+                     for gr in grow],
+                    [_byte(s13, gr * GROUPS + gk) for gr in grow],
+                    fx.Vector(bo.buffer_load(rsrc(scratch), (XQ + col * (HIDDEN // 2) + gk * 16) // 4, vec_width=4,
+                                             dtype=T.i32, cache_modifier=CM_DEV)),
+                    fx.Int32(bo.buffer_load(rsrc(scratch), (XS + (col * GROUPS + gk) * 4) // 4, vec_width=1,
+                                            dtype=T.i32, cache_modifier=CM_DEV)),
+                ))
+            for j in range_constexpr(2):
+                wv2, ws2, xv, xs = ld[j]
+                bv = col_ok.select(xv, zero4)
+                bs = col_ok.select(xs, fx.Int32(127))
+                for r in range_constexpr(2):
+                    cacc[r] = mfma_scaled(wv2[r], bv, cacc[r], ws2[r], bs, FP4, FP4)
+            # waves summed in order through LDS (C: rows 4 sub + i, column = token ni)
+            for r in range_constexpr(2):
+                for i in range_constexpr(4):
+                    fx.ptr_store(fx.Float32(cacc[r][i]), part + ((wave * 2 + r) * 16 + sub * 4 + i) * MAX_TOKENS + ni)
+            gpu.barrier()
+            if tid < 32 * tokens:
+                prow = tid // tokens  # 0..31: 16 gate rows then 16 up rows
+                pt = tid % tokens
+                ptot = fx.ptr_load(part + ((0 * 2 + prow // 16) * 16 + prow % 16) * MAX_TOKENS + pt)
                 for w in range_constexpr(1, WAVES):
-                    tot = tot + fx.ptr_load(part + (w * 4 + r) * MAX_TOKENS + t)
-                fx.ptr_store(bf16_round(tot), gu + r * MAX_TOKENS + t)
-            gpu.barrier()
-            if tid < tokens:
-                h0 = _silu_mul(fx.ptr_load(gu + 0 * MAX_TOKENS + tid), fx.ptr_load(gu + 2 * MAX_TOKENS + tid))
-                h1 = _silu_mul(fx.ptr_load(gu + 1 * MAX_TOKENS + tid), fx.ptr_load(gu + 3 * MAX_TOKENS + tid))
-                bo.buffer_store(
-                    fx.Vector.from_elements([h0, h1], fx.Float32).to(fx.BFloat16), rsrc(scratch),
-                    MID // 2 + tid * INTER + bid * 2, cache_modifier=CM_DEV,
-                )
+                    ptot = ptot + fx.ptr_load(part + ((w * 2 + prow // 16) * 16 + prow % 16) * MAX_TOKENS + pt)
+                grow_g = (prow // 16) * INTER + cb * 16 + prow % 16
+                bo.buffer_store(ptot, rsrc(scratch), (PART + ((ks * 2 * INTER + grow_g) * MAX_TOKENS + pt) * 4) // 4,
+                                cache_modifier=CM_DEV)
             _release()
             gpu.barrier()
             if tid == 0:
                 box["mb"].put(box["gf"], bid, fx.Int32(1))
+
+            # ---- GR: CTA cb < 32: the block's 8 K-slice partials summed in slice order, bf16
+            # (the GEMM's output), silu(gate) * up -> bf16 MID
+            if bid < INTER // 16:
+                if tid < KSLICES:
+                    box["mb"].poll([(box["gf"], bid * KSLICES + tid, 1)])
+                gpu.barrier()
+                if tid < 8 * tokens:
+                    ht = tid // 8
+                    hc = (tid % 8) * 2
+                    hh = []
+                    for q in range_constexpr(2):
+                        hv = []
+                        for half in range_constexpr(2):
+                            hrow = half * INTER + bid * 16 + hc + q
+                            htot = fx.Float32(0.0)
+                            for k2 in range_constexpr(KSLICES):
+                                htot = htot + fx.Float32(bo.buffer_load(
+                                    rsrc(scratch), (PART + ((k2 * 2 * INTER + hrow) * MAX_TOKENS + ht) * 4) // 4,
+                                    vec_width=1, dtype=T.f32, cache_modifier=CM_DEV))
+                            hv.append(bf16_round(htot))
+                        hh.append(_silu_mul(hv[0], hv[1]))
+                    bo.buffer_store(
+                        fx.Vector.from_elements(hh, fx.Float32).to(fx.BFloat16), rsrc(scratch),
+                        MID // 2 + ht * INTER + bid * 16 + hc, cache_modifier=CM_DEV,
+                    )
+                _release()
+                gpu.barrier()
+                if tid == 0:
+                    box["mb"].put(box["hf"], bid, fx.Int32(1))
 
             # ---- RQ: requantize MID group (token, group) = (b // 16, b % 16)
             if bid < MGROUPS * tokens:
                 t = bid // MGROUPS
                 grp = bid % MGROUPS
                 if wave == 0:
-                    box["mb"].poll([(box["gf"], grp * 16 + i, 1) for i in range(16)])
+                    box["mb"].poll([(box["hf"], grp * 2 + i, 1) for i in range(2)])
                     if lane == 0:
                         vals = []
                         for c in range_constexpr(4):
@@ -208,34 +235,41 @@ def build_shared(tokens: int):
                         _release()
                         box["mb"].put(box["rf"], t * MGROUPS + grp, fx.Int32(1))
 
-            # ---- DOWN: rows [64 b, 64 b + 64), wave w eight, a lane a dword of K
-            box["mb"].poll([(box["rf"], t * MGROUPS + g, 1) for t in range(tokens) for g in range(MGROUPS)])
-            md = []
-            for t in range_constexpr(tokens):
-                mw = fx.Int32(bo.buffer_load(rsrc(scratch), (MQ + t * (INTER // 2)) // 4 + lane, vec_width=1,
-                                             dtype=T.i32, cache_modifier=CM_DEV))
-                ms = pow2(fx.Int32(bo.buffer_load(rsrc(scratch), (MS + (t * MGROUPS + lane // 4) * 4) // 4,
-                                                  vec_width=1, dtype=T.i32, cache_modifier=CM_DEV)))
-                md.append(decode_word(mw, ms))
-            for pr in range_constexpr(4):
-                sums = []
-                for half in range_constexpr(2):
-                    row = bid * 64 + wave * 8 + pr * 2 + half
-                    wv = fx.Int32(bo.buffer_load(rsrc(w2), row * (INTER // 8) + lane, vec_width=1, dtype=T.i32))
-                    wd = decode_word(wv, pow2(_byte(s2, row * MGROUPS + lane // 4)))
-                    per_t = []
-                    for t in range_constexpr(tokens):
-                        s = fx.Float32(0.0)
-                        for j in range_constexpr(8):
-                            s = s + wd[j] * md[t][j]
-                        per_t.append(butterfly(s, (32, 16, 8, 4, 2, 1)))
-                    sums.append(per_t)
-                if lane == 0:
-                    for t in range_constexpr(tokens):
-                        bo.buffer_store(
-                            fx.Vector.from_elements([sums[0][t], sums[1][t]], fx.Float32).to(fx.BFloat16),
-                            rsrc(out), t * HIDDEN + bid * 64 + wave * 8 + pr * 2,
-                        )
+            # ---- DOWN (MFMA): rows [64 b, 64 b + 64) = four 16-row groups; wave w: group w // 2,
+            # K steps (w % 2) * 2 .. + 2 (128 K each). A = 16 W2 rows (row-major), B = 16 token
+            # columns of the quantized MID (zero past the batch)
+            if tid < tokens * MGROUPS:
+                box["mb"].poll([(box["rf"], tid, 1)])
+            gpu.barrier()
+            drow = bid * 64 + (wave // 2) * 16 + ni
+            dacc = fx.Vector.filled(4, 0.0, fx.Float32)
+            for j in range_constexpr(2):
+                dg = (wave % 2) * 8 + j * 4 + sub
+                dw = fx.Vector(bo.buffer_load(rsrc(w2), (drow * (INTER // 2) + dg * 16) // 4, vec_width=4, dtype=T.i32))
+                dsc = _byte(s2, drow * MGROUPS + dg)
+                dmv = fx.Vector(bo.buffer_load(rsrc(scratch), (MQ + col * (INTER // 2) + dg * 16) // 4, vec_width=4,
+                                               dtype=T.i32, cache_modifier=CM_DEV))
+                dms = fx.Int32(bo.buffer_load(rsrc(scratch), (MS + (col * MGROUPS + dg) * 4) // 4, vec_width=1,
+                                              dtype=T.i32, cache_modifier=CM_DEV))
+                dacc = mfma_scaled(dw, col_ok.select(dmv, zero4), dacc, dsc, col_ok.select(dms, fx.Int32(127)), FP4, FP4)
+            gpu.barrier()
+            for i in range_constexpr(4):
+                fx.ptr_store(fx.Float32(dacc[i]), part + (wave * 16 + sub * 4 + i) * MAX_TOKENS + ni)
+            gpu.barrier()
+            if tid < 4 * 8 * tokens:
+                ot = tid // 32
+                orb = (tid % 32) // 8
+                op = (tid % 8) * 2
+                ov = []
+                for q in range_constexpr(2):
+                    ov.append(
+                        fx.ptr_load(part + ((orb * 2) * 16 + op + q) * MAX_TOKENS + ot)
+                        + fx.ptr_load(part + ((orb * 2 + 1) * 16 + op + q) * MAX_TOKENS + ot)
+                    )
+                bo.buffer_store(
+                    fx.Vector.from_elements(ov, fx.Float32).to(fx.BFloat16),
+                    rsrc(out), ot * HIDDEN + bid * 64 + orb * 16 + op,
+                )
 
     @flyc.jit
     def launch(
