@@ -19,6 +19,8 @@ One launch, BLOCKS CTAs x THREADS threads, stages in order:
            the experts (a CTA owns its rows: no atomics, deterministic); bf16 out
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
@@ -294,7 +296,7 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
                         part + g_par + ((wave * 2 + g_r) * 16 + g_sub * 4 + g_i) * MAX_TOKENS + g_ni,
                     )
             gpu.barrier()
-            if tid < tokens * 8:
+            if (tid < tokens * 8) & ((skip & fx.Int32(4)) == fx.Int32(0)):  # bit 2: timing aid, no tail
                 g_t2 = tid // 8
                 g_c2 = (tid % 8) * 2
                 if ((g_m >> g_t2) & fx.Int32(1)) != fx.Int32(0):
@@ -444,6 +446,7 @@ def build_routed(tokens: int, upto: str = "DOWN", shared: bool = False):
     last = STAGES.index(upto)
     keyed = (
         tokens,
+        os.environ.get("LAGUNA_DN_BATCH", "4"),
         upto,
         shared,
         kernel_sources(__name__),

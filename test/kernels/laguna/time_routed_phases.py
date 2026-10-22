@@ -19,7 +19,7 @@ for m in widths:
     out = torch.empty(m, routed.HIDDEN, dtype=torch.bfloat16, device=dev)
     launch = routed.build_routed(m)
     t = {}
-    for skip in (0, 1, 2, 3):
+    for skip in (0, 1, 2, 3, 4):
         args = (x.data_ptr(), ids.data_ptr(), wt.data_ptr(), w1.data_ptr(), w1s.data_ptr(), w2.data_ptr(),
                 w2s.data_ptr(), out.data_ptr(), scratch.data_ptr(), epoch.data_ptr(), 0, skip)
         launch(*args, stream=torch.cuda.current_stream()); epoch[0] += 1
@@ -36,4 +36,5 @@ for m in widths:
     nu = int(torch.unique(ids).numel())
     ug, dn = t[0] - t[1], t[0] - t[2]
     print(f"M={m:2d} union={nu}: full {t[0]:.1f} | UG {ug:.1f} us ({nu * 8.65e6 / ug / 1e6:.2f} TB/s) | "
-          f"DOWN {dn:.1f} us ({nu * 4.33e6 / dn / 1e6:.2f} TB/s) | rest {t[3]:.1f} us", flush=True)
+          f"DOWN {dn:.1f} us ({nu * 4.33e6 / dn / 1e6:.2f} TB/s) | rest {t[3]:.1f} us | UG tails {t[0] - t[4]:.1f} us",
+          flush=True)
