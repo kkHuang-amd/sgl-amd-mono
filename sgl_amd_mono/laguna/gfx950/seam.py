@@ -20,6 +20,8 @@ is cleared between steps and a captured graph replays correctly.
 """
 
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
@@ -62,7 +64,19 @@ NORM_FP32_COLS = 8192
 
 
 def region_bytes(npes: int) -> int:
+    # [src rank][token][HIDDEN] partials, then [token][HIDDEN] all-gathered sums (two-shot)
+    return (npes + 1) * MAX_TOKENS * HIDDEN * 4
+
+
+def ag_offset(npes: int) -> int:
     return npes * MAX_TOKENS * HIDDEN * 4
+
+
+# from this many rows the all-reduce runs two-shot: each CTA's columns go to their owner rank
+# only (reduce-scatter), the owner sums them in rank order and pushes the bf16 sum to every
+# rank (all-gather): ~4x fewer xGMI bytes than one-shot (every partial to every rank), one
+# more hop. Same sums, same rounding: bit-identical results.
+TWO_SHOT_MIN = int(os.environ.get("LAGUNA_SEAM_TWO_SHOT_MIN", "2"))  # seam M1-16: 8.0/10.2/13.1/19.2/32.9 -> 8.5/9.2/10.9/13.9/20.6 us
 
 
 def peer_bytes(npes: int) -> int:
@@ -76,6 +90,19 @@ SS_BYTES = PHASES * MAX_TOKENS * BLOCKS * 8
 def tag_slot(layer: int, phase: int) -> int:
     """The ``layer`` argument of a launch: one tag slot per (layer, phase)."""
     return PHASES * layer + phase
+
+
+def _load_pair(partial, partial2, tk, col, cm):
+    """A bf16 pair of this rank's partial, plus the same pair of ``partial2`` if given (S4 next
+    to S3: added in fp32, rounded to bf16 once at the push, as a bf16 add)."""
+    v0, v1 = bf2_f32(fx.Int32(bo.buffer_load(rsrc(partial), (tk * HIDDEN + col) // 2, vec_width=1, dtype=T.i32,
+                                             cache_modifier=cm)))
+    if partial2 is not None:
+        u0, u1 = bf2_f32(fx.Int32(bo.buffer_load(rsrc(partial2), (tk * HIDDEN + col) // 2, vec_width=1,
+                                                 dtype=T.i32, cache_modifier=cm)))
+        v0 = v0 + u0
+        v1 = v1 + u1
+    return v0, v1
 
 
 @flyc.jit
@@ -94,52 +121,73 @@ def emit_seam(ctx, args, npes, tokens, eps, phase, in_cm=0, out_cm=0):
     peers, rank = args["peers"], args["rank"]
     partial2 = args.get("partial2")
     box["own"] = preg(args["sym"], REG, "attn")
+    box["ag"] = preg(args["sym"], REG + ag_offset(W), "ag")
     box["ss"] = sreg(args["scratch"], SS, "ss")
     c0 = bid * COLS
 
-    # push: wave w -> peer w, a bf16 pair a lane
-    dst = load_ptr64(peers, fx.Int32(wave) % W)
-    box["dst"] = preg(dst, REG, "attn")
-    for ci in range_constexpr((PAIRS * tokens + 63) // 64):
-        i = lane + 64 * ci
-        if (wave < W) & (i < PAIRS * tokens):
-            tk = i // PAIRS
-            col = c0 + (i % PAIRS) * 2
-            w = fx.Int32(
-                bo.buffer_load(
-                    rsrc(partial), (tk * HIDDEN + col) // 2, vec_width=1, dtype=T.i32,
-                    cache_modifier=in_cm,
+    two = tokens >= TWO_SHOT_MIN
+    owner = bid // (BLOCKS // W)  # two-shot: the rank that reduces this CTA's columns
+    if const_expr(two):
+        # reduce-scatter push: every wave, its share of the CTA's pairs, to the owner only
+        box["dst"] = preg(load_ptr64(peers, owner), REG, "attn")
+        for ci in range_constexpr((PAIRS * tokens + THREADS - 1) // THREADS):
+            i = tid + THREADS * ci
+            if i < PAIRS * tokens:
+                tk = i // PAIRS
+                col = c0 + (i % PAIRS) * 2
+                v0, v1 = _load_pair(partial, partial2, tk, col, in_cm)
+                box["mb"].put_bf(box["dst"], (rank * MAX_TOKENS + tk) * HIDDEN + col, [v0, v1])
+    else:
+        # one-shot push: wave w -> peer w, a bf16 pair a lane
+        dst = load_ptr64(peers, fx.Int32(wave) % W)
+        box["dst"] = preg(dst, REG, "attn")
+        for ci in range_constexpr((PAIRS * tokens + 63) // 64):
+            i = lane + 64 * ci
+            if (wave < W) & (i < PAIRS * tokens):
+                tk = i // PAIRS
+                col = c0 + (i % PAIRS) * 2
+                v0, v1 = _load_pair(partial, partial2, tk, col, in_cm)
+                box["mb"].put_bf(
+                    box["dst"],
+                    (rank * MAX_TOKENS + tk) * HIDDEN + col,
+                    [v0, v1],
                 )
-            )
-            v0, v1 = bf2_f32(w)
-            if const_expr(partial2 is not None):
-                # a second bf16 partial (S4 next to S3): added and rounded to bf16 once, as a bf16 add
-                w2 = fx.Int32(
-                    bo.buffer_load(
-                        rsrc(partial2), (tk * HIDDEN + col) // 2, vec_width=1, dtype=T.i32,
-                        cache_modifier=in_cm,
-                    )
-                )
-                u0, u1 = bf2_f32(w2)
-                v0 = v0 + u0
-                v1 = v1 + u1
-            box["mb"].put_bf(
-                box["dst"],
-                (rank * MAX_TOKENS + tk) * HIDDEN + col,
-                [v0, v1],
-            )
 
-    # sum: every rank's partials in rank order, + residual; sum of squares
+    if const_expr(two):
+        # owner: the ranks' partials of these columns summed in rank order, rounded to bf16
+        # (the all-reduce's output), pushed to every rank's AG region
+        for p in range_constexpr(W):
+            box[f"ag{p}"] = preg(load_ptr64(peers, p), REG + ag_offset(W), "ag")
+        if owner == rank:
+            for ci in range_constexpr((PAIRS * tokens + THREADS - 1) // THREADS):
+                i = tid + THREADS * ci
+                if i < PAIRS * tokens:
+                    tk = i // PAIRS
+                    col = c0 + (i % PAIRS) * 2
+                    a0, a1 = sum_partials(
+                        box["mb"].poll,
+                        box["own"],
+                        lambda src: ((src * MAX_TOKENS + tk) * HIDDEN + col) // 2,
+                        W,
+                    )
+                    for p in range_constexpr(W):
+                        box["mb"].put_bf(box[f"ag{p}"], tk * HIDDEN + col, [a0, a1])
+
+    # sum: every rank's partials in rank order (two-shot: the owner's sum), + residual; squares
     sq = fx.Float32(0.0)
     if tid < PAIRS * tokens:
         tk = tid // PAIRS
         col = c0 + (tid % PAIRS) * 2
-        s0, s1 = sum_partials(
-            box["mb"].poll,
-            box["own"],
-            lambda src: ((src * MAX_TOKENS + tk) * HIDDEN + col) // 2,
-            W,
-        )
+        if const_expr(two):
+            ga = box["mb"].poll([(box["ag"], (tk * HIDDEN + col) // 2, 1)])
+            s0, s1 = bf2_f32(ga[0][0])
+        else:
+            s0, s1 = sum_partials(
+                box["mb"].poll,
+                box["own"],
+                lambda src: ((src * MAX_TOKENS + tk) * HIDDEN + col) // 2,
+                W,
+            )
         rw = fx.Int32(
             bo.buffer_load(
                 rsrc(residual), (tk * HIDDEN + col) // 2, vec_width=1, dtype=T.i32,
@@ -206,7 +254,7 @@ def build_seam(npes: int, tokens: int, eps: float, phase: int = 0):
     is ``tag_slot(layer, phase)``."""
     assert 1 <= tokens <= MAX_TOKENS and 1 <= npes <= WAVES and phase in (0, 1)
     W = npes
-    keyed = (W, tokens, eps, phase, kernel_sources(__name__), kernel_sources(guard.__name__))
+    keyed = (W, tokens, eps, phase, TWO_SHOT_MIN, kernel_sources(__name__), kernel_sources(guard.__name__))
     name = f"laguna_seam_tp{W}_t{tokens}_p{phase}"
 
     @fx.struct
