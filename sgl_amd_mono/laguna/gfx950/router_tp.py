@@ -18,7 +18,7 @@ One launch, BLOCKS CTAs x THREADS threads:
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common import guard
@@ -36,6 +36,9 @@ KQ = HIDDEN // QUARTERS  # 4096 a CTA
 KW = KQ // WAVES  # 512 a wave
 PER_LANE = EXPERTS // 64
 LOG2E = 1.4426950408889634
+
+
+STAGES = ("part", "push", "topk")
 
 
 def local_experts(npes: int) -> int:
@@ -63,93 +66,98 @@ def _min_i(a, b):
 
 
 @flyc.jit
-def emit_router(ctx, args, npes, tokens, in_cm=0):
+def emit_router(ctx, args, npes, tokens, stages=STAGES, in_cm=0, out_cm=0):
     """The router's code inside a kernel: ``ctx`` = thread ids, the mailbox dict ``box`` (its
     ``mb``) and the LDS ``rpart`` (WAVES x MAX_TOKENS fp32); ``args`` = the launch's pointers
-    (``scratch``: the router's ``PQ_BYTES``, ``sym``: this rank's ``LG_BYTES`` region, ``peers``:
-    the table of every rank's ``sym``). ``in_cm``: the cache policy of the x loads."""
+    (``scratch``: the router's ``PQ_BYTES``, ``sym`` / ``peers``: this rank's / every rank's peer
+    buffer, its ``LG_BYTES`` region at byte ``lg_off``, default 0). ``stages``: a subset of STAGES (each waits on its inputs). ``in_cm`` / ``out_cm``: the cache policy of the x loads / the top-k stores."""
     W = npes
     EL = local_experts(W)
     tid, bid, lane, wave, box, part = (ctx[n] for n in ("tid", "bid", "lane", "wave", "box", "rpart"))
     x, weight, bias, ids_out, wts_out = (args[n] for n in ("x", "weight", "bias", "ids_out", "wts_out"))
     peers, rank = args["peers"], args["rank"]
     box["pq"] = sreg(args["scratch"], 0, "pq")
-    box["lg"] = preg(args["sym"], 0, "lg")
+    lg_off = args.get("lg_off", 0)
+    box["lg"] = preg(args["sym"], lg_off, "lg")
 
-    # part: local expert el, quarter q
     el = bid // QUARTERS
     q = bid % QUARTERS
-    kk = q * KQ + wave * KW + lane * 8
-    w0 = fx.Vector(bo.buffer_load(rsrc(weight), el * HIDDEN + kk, vec_width=4, dtype=T.f32))
-    w1 = fx.Vector(bo.buffer_load(rsrc(weight), el * HIDDEN + kk + 4, vec_width=4, dtype=T.f32))
-    wv = [fx.Float32(w0[i]) for i in range(4)] + [fx.Float32(w1[i]) for i in range(4)]
-    for t in range_constexpr(tokens):
-        xv = fx.Vector(bo.buffer_load(rsrc(x), (t * HIDDEN + kk) // 2, vec_width=4, dtype=T.i32, cache_modifier=in_cm))
-        a = fx.Float32(0.0)
-        for i in range_constexpr(4):
-            lo, hi = bf2_f32(fx.Int32(xv[i]))
-            a = a + lo * wv[2 * i] + hi * wv[2 * i + 1]
-        a = butterfly(a, (32, 16, 8, 4, 2, 1))
-        if lane == 0:
-            fx.ptr_store(a, part + wave * MAX_TOKENS + t)
-    gpu.barrier()
-    if tid < tokens:
-        tot = fx.ptr_load(part + tid)
-        for w in range_constexpr(1, WAVES):
-            tot = tot + fx.ptr_load(part + w * MAX_TOKENS + tid)
-        box["mb"].put(box["pq"], (tid * EL + el) * QUARTERS + q, tot)
 
-    # push: quarter-0 CTAs; wave = peer (the peer table is read wave-uniform), lane = token
-    assert WAVES == W
-    pt = lane % tokens
-    box["dst"] = preg(load_ptr64(peers, wave), 0, "lg")
-    if q == 0:
-        if lane < tokens:
-            got = box["mb"].poll([(box["pq"], (pt * EL + el) * QUARTERS + qq, 1) for qq in range(QUARTERS)])
-            lgt = got[0][0].bitcast(fx.Float32)
-            for qq in range_constexpr(1, QUARTERS):
-                lgt = lgt + got[qq][0].bitcast(fx.Float32)
-            box["mb"].put(box["dst"], pt * EXPERTS + rank * EL + el, lgt)
+    if const_expr("part" in stages):
+        # part: local expert el, quarter q
+        kk = q * KQ + wave * KW + lane * 8
+        w0 = fx.Vector(bo.buffer_load(rsrc(weight), el * HIDDEN + kk, vec_width=4, dtype=T.f32))
+        w1 = fx.Vector(bo.buffer_load(rsrc(weight), el * HIDDEN + kk + 4, vec_width=4, dtype=T.f32))
+        wv = [fx.Float32(w0[i]) for i in range(4)] + [fx.Float32(w1[i]) for i in range(4)]
+        for t in range_constexpr(tokens):
+            xv = fx.Vector(bo.buffer_load(rsrc(x), (t * HIDDEN + kk) // 2, vec_width=4, dtype=T.i32, cache_modifier=in_cm))
+            a = fx.Float32(0.0)
+            for i in range_constexpr(4):
+                lo, hi = bf2_f32(fx.Int32(xv[i]))
+                a = a + lo * wv[2 * i] + hi * wv[2 * i + 1]
+            a = butterfly(a, (32, 16, 8, 4, 2, 1))
+            if lane == 0:
+                fx.ptr_store(a, part + wave * MAX_TOKENS + t)
+        gpu.barrier()
+        if tid < tokens:
+            tot = fx.ptr_load(part + tid)
+            for w in range_constexpr(1, WAVES):
+                tot = tot + fx.ptr_load(part + w * MAX_TOKENS + tid)
+            box["mb"].put(box["pq"], (tid * EL + el) * QUARTERS + q, tot)
 
-    # topk: token bid, wave 0
-    if (bid < tokens) & (wave == 0):
-        li = fx.Int32(lane)
-        got2 = box["mb"].poll([(box["lg"], bid * EXPERTS + lane + 64 * j, 1) for j in range(PER_LANE)])
-        act = []
-        key = []
-        for j in range_constexpr(PER_LANE):
-            lg = got2[j][0].bitcast(fx.Float32)
-            av = hw_rcp(fx.Float32(1.0) + hw_exp2(-lg * fx.Float32(LOG2E)))
-            bv = fx.Float32(bo.buffer_load(rsrc(bias), lane + 64 * j, vec_width=1, dtype=T.f32))
-            act.append(av)
-            key.append(av + bv)
-        neg = fx.Float32(-3.0e38)
-        tsum = fx.Float32(0.0)
-        pick_id = []
-        pick_w = []
-        for r in range_constexpr(TOPK):
-            m = key[0]
-            for j in range_constexpr(1, PER_LANE):
-                m = _max(m, key[j])
-            m = butterfly(m, (32, 16, 8, 4, 2, 1), _max)
-            cand = fx.Int32(1 << 30)
+    if const_expr("push" in stages):
+        # push: quarter-0 CTAs; wave = peer (the peer table is read wave-uniform), lane = token
+        assert WAVES == W
+        pt = lane % tokens
+        box["dst"] = preg(load_ptr64(peers, wave), lg_off, "lg")
+        if q == 0:
+            if lane < tokens:
+                got = box["mb"].poll([(box["pq"], (pt * EL + el) * QUARTERS + qq, 1) for qq in range(QUARTERS)])
+                lgt = got[0][0].bitcast(fx.Float32)
+                for qq in range_constexpr(1, QUARTERS):
+                    lgt = lgt + got[qq][0].bitcast(fx.Float32)
+                box["mb"].put(box["dst"], pt * EXPERTS + rank * EL + el, lgt)
+
+    if const_expr("topk" in stages):
+        # topk: token bid, wave 0
+        if (bid < tokens) & (wave == 0):
+            li = fx.Int32(lane)
+            got2 = box["mb"].poll([(box["lg"], bid * EXPERTS + lane + 64 * j, 1) for j in range(PER_LANE)])
+            act = []
+            key = []
             for j in range_constexpr(PER_LANE):
-                cand = _min_i(cand, (key[j] == m).select(li + 64 * j, fx.Int32(1 << 30)))
-            win = butterfly(cand, (32, 16, 8, 4, 2, 1), _min_i)
-            wa = neg
-            for j in range_constexpr(PER_LANE):
-                hit = (li + 64 * j) == win
-                wa = _max(wa, hit.select(act[j], neg))
-                key[j] = hit.select(neg, key[j])
-            wa = butterfly(wa, (32, 16, 8, 4, 2, 1), _max)
-            pick_id.append(win)
-            pick_w.append(wa)
-            tsum = tsum + wa
-        inv = fx.Float32(1.0) / (tsum + fx.Float32(1e-20))
-        if lane == 0:
+                lg = got2[j][0].bitcast(fx.Float32)
+                av = hw_rcp(fx.Float32(1.0) + hw_exp2(-lg * fx.Float32(LOG2E)))
+                bv = fx.Float32(bo.buffer_load(rsrc(bias), lane + 64 * j, vec_width=1, dtype=T.f32))
+                act.append(av)
+                key.append(av + bv)
+            neg = fx.Float32(-3.0e38)
+            tsum = fx.Float32(0.0)
+            pick_id = []
+            pick_w = []
             for r in range_constexpr(TOPK):
-                bo.buffer_store(fx.Int32(pick_id[r]), rsrc(ids_out), bid * TOPK + r)
-                bo.buffer_store(fx.Float32(pick_w[r] * inv), rsrc(wts_out), bid * TOPK + r)
+                m = key[0]
+                for j in range_constexpr(1, PER_LANE):
+                    m = _max(m, key[j])
+                m = butterfly(m, (32, 16, 8, 4, 2, 1), _max)
+                cand = fx.Int32(1 << 30)
+                for j in range_constexpr(PER_LANE):
+                    cand = _min_i(cand, (key[j] == m).select(li + 64 * j, fx.Int32(1 << 30)))
+                win = butterfly(cand, (32, 16, 8, 4, 2, 1), _min_i)
+                wa = neg
+                for j in range_constexpr(PER_LANE):
+                    hit = (li + 64 * j) == win
+                    wa = _max(wa, hit.select(act[j], neg))
+                    key[j] = hit.select(neg, key[j])
+                wa = butterfly(wa, (32, 16, 8, 4, 2, 1), _max)
+                pick_id.append(win)
+                pick_w.append(wa)
+                tsum = tsum + wa
+            inv = fx.Float32(1.0) / (tsum + fx.Float32(1e-20))
+            if lane == 0:
+                for r in range_constexpr(TOPK):
+                    bo.buffer_store(fx.Int32(pick_id[r]), rsrc(ids_out), bid * TOPK + r, cache_modifier=out_cm)
+                    bo.buffer_store(fx.Float32(pick_w[r] * inv), rsrc(wts_out), bid * TOPK + r, cache_modifier=out_cm)
 
 
 def build_router_tp(npes: int, tokens: int):

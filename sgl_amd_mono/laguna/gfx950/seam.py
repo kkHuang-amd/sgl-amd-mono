@@ -23,7 +23,7 @@ is cleared between steps and a captured graph replays correctly.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common import guard
@@ -74,17 +74,20 @@ def tag_slot(layer: int, phase: int) -> int:
 
 
 @flyc.jit
-def emit_seam(ctx, args, npes, tokens, eps, phase, in_cm=0):
+def emit_seam(ctx, args, npes, tokens, eps, phase, in_cm=0, out_cm=0):
     """The seam's code inside a kernel: ``ctx`` = thread ids, the mailbox dict ``box`` (its
     ``mb``) and the LDS ``red`` (WAVES fp32); ``args`` = the launch's pointers (``scratch``: the
-    seam's ``SS_BYTES``, ``sym``: this rank's seam peer regions). ``in_cm``: the cache policy of
-    the partial / residual loads (CM_DEV when this launch wrote them)."""
+    seam's ``SS_BYTES``, ``sym``: this rank's seam peer regions; optional ``partial2``: a second
+    partial, added to ``partial`` before the push). ``in_cm``: the cache policy of
+    the partial / residual loads (CM_DEV when this launch wrote them); ``out_cm``: of the x /
+    residual stores (CM_DEV when this launch reads them on other CTAs: the XCDs' L2s are not coherent)."""
     W = npes
     REG = phase * region_bytes(W)
     SS = phase * MAX_TOKENS * BLOCKS * 8
     tid, bid, lane, wave, box, red = (ctx[n] for n in ("tid", "bid", "lane", "wave", "box", "red"))
     partial, residual, norm_w, x_out, res_out = (args[n] for n in ("partial", "residual", "norm_w", "x_out", "res_out"))
     peers, rank = args["peers"], args["rank"]
+    partial2 = args.get("partial2")
     box["own"] = preg(args["sym"], REG, "attn")
     box["ss"] = sreg(args["scratch"], SS, "ss")
     c0 = bid * COLS
@@ -104,6 +107,17 @@ def emit_seam(ctx, args, npes, tokens, eps, phase, in_cm=0):
                 )
             )
             v0, v1 = bf2_f32(w)
+            if const_expr(partial2 is not None):
+                # a second bf16 partial (S4 next to S3): added and rounded to bf16 once, as a bf16 add
+                w2 = fx.Int32(
+                    bo.buffer_load(
+                        rsrc(partial2), (tk * HIDDEN + col) // 2, vec_width=1, dtype=T.i32,
+                        cache_modifier=in_cm,
+                    )
+                )
+                u0, u1 = bf2_f32(w2)
+                v0 = v0 + u0
+                v1 = v1 + u1
             box["mb"].put_bf(
                 box["dst"],
                 (rank * MAX_TOKENS + tk) * HIDDEN + col,
@@ -134,6 +148,7 @@ def emit_seam(ctx, args, npes, tokens, eps, phase, in_cm=0):
             fx.Vector.from_elements([n0, n1], fx.Float32).to(fx.BFloat16),
             rsrc(res_out),
             tk * HIDDEN + col,
+            cache_modifier=out_cm,
         )
         sq = n0 * n0 + n1 * n1
     # the token's 32 threads are one half-wave: reduce within it
@@ -173,6 +188,7 @@ def emit_seam(ctx, args, npes, tokens, eps, phase, in_cm=0):
                 ).to(fx.BFloat16),
                 rsrc(x_out),
                 tk * HIDDEN + col,
+                cache_modifier=out_cm,
             )
 
 
