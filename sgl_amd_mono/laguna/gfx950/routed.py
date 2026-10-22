@@ -83,6 +83,9 @@ def _quant_for(vals, shared, is_shared):
     return [is_shared.select(wt[i], wh[i]) for i in range(4)], is_shared.select(bt, bh)
 
 
+OOB = (1 << 30) - 16  # a dword index past the scratch descriptor's range: the load returns 0, no traffic
+
+
 def _silu_mul(g, u):
     return g * hw_rcp(fx.Float32(1.0) + hw_exp2(-g * fx.Float32(LOG2E))) * u
 
@@ -250,9 +253,12 @@ def build_routed(tokens: int, upto: str = "DOWN", shared: bool = False):
                     g_uu = g_tc // (INTER // 16)
                     g_cc = g_tc % (INTER // 16)
                     g_ee = uniform(fx.ptr_load(uexp + g_uu))
-                    return g_uu, g_cc, g_ee
+                    g_mm = uniform(fx.ptr_load(umask + g_uu))
+                    return g_uu, g_cc, g_ee, g_mm
 
-                def g_quarter_of(g_ee, g_cc, g_q):
+                def g_quarter_of(g_ee, g_cc, g_q, g_mm):
+                    # only lanes whose token column is routed to this expert read its x (the rest: zero)
+                    g_on = g_col_ok & (((g_mm >> g_col) & fx.Int32(1)) != fx.Int32(0))
                     g_rr = [g_cc * 16 + g_ni, INTER + g_cc * 16 + g_ni]
                     if const_expr(shared):
                         g_sh = g_ee == fx.Int32(SHARED_ID)
@@ -275,10 +281,10 @@ def build_routed(tokens: int, upto: str = "DOWN", shared: bool = False):
                         g_w = [fx.Vector(bo.buffer_load(rsrc(g_bb), g_wi[g_r], vec_width=4, dtype=T.i32)) for g_r in range(2)]
                         g_ws = [_byte(g_sp, g_si[g_r]) for g_r in range(2)]
                         g_xv = fx.Vector(bo.buffer_load(
-                            rsrc(scratch), (g_xq + g_col * (HIDDEN // 2) + g_gi * 16) // 4, vec_width=4,
+                            rsrc(scratch, SCRATCH_BYTES), g_on.select((g_xq + g_col * (HIDDEN // 2) + g_gi * 16) // 4, fx.Int32(OOB)), vec_width=4,
                             dtype=T.i32, cache_modifier=CM_DEV))
                         g_xs = fx.Int32(bo.buffer_load(
-                            rsrc(scratch), (g_xsr + (g_col * GROUPS + g_gi) * 4) // 4, vec_width=1,
+                            rsrc(scratch, SCRATCH_BYTES), g_on.select((g_xsr + (g_col * GROUPS + g_gi) * 4) // 4, fx.Int32(OOB)), vec_width=1,
                             dtype=T.i32, cache_modifier=CM_DEV))
                         g_l += g_w + g_ws + [g_xv, g_xs]
                     return g_l
@@ -287,16 +293,15 @@ def build_routed(tokens: int, upto: str = "DOWN", shared: bool = False):
                     return [(g_l[6 * g_j:6 * g_j + 2], g_l[6 * g_j + 2:6 * g_j + 4], g_l[6 * g_j + 4], g_l[6 * g_j + 5])
                             for g_j in range(4)]
 
-                _, g_c0, g_e0 = g_task_info(bid)
-                g_first = g_quarter_of(g_e0, g_c0, 0)  # the first task's first quarter, in flight
+                _, g_c0, g_e0, g_m0 = g_task_info(bid)
+                g_first = g_quarter_of(g_e0, g_c0, 0, g_m0)  # the first task's first quarter, in flight
                 for g_task in range(bid, g_ntask, BLOCKS):
-                    g_u, g_cb, g_e = g_task_info(g_task)
-                    g_m = uniform(fx.ptr_load(umask + g_u))
+                    g_u, g_cb, g_e, g_m = g_task_info(g_task)
                     g_base = w13 + fx.Int64(g_e) * W13_BYTES
                     g_rows = [g_cb * 16 + g_ni, INTER + g_cb * 16 + g_ni]
 
                     def g_quarter(g_q):
-                        return g_unpack(g_quarter_of(g_e, g_cb, g_q))
+                        return g_unpack(g_quarter_of(g_e, g_cb, g_q, g_m))
 
                     g_c = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
                     g_next = g_unpack(g_first)
@@ -306,8 +311,8 @@ def build_routed(tokens: int, upto: str = "DOWN", shared: bool = False):
                             g_next = g_quarter(g_q + 1)
                         else:
                             # the next task's first quarter goes out before this task's tail
-                            _, g_cn, g_en = g_task_info(g_task + BLOCKS)
-                            g_first = g_quarter_of(g_en, g_cn, 0)
+                            _, g_cn, g_en, g_mn = g_task_info(g_task + BLOCKS)
+                            g_first = g_quarter_of(g_en, g_cn, 0, g_mn)
                         for g_j in range_constexpr(4):
                             g_w, g_ws, g_xv, g_xs = g_ld[g_j]
                             g_b = g_col_ok.select(g_xv, g_zero4)
@@ -412,33 +417,37 @@ def build_routed(tokens: int, upto: str = "DOWN", shared: bool = False):
                         dsp = s2
                     dww = [fx.Vector(bo.buffer_load(rsrc(dbase), dwi[q], vec_width=4, dtype=T.i32)) for q in range(2)]
                     dsc = [_byte(dsp, dsi[q]) for q in range(2)]
+                    # only lanes whose token is routed to this expert read its mid (the rest: zero)
+                    don = d_col_ok & (((dm >> d_col) & fx.Int32(1)) != fx.Int32(0))
                     dmv = [fx.Vector(bo.buffer_load(
-                        rsrc(scratch), (MQ + (d_c * MAX_TOKENS + d_col) * (INTER // 2) + dg * 16) // 4,
+                        rsrc(scratch, SCRATCH_BYTES), don.select((MQ + (d_c * MAX_TOKENS + d_col) * (INTER // 2) + dg * 16) // 4, fx.Int32(OOB)),
                         vec_width=4, dtype=T.i32, cache_modifier=CM_DEV)) for dg in d_gis]
                     dms = [fx.Int32(bo.buffer_load(
-                        rsrc(scratch), (MS + ((d_c * MAX_TOKENS + d_col) * MGROUPS + dg) * 4) // 4,
+                        rsrc(scratch, SCRATCH_BYTES), don.select((MS + ((d_c * MAX_TOKENS + d_col) * MGROUPS + dg) * 4) // 4, fx.Int32(OOB)),
                         vec_width=1, dtype=T.i32, cache_modifier=CM_DEV)) for dg in d_gis]
                     return [de, dm] + dww + dsc + dmv + dms
 
                 d_acc = fx.Vector.filled(4, 0.0, fx.Float32)
-                DEPTH = 2  # experts in flight ahead of the one computing (4 measured no better)
-                d_fly = [d_load(fx.Int32(d_i)) for d_i in range(DEPTH)]
+                # BATCH experts an iteration, all of their loads issued before any of their math
+                # (straight-line code: no loop-carried loads for the wait analysis to drain)
+                BATCH = 4
                 d_nu = ((skip & fx.Int32(2)) == fx.Int32(0)).select(nu, fx.Int32(0))  # timing aid
-                for d_u in range(d_nu):
-                    d_cur = d_fly[0]
-                    d_fly = d_fly[1:] + [d_load(d_u + DEPTH)]
-                    d_m = d_cur[1]
-                    d_on = d_col_ok & (((d_m >> d_col) & fx.Int32(1)) != fx.Int32(0))
-                    d_cc = fx.Vector.filled(4, 0.0, fx.Float32)
-                    for d_j in range_constexpr(2):
-                        d_mv = d_cur[6 + d_j]
-                        d_ms = d_cur[8 + d_j]
-                        d_cc = mfma_scaled(d_cur[2 + d_j], d_on.select(d_mv, d_zero4), d_cc, d_cur[4 + d_j],
-                                           d_on.select(d_ms, fx.Int32(127)), FP4, FP4)
-                    d_wt = d_on.select(fx.ptr_load(uw + d_u * MAX_TOKENS + d_col), fx.Float32(0.0))
-                    d_acc = fx.Vector.from_elements(
-                        [fx.Float32(d_acc[d_i]) + d_wt * fx.Float32(d_cc[d_i]) for d_i in range(4)], fx.Float32
-                    )
+                for d_ub in range(0, d_nu, BATCH):
+                    d_ld = [d_load(d_ub + d_k) for d_k in range(BATCH)]
+                    for d_k in range_constexpr(BATCH):
+                        d_cur = d_ld[d_k]
+                        d_m = d_cur[1]
+                        d_live = (d_ub + d_k) < d_nu
+                        d_on = d_live & d_col_ok & (((d_m >> d_col) & fx.Int32(1)) != fx.Int32(0))
+                        d_cc = fx.Vector.filled(4, 0.0, fx.Float32)
+                        for d_j in range_constexpr(2):
+                            d_cc = mfma_scaled(d_cur[2 + d_j], d_on.select(d_cur[6 + d_j], d_zero4), d_cc, d_cur[4 + d_j],
+                                               d_on.select(d_cur[8 + d_j], fx.Int32(127)), FP4, FP4)
+                        d_wt = d_on.select(fx.ptr_load(uw + fx.min(d_ub + d_k, nu - 1) * MAX_TOKENS + d_col),
+                                           fx.Float32(0.0))
+                        d_acc = fx.Vector.from_elements(
+                            [fx.Float32(d_acc[d_i]) + d_wt * fx.Float32(d_cc[d_i]) for d_i in range(4)], fx.Float32
+                        )
                 # the wave pair (K halves) through LDS, then rows x tokens out
                 for d_i in range_constexpr(4):
                     fx.ptr_store(fx.Float32(d_acc[d_i]), part + (wave * 16 + d_sub * 4 + d_i) * MAX_TOKENS + d_ni)
