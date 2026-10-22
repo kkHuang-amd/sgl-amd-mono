@@ -26,7 +26,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common import guard
-from sgl_amd_mono.common.mx import scale_index
+from sgl_amd_mono.common.mx import FP4, mfma_scaled, scale_index
 from sgl_amd_mono.common.ops import (
     CM_DEV, ballot, bf2_f32, butterfly, hw_exp2, hw_rcp, lanes_below, popcount, rsrc, uniform, xshfl,
 )
@@ -115,6 +115,8 @@ def build_routed(tokens: int, upto: str = "DOWN"):
         uexp: fx.Array[fx.Int32, U_MAX, 16]
         umask: fx.Array[fx.Int32, U_MAX, 16]
         uw: fx.Array[fx.Float32, U_MAX * MAX_TOKENS, 16]
+        sids: fx.Array[fx.Int32, MAX_TOKENS * TOPK, 16]
+        swts: fx.Array[fx.Float32, MAX_TOKENS * TOPK, 16]
         wc: fx.Array[fx.Int32, WAVES + 1, 16]
         part: fx.Array[fx.Float32, 2 * WAVES * 32 * MAX_TOKENS, 16]
         gu: fx.Array[fx.Float32, 4 * MAX_TOKENS, 16]
@@ -132,6 +134,7 @@ def build_routed(tokens: int, upto: str = "DOWN"):
             wave = tid // 64
             lds = fx.SharedAllocator().allocate(Smem).peek()
             uexp, umask, uw = lds.uexp.ptr, lds.umask.ptr, lds.uw.ptr
+            sids, swts = lds.sids.ptr, lds.swts.ptr
             wc, part, gu = lds.wc.ptr, lds.part.ptr, lds.gu.ptr
             step = uniform(bo.buffer_load(rsrc(epoch), 0, vec_width=1, dtype=T.i32))
             box = {
@@ -142,16 +145,20 @@ def build_routed(tokens: int, upto: str = "DOWN"):
             }
 
             # ---- U: the union, thread e = expert e
+            # the top-k table lands in LDS once (a thread an entry), then every thread scans it
+            if tid < tokens * TOPK:
+                fx.ptr_store(fx.Int32(bo.buffer_load(rsrc(ids), tid, vec_width=1, dtype=T.i32)), sids + tid)
+                fx.ptr_store(fx.Float32(bo.buffer_load(rsrc(wts), tid, vec_width=1, dtype=T.f32)), swts + tid)
+            gpu.barrier()
             e_me = fx.Int32(tid)
             m_me = fx.Int32(0)
             w_me = [fx.Float32(0.0) for _ in range(tokens)]
             for t in range_constexpr(tokens):
                 for kk in range_constexpr(TOPK):
-                    v = fx.Int32(bo.buffer_load(rsrc(ids), t * TOPK + kk, vec_width=1, dtype=T.i32))
+                    v = fx.ptr_load(sids + t * TOPK + kk)
                     hit = v == e_me
                     m_me = m_me | hit.select(fx.Int32(1 << t), fx.Int32(0))
-                    wv = fx.Float32(bo.buffer_load(rsrc(wts), t * TOPK + kk, vec_width=1, dtype=T.f32))
-                    w_me[t] = hit.select(wv, w_me[t])
+                    w_me[t] = hit.select(fx.ptr_load(swts + t * TOPK + kk), w_me[t])
             used = m_me != fx.Int32(0)
             bal = ballot(used)
             if lane == 0:
@@ -194,16 +201,20 @@ def build_routed(tokens: int, upto: str = "DOWN"):
                         box["mb"].put(box["qf"], bid * WAVES + wave, fx.Int32(1))
 
             if const_expr(last >= 2):
-                # ---- UG: tasks (union expert, 16-channel block): gate rows 16 cb .. +15 and
-                # up rows 512 + 16 cb .. +15, whole (16, 16) shuffle groups (no read
-                # amplification). Lane = (row ni = lane % 16, K group 4 q + lane // 16): a wave
-                # load is 1 KB contiguous; wave w owns K groups [64 w, 64 w + 64) (16 loads).
+                # ---- UG (MFMA): tasks (union expert, 16-channel block); per wave K groups
+                # [64 w, 64 w + 64) in 16 steps of 128 K. A = 16 gate (and 16 up) rows, a
+                # lane's 16 B of the (16, 16) shuffle group (row lane % 16, K group lane // 16);
+                # B = 16 token columns of x (token lane % 16, zero past the batch). One
+                # scaled fp4 x fp4 MFMA per row group a step.
                 if tid < tokens * WAVES:
                     box["mb"].poll([(box["qf"], tid, 1)])
                 gpu.barrier()
                 g_ni = lane % 16
                 g_sub = lane // 16
+                g_col_ok = g_ni < tokens
+                g_col = fx.min(g_ni, fx.Int32(tokens - 1))
                 g_ntask = nu * (INTER // 16)
+                g_zero4 = fx.Vector.filled(4, 0, fx.Int32)
                 for g_task in range(bid, g_ntask, BLOCKS):
                     g_u = g_task // (INTER // 16)
                     g_cb = g_task % (INTER // 16)
@@ -211,49 +222,47 @@ def build_routed(tokens: int, upto: str = "DOWN"):
                     g_m = uniform(fx.ptr_load(umask + g_u))
                     g_base = w13 + fx.Int64(g_e) * W13_BYTES
                     g_rows = [g_cb * 16 + g_ni, INTER + g_cb * 16 + g_ni]
-                    g_acc = [fx.Float32(0.0) for _ in range(2 * tokens)]
-                    for g_h in range_constexpr(2):
-                        g_ld = []
-                        for g_j in range_constexpr(8):
-                            g_gi = wave * 64 + (g_h * 8 + g_j) * 4 + g_sub
+
+                    def g_quarter(g_q):
+                        g_l = []
+                        for g_j in range_constexpr(4):
+                            g_gi = wave * 64 + (g_q * 4 + g_j) * 4 + g_sub
+                            g_w = [
+                                fx.Vector(bo.buffer_load(rsrc(g_base), _w13_index(g_rows[g_r], g_gi),
+                                                         vec_width=4, dtype=T.i32))
+                                for g_r in range(2)
+                            ]
+                            g_ws = [_byte(s13, scale_index(g_e * (2 * INTER) + g_rows[g_r], g_gi, GROUPS))
+                                    for g_r in range(2)]
+                            g_xv = fx.Vector(bo.buffer_load(
+                                rsrc(scratch), (XQ + g_col * (HIDDEN // 2) + g_gi * 16) // 4, vec_width=4,
+                                dtype=T.i32, cache_modifier=CM_DEV))
+                            g_xs = fx.Int32(bo.buffer_load(
+                                rsrc(scratch), (XS + (g_col * GROUPS + g_gi) * 4) // 4, vec_width=1,
+                                dtype=T.i32, cache_modifier=CM_DEV))
+                            g_l.append((g_w, g_ws, g_xv, g_xs))
+                        return g_l
+
+                    g_c = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
+                    g_next = g_quarter(0)
+                    for g_q in range_constexpr(4):
+                        g_ld = g_next
+                        if const_expr(g_q + 1 < 4):
+                            g_next = g_quarter(g_q + 1)
+                        for g_j in range_constexpr(4):
+                            g_w, g_ws, g_xv, g_xs = g_ld[g_j]
+                            g_b = g_col_ok.select(g_xv, g_zero4)
+                            g_bs = g_col_ok.select(g_xs, fx.Int32(127))
                             for g_r in range_constexpr(2):
-                                g_ld.append((
-                                    fx.Vector(bo.buffer_load(rsrc(g_base), _w13_index(g_rows[g_r], g_gi),
-                                                             vec_width=4, dtype=T.i32)),
-                                    _byte(s13, scale_index(g_e * (2 * INTER) + g_rows[g_r], g_gi, GROUPS)),
-                                ))
-                        # per routed token: its eight x groups of this half in one batch of
-                        # loads, then the math against the half's weights
-                        for g_t in range_constexpr(tokens):
-                            if ((g_m >> g_t) & fx.Int32(1)) != fx.Int32(0):
-                                g_xb = []
-                                for g_j in range_constexpr(8):
-                                    g_gi = wave * 64 + (g_h * 8 + g_j) * 4 + g_sub
-                                    g_xb.append((
-                                        fx.Vector(bo.buffer_load(
-                                            rsrc(scratch), (XQ + g_t * (HIDDEN // 2) + g_gi * 16) // 4, vec_width=4,
-                                            dtype=T.i32, cache_modifier=CM_DEV)),
-                                        fx.Int32(bo.buffer_load(
-                                            rsrc(scratch), (XS + (g_t * GROUPS + g_gi) * 4) // 4, vec_width=1,
-                                            dtype=T.i32, cache_modifier=CM_DEV)),
-                                    ))
-                                for g_j in range_constexpr(8):
-                                    g_xs = pow2(g_xb[g_j][1])
-                                    for g_c in range_constexpr(4):
-                                        g_xd = decode_word(fx.Int32(g_xb[g_j][0][g_c]), g_xs)
-                                        for g_r in range_constexpr(2):
-                                            g_wd = decode_word(fx.Int32(g_ld[2 * g_j + g_r][0][g_c]),
-                                                               pow2(g_ld[2 * g_j + g_r][1]))
-                                            g_s = g_acc[g_r * tokens + g_t]
-                                            for g_k in range_constexpr(8):
-                                                g_s = g_s + g_wd[g_k] * g_xd[g_k]
-                                            g_acc[g_r * tokens + g_t] = g_s
+                                g_c[g_r] = mfma_scaled(g_w[g_r], g_b, g_c[g_r], g_ws[g_r], g_bs, FP4, FP4)
+                    # C: lane holds rows 4 (lane // 16) + i of column lane % 16 (a token)
                     g_par = (g_task // BLOCKS % 2) * (WAVES * 32 * MAX_TOKENS)
                     for g_r in range_constexpr(2):
-                        for g_t in range_constexpr(tokens):
-                            g_v = butterfly(g_acc[g_r * tokens + g_t], (16, 32))
-                            if g_sub == 0:
-                                fx.ptr_store(g_v, part + g_par + ((wave * 2 + g_r) * 16 + g_ni) * MAX_TOKENS + g_t)
+                        for g_i in range_constexpr(4):
+                            fx.ptr_store(
+                                fx.Float32(g_c[g_r][g_i]),
+                                part + g_par + ((wave * 2 + g_r) * 16 + g_sub * 4 + g_i) * MAX_TOKENS + g_ni,
+                            )
                     gpu.barrier()
                     if tid < tokens * 8:
                         g_t2 = tid // 8
@@ -263,9 +272,9 @@ def build_routed(tokens: int, upto: str = "DOWN"):
                             for g_q in range_constexpr(2):
                                 g_gg = fx.ptr_load(part + g_par + (0 * 16 + g_c2 + g_q) * MAX_TOKENS + g_t2)
                                 g_uu = fx.ptr_load(part + g_par + (1 * 16 + g_c2 + g_q) * MAX_TOKENS + g_t2)
-                                for g_w in range_constexpr(1, WAVES):
-                                    g_gg = g_gg + fx.ptr_load(part + g_par + ((g_w * 2) * 16 + g_c2 + g_q) * MAX_TOKENS + g_t2)
-                                    g_uu = g_uu + fx.ptr_load(part + g_par + ((g_w * 2 + 1) * 16 + g_c2 + g_q) * MAX_TOKENS + g_t2)
+                                for g_w2 in range_constexpr(1, WAVES):
+                                    g_gg = g_gg + fx.ptr_load(part + g_par + ((g_w2 * 2) * 16 + g_c2 + g_q) * MAX_TOKENS + g_t2)
+                                    g_uu = g_uu + fx.ptr_load(part + g_par + ((g_w2 * 2 + 1) * 16 + g_c2 + g_q) * MAX_TOKENS + g_t2)
                                 g_h2.append(_silu_mul(g_gg, g_uu))
                             bo.buffer_store(
                                 fx.Vector.from_elements(g_h2, fx.Float32).to(fx.BFloat16), rsrc(scratch),
@@ -307,9 +316,10 @@ def build_routed(tokens: int, upto: str = "DOWN"):
                     box["mb"].put(box["rf"], bid, fx.Int32(1))
 
             if const_expr(last >= 4):
-                # ---- DOWN: rows [64 b, 64 b + 64) = four (16, 16) shuffle groups; wave w takes
-                # group w // 2, K groups (w % 2) * 8 .. + 8 as two 1 KB loads (lane = row ni,
-                # K group 4 j + lane // 16); route-weighted fp32 sum over the union
+                # ---- DOWN (MFMA): rows [64 b, 64 b + 64) = four shuffle groups; wave w takes
+                # group w // 2 and K steps (w % 2) * 2 .. + 2 (128 K each). A = 16 W2 rows, B = 16
+                # token columns of the expert's quantized mid (zero where the token is not
+                # routed there); per expert C times the column's route weight, summed in fp32
                 if tid < BLOCKS:
                     box["mb"].poll([(box["rf"], tid, 1)])
                 gpu.barrier()
@@ -317,6 +327,9 @@ def build_routed(tokens: int, upto: str = "DOWN"):
                 d_sub = lane // 16
                 d_row = bid * 64 + (wave // 2) * 16 + d_ni
                 d_gis = [(wave % 2) * 8 + d_j * 4 + d_sub for d_j in range(2)]
+                d_col = fx.min(d_ni, fx.Int32(tokens - 1))
+                d_col_ok = d_ni < tokens
+                d_zero4 = fx.Vector.filled(4, 0, fx.Int32)
 
                 def d_load(d_i):
                     d_c = fx.min(d_i, fx.max(nu - 1, fx.Int32(0)))
@@ -330,35 +343,32 @@ def build_routed(tokens: int, upto: str = "DOWN"):
                     dsc = [_byte(s2, scale_index(de * HIDDEN + d_row, dg, MGROUPS)) for dg in d_gis]
                     return [de, dm] + dww + dsc
 
-                d_acc = [fx.Float32(0.0) for _ in range(tokens)]
+                d_acc = fx.Vector.filled(4, 0.0, fx.Float32)
                 d_pre = d_load(fx.Int32(0))
+                d_pre2 = d_load(fx.Int32(1))
                 for d_u in range(nu):
                     d_cur = d_pre
-                    d_pre = d_load(d_u + 1)
+                    d_pre = d_pre2
+                    d_pre2 = d_load(d_u + 2)
                     d_m = d_cur[1]
-                    d_wd = [
-                        [decode_word(fx.Int32(d_cur[2 + d_j][d_c]), pow2(d_cur[4 + d_j])) for d_c in range(4)]
-                        for d_j in range(2)
-                    ]
-                    for d_t in range_constexpr(tokens):
-                        if ((d_m >> d_t) & fx.Int32(1)) != fx.Int32(0):
-                            d_s = fx.Float32(0.0)
-                            for d_j in range_constexpr(2):
-                                d_mw = fx.Vector(bo.buffer_load(
-                                    rsrc(scratch), (MQ + (d_u * MAX_TOKENS + d_t) * (INTER // 2) + d_gis[d_j] * 16) // 4,
-                                    vec_width=4, dtype=T.i32, cache_modifier=CM_DEV))
-                                d_ms = pow2(fx.Int32(bo.buffer_load(
-                                    rsrc(scratch), (MS + ((d_u * MAX_TOKENS + d_t) * MGROUPS + d_gis[d_j]) * 4) // 4,
-                                    vec_width=1, dtype=T.i32, cache_modifier=CM_DEV)))
-                                for d_c in range_constexpr(4):
-                                    d_md = decode_word(fx.Int32(d_mw[d_c]), d_ms)
-                                    for d_k in range_constexpr(8):
-                                        d_s = d_s + d_wd[d_j][d_c][d_k] * d_md[d_k]
-                            d_acc[d_t] = d_acc[d_t] + fx.ptr_load(uw + d_u * MAX_TOKENS + d_t) * d_s
-                for d_t in range_constexpr(tokens):
-                    d_v = butterfly(d_acc[d_t], (16, 32))
-                    if d_sub == 0:
-                        fx.ptr_store(d_v, part + (wave * 16 + d_ni) * MAX_TOKENS + d_t)
+                    d_on = d_col_ok & (((d_m >> d_col) & fx.Int32(1)) != fx.Int32(0))
+                    d_cc = fx.Vector.filled(4, 0.0, fx.Float32)
+                    for d_j in range_constexpr(2):
+                        d_mv = fx.Vector(bo.buffer_load(
+                            rsrc(scratch), (MQ + (d_u * MAX_TOKENS + d_col) * (INTER // 2) + d_gis[d_j] * 16) // 4,
+                            vec_width=4, dtype=T.i32, cache_modifier=CM_DEV))
+                        d_ms = fx.Int32(bo.buffer_load(
+                            rsrc(scratch), (MS + ((d_u * MAX_TOKENS + d_col) * MGROUPS + d_gis[d_j]) * 4) // 4,
+                            vec_width=1, dtype=T.i32, cache_modifier=CM_DEV))
+                        d_cc = mfma_scaled(d_cur[2 + d_j], d_on.select(d_mv, d_zero4), d_cc, d_cur[4 + d_j],
+                                           d_on.select(d_ms, fx.Int32(127)), FP4, FP4)
+                    d_wt = d_on.select(fx.ptr_load(uw + d_u * MAX_TOKENS + d_col), fx.Float32(0.0))
+                    d_acc = fx.Vector.from_elements(
+                        [fx.Float32(d_acc[d_i]) + d_wt * fx.Float32(d_cc[d_i]) for d_i in range(4)], fx.Float32
+                    )
+                # the wave pair (K halves) through LDS, then rows x tokens out
+                for d_i in range_constexpr(4):
+                    fx.ptr_store(fx.Float32(d_acc[d_i]), part + (wave * 16 + d_sub * 4 + d_i) * MAX_TOKENS + d_ni)
                 gpu.barrier()
                 if tid < 4 * 8 * tokens:
                     d_t2 = tid // 32
