@@ -46,32 +46,42 @@ def ulps(a, b):
     return u.max().item(), (a != b).float().mean().item()
 
 
+LAYERS = 3
 ok = True
 for m in [int(x) for x in a.widths.split(",")]:
-    launch = seam.build_seam(ws, m, EPS)
+    # S1 (phase 0) and S5 (phase 1) alternate over LAYERS layers, as the plugin runs them
+    s1 = seam.build_seam(ws, m, EPS, phase=0)
+    s5 = seam.build_seam(ws, m, EPS, phase=1)
     gp = torch.Generator(device=dev).manual_seed(100 + rank)
-    partial = torch.randn(m, H, generator=gp, device=dev).to(torch.bfloat16)
+    parts_in = [torch.randn(m, H, generator=gp, device=dev).to(torch.bfloat16) for _ in range(2 * LAYERS)]
     gr = torch.Generator(device=dev).manual_seed(7)
-    residual = (torch.randn(m, H, generator=gr, device=dev) * 4).to(torch.bfloat16)
-    x_out = torch.empty(m, H, dtype=torch.bfloat16, device=dev)
-    res_out = torch.empty_like(x_out)
-    args = lambda: (partial.data_ptr(), residual.data_ptr(), norm_w.data_ptr(), x_out.data_ptr(),
-                    res_out.data_ptr(), scratch.data_ptr(), peer.local, peer.addresses.data_ptr(),
-                    epoch.data_ptr(), rank, 0)
-    launch(*args(), stream=torch.cuda.current_stream())
-    epoch[0] += 1
-    torch.cuda.synchronize()
-    parts = [torch.empty_like(partial) for _ in range(ws)]
-    dist.all_gather(parts, partial)
-    xr, rr = reference(parts, residual)
-    ux, fx_ = ulps(x_out, xr)
-    ur, fr = ulps(res_out, rr)
-    # graph: launch + step bump, replayed; output must stay bit-identical
-    first_x = x_out.clone()
+    residual0 = (torch.randn(m, H, generator=gr, device=dev) * 4).to(torch.bfloat16)
+    outs = [torch.empty(m, H, dtype=torch.bfloat16, device=dev) for _ in range(2 * LAYERS)]
+    ress = [torch.empty(m, H, dtype=torch.bfloat16, device=dev) for _ in range(2 * LAYERS)]
+
+    def chain():
+        res = residual0
+        for j in range(2 * LAYERS):
+            launch = s1 if j % 2 == 0 else s5
+            launch(parts_in[j].data_ptr(), res.data_ptr(), norm_w.data_ptr(), outs[j].data_ptr(),
+                   ress[j].data_ptr(), scratch.data_ptr(), peer.local, peer.addresses.data_ptr(),
+                   epoch.data_ptr(), rank, seam.tag_slot(j // 2, j % 2), stream=torch.cuda.current_stream())
+            res = ress[j]
+        epoch[0] += 1
+
+    chain(); torch.cuda.synchronize()
+    ux = ur = 0.0
+    res = residual0
+    for j in range(2 * LAYERS):
+        parts = [torch.empty_like(parts_in[j]) for _ in range(ws)]
+        dist.all_gather(parts, parts_in[j])
+        xr, rr = reference(parts, res)
+        ux = max(ux, ulps(outs[j], xr)[0]); ur = max(ur, ulps(ress[j], rr)[0])
+        res = rr
+    first = [o.clone() for o in outs]
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        launch(*args(), stream=torch.cuda.current_stream())
-        epoch[0] += 1
+        chain()
     dist.barrier()
     graph.replay(); torch.cuda.synchronize(); dist.barrier()
     s, e = torch.cuda.Event(True), torch.cuda.Event(True)
@@ -79,15 +89,14 @@ for m in [int(x) for x in a.widths.split(",")]:
     for _ in range(a.replays):
         graph.replay()
     e.record(); torch.cuda.synchronize()
-    us = s.elapsed_time(e) * 1e3 / a.replays
-    stable = torch.equal(first_x, x_out)
+    us = s.elapsed_time(e) * 1e3 / a.replays / (2 * LAYERS)
+    stable = all(torch.equal(f, o) for f, o in zip(first, outs))
     err = [int(epoch[i]) for i in guard.ERROR_WORDS]
     t = torch.tensor([us], device=dev); dist.all_reduce(t, op=dist.ReduceOp.MAX)
     if rank == 0:
-        print(f"M={m:2d} x: max {ux:.0f} ulp, {fx_*100:.2f}% differ | residual: max {ur:.0f} ulp, "
-              f"{fr*100:.2f}% differ | graph stable={stable} errors={err} | {t.item():.1f} us/launch "
-              f"(slowest rank)", flush=True)
-    ok &= stable and err == [0, 0, 0] and ur == 0
+        print(f"M={m:2d} {LAYERS} layers S1/S5 chained: x max {ux:.0f} ulp, residual max {ur:.0f} ulp | "
+              f"graph stable={stable} errors={err} | {t.item():.1f} us/launch (slowest rank)", flush=True)
+    ok &= stable and err == [0, 0, 0] and ur == 0 and ux == 0
 dist.barrier()
 peer.close()
 if rank == 0:

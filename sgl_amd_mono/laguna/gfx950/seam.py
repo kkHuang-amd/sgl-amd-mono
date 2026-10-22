@@ -48,26 +48,42 @@ COLS = HIDDEN // BLOCKS  # 64 hidden columns a CTA
 PAIRS = COLS // 2  # bf16 pairs a token a CTA (32)
 assert COLS * BLOCKS == HIDDEN and PAIRS == 32
 
-# peer buffer: the attention partials [src rank][token][HIDDEN] as tagged bf16 pairs
-# (two words a pair), then the guard flags
-def attn_bytes(npes: int) -> int:
+# peer buffer: two regions of partials [src rank][token][HIDDEN] as tagged bf16 pairs
+# (two words a pair) -- phase 0 the attention output (S1), phase 1 the MoE output
+# (S5) -- then the guard flags. The phases alternate regions, so a rank that runs
+# ahead into the next launch never overwrites partials a slower rank still reads:
+# it can only start a phase after every rank pushed the other one.
+PHASES = 2
+
+
+def region_bytes(npes: int) -> int:
     return npes * MAX_TOKENS * HIDDEN * 4
 
 
 def peer_bytes(npes: int) -> int:
-    return attn_bytes(npes) + guard.FLAG_BYTES
+    return PHASES * region_bytes(npes) + guard.FLAG_BYTES
 
 
-# scratch: the per-CTA sums of squares [token][CTA] as tagged words
-SS_BYTES = MAX_TOKENS * BLOCKS * 8
+# scratch: the per-CTA sums of squares [phase][token][CTA] as tagged words
+SS_BYTES = PHASES * MAX_TOKENS * BLOCKS * 8
 
 
-def build_seam(npes: int, tokens: int, eps: float):
-    """The S1 launch for ``tokens`` rows at TP ``npes``."""
-    assert 1 <= tokens <= MAX_TOKENS and 1 <= npes <= WAVES
+def tag_slot(layer: int, phase: int) -> int:
+    """The ``layer`` argument of a launch: one tag slot per (layer, phase)."""
+    return PHASES * layer + phase
+
+
+def build_seam(npes: int, tokens: int, eps: float, phase: int = 0):
+    """The seam launch for ``tokens`` rows at TP ``npes``: phase 0 = S1 (attention
+    all-reduce + residual + post-attention norm), phase 1 = S5 (MoE all-reduce +
+    residual + the next layer's input norm, or the final norm). ``layer`` at launch
+    is ``tag_slot(layer, phase)``."""
+    assert 1 <= tokens <= MAX_TOKENS and 1 <= npes <= WAVES and phase in (0, 1)
     W = npes
-    keyed = (W, tokens, eps, kernel_sources(__name__), kernel_sources(guard.__name__))
-    name = f"laguna_seam_tp{W}_t{tokens}"
+    REG = phase * region_bytes(W)
+    SS = phase * MAX_TOKENS * BLOCKS * 8
+    keyed = (W, tokens, eps, phase, kernel_sources(__name__), kernel_sources(guard.__name__))
+    name = f"laguna_seam_tp{W}_t{tokens}_p{phase}"
 
     @fx.struct
     class Smem:
@@ -90,7 +106,8 @@ def build_seam(npes: int, tokens: int, eps: float):
         _ = keyed
         with guard.scope(
             guard.Guard(
-                epoch, own=sym, peers=peers, rank=rank, npes=W, flags_offset=attn_bytes(W)
+                epoch, own=sym, peers=peers, rank=rank, npes=W,
+                flags_offset=PHASES * region_bytes(W),
             )
         ):
             tid = fx.thread_idx.x
@@ -103,14 +120,14 @@ def build_seam(npes: int, tokens: int, eps: float):
             # held in a dict: traced branches carry IR values only
             box = {
                 "mb": Mailbox(step * LAYER_SLOTS + layer + 1),
-                "own": preg(sym, 0, "attn"),
-                "ss": sreg(scratch, 0, "ss"),
+                "own": preg(sym, REG, "attn"),
+                "ss": sreg(scratch, SS, "ss"),
             }
             c0 = bid * COLS
 
             # push: wave w -> peer w, a bf16 pair a lane
             dst = load_ptr64(peers, fx.Int32(wave) % W)
-            box["dst"] = preg(dst, 0, "attn")
+            box["dst"] = preg(dst, REG, "attn")
             for c in range_constexpr((PAIRS * tokens + 63) // 64):
                 i = lane + 64 * c
                 if (wave < W) & (i < PAIRS * tokens):
