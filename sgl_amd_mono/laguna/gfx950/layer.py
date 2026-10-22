@@ -21,6 +21,8 @@ the two syncs.
 One mailbox tag a launch: ``step * LAYER_SLOTS + layer + 1``.
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
@@ -66,6 +68,10 @@ WTS = IDS + MAX_TOKENS * TOPK * 4
 SHS = WTS + MAX_TOKENS * TOPK * 4  # S4's scratch
 SH = SHS + shared.SCRATCH_BYTES  # S4's output
 PROF = SH + MAX_TOKENS * HIDDEN * 2
+# S3's Q (x quantized for the routed experts) right after the router's logit push, on CTAs tokens ..
+# 2 tokens - 1, instead of after S3's union: its flags are visible by UG (critical path: the U -> UG gap
+# was ~6-7 us a layer at every M, ~5 us of it the qf hand-off)
+Q_EARLY = os.environ.get("LAGUNA_Q_EARLY", "1") == "1"  # TP8 M1 82.4 -> 76.8 us/layer, TP4 116.7 -> 110.9
 MARKS = 16  # prof build: per CTA, s_memrealtime at the stage boundaries (7-12: inside S3)
 SCRATCH_BYTES = PROF + BLOCKS * MARKS * 8
 
@@ -78,7 +84,7 @@ def build_layer(npes: int, tokens: int, eps: float, prof: bool = False):
     LG, FLAGS, _ = peer_layout(W)
     U = routed.U_MAX
     keyed = (
-        W, tokens, eps, prof, routed.INTER,
+        W, tokens, eps, prof, routed.INTER, Q_EARLY,
         kernel_sources(__name__), kernel_sources(seam.__name__), kernel_sources(router_tp.__name__),
         kernel_sources(routed.__name__), kernel_sources(shared.__name__), kernel_sources(mxq.__name__), kernel_sources(guard.__name__),
     )
@@ -166,6 +172,8 @@ def build_layer(npes: int, tokens: int, eps: float, prof: bool = False):
             }
             shared.emit_shared(ctx, sh_args, tokens, ("Q",), in_cm=CM_DEV)
             router_tp.emit_router(ctx, r_args, W, tokens, ("part", "push"), in_cm=CM_DEV)
+            if const_expr(Q_EARLY):
+                routed.emit_routed_q(ctx, {"x": h, "scratch": scratch}, tokens, False, in_cm=CM_DEV, cta0=tokens)
             shared.emit_shared(ctx, sh_args, tokens, ("GU",))
             mark(3)
             router_tp.emit_router(ctx, r_args, W, tokens, ("topk",), out_cm=CM_DEV)
@@ -181,7 +189,7 @@ def build_layer(npes: int, tokens: int, eps: float, prof: bool = False):
             routed.emit_routed(ctx, {
                 "x": h, "ids": ids, "wts": wts, "w13": w13, "s13": s13, "w2": w2, "s2": s2, "out": moe,
                 "scratch": scratch, "skip": fx.Int32(0), "sw13": sw13, "ss13": ss13, "sw2": sw2, "ss2": ss2,
-            }, tokens, len(routed.STAGES) - 1, False, in_cm=CM_DEV)
+            }, tokens, len(routed.STAGES) - 1, False, in_cm=CM_DEV, q_early=Q_EARLY)
             shared.emit_shared(ctx, sh_args, tokens, ("DOWN",))
             routed._release()
             gpu.barrier()

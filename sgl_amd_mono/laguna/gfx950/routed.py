@@ -145,7 +145,46 @@ def _ms_pos(grp):
 
 
 @flyc.jit
-def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
+def emit_routed_q(ctx, args, tokens, shared, in_cm=0, cta0=0):
+    """S3's Q: quantize x (hip rule; + the triton rule for the fused shared expert), a CTA a token
+    (CTAs cta0 .. cta0 + tokens - 1), a thread a group -> XQ / XS, flags ``qf``. The fused layer runs it
+    early (``q_early``), while the router's logits cross the GPUs."""
+    tid, bid, lane, wave, box = (ctx[n] for n in ("tid", "bid", "lane", "wave", "box"))
+    x, scratch = args["x"], args["scratch"]
+    box["qf"] = sreg(scratch, QF, "qf")
+    tk = bid - cta0
+    if (bid >= cta0) & (bid < cta0 + tokens):
+        vals = []
+        for c in range_constexpr(4):
+            wv4 = fx.Vector(
+                bo.buffer_load(rsrc(x), (tk * HIDDEN + tid * 32) // 2 + 4 * c, vec_width=4, dtype=T.i32, cache_modifier=in_cm)
+            )
+            for i in range_constexpr(4):
+                a, b = bf2_f32(fx.Int32(wv4[i]))
+                vals += [a, b]
+        words, byte = quant_group(vals, "hip")
+        bo.buffer_store(fx.Vector.from_elements(words, fx.Int32), rsrc(scratch),
+                        (XQ + tk * (HIDDEN // 2) + tid * 16) // 4, cache_modifier=CM_DEV)
+        if const_expr(XS_PACK):
+            bo.buffer_store(fx.Int8(byte), rsrc(scratch), XS + tk * GROUPS + _xs_pos(tid), cache_modifier=CM_DEV)
+        else:
+            bo.buffer_store(byte, rsrc(scratch), (XS + (tk * GROUPS + tid) * 4) // 4, cache_modifier=CM_DEV)
+        if const_expr(shared):
+            words_t, byte_t = quant_group(vals, "triton")
+            bo.buffer_store(fx.Vector.from_elements(words_t, fx.Int32), rsrc(scratch),
+                            (XQT + tk * (HIDDEN // 2) + tid * 16) // 4, cache_modifier=CM_DEV)
+            if const_expr(XS_PACK):
+                bo.buffer_store(fx.Int8(byte_t), rsrc(scratch), XST + tk * GROUPS + _xs_pos(tid), cache_modifier=CM_DEV)
+            else:
+                bo.buffer_store(byte_t, rsrc(scratch), (XST + (tk * GROUPS + tid) * 4) // 4,
+                                cache_modifier=CM_DEV)
+        _release()
+        if lane == 0:
+            box["mb"].put(box["qf"], tk * WAVES + wave, fx.Int32(1))
+
+
+@flyc.jit
+def emit_routed(ctx, args, tokens, last, shared, in_cm=0, q_early=False):
     """S3's code inside a kernel: ``ctx`` = thread ids, the mailbox dict ``box`` (its ``mb``) and
     the LDS arrays of ``Smem`` (``build_routed``); ``args`` = the launch's pointers and ``skip``
     (``scratch``: ``SCRATCH_BYTES``). ``last``: the index of the last stage run. ``in_cm``: the
@@ -208,35 +247,9 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
     mark(7)
 
     if const_expr(last >= 1):
-        # ---- Q: quantize x (hip rule), a thread a group
-        if bid < tokens:
-            vals = []
-            for c in range_constexpr(4):
-                wv4 = fx.Vector(
-                    bo.buffer_load(rsrc(x), (bid * HIDDEN + tid * 32) // 2 + 4 * c, vec_width=4, dtype=T.i32, cache_modifier=in_cm)
-                )
-                for i in range_constexpr(4):
-                    a, b = bf2_f32(fx.Int32(wv4[i]))
-                    vals += [a, b]
-            words, byte = quant_group(vals, "hip")
-            bo.buffer_store(fx.Vector.from_elements(words, fx.Int32), rsrc(scratch),
-                            (XQ + bid * (HIDDEN // 2) + tid * 16) // 4, cache_modifier=CM_DEV)
-            if const_expr(XS_PACK):
-                bo.buffer_store(fx.Int8(byte), rsrc(scratch), XS + bid * GROUPS + _xs_pos(tid), cache_modifier=CM_DEV)
-            else:
-                bo.buffer_store(byte, rsrc(scratch), (XS + (bid * GROUPS + tid) * 4) // 4, cache_modifier=CM_DEV)
-            if const_expr(shared):
-                words_t, byte_t = quant_group(vals, "triton")
-                bo.buffer_store(fx.Vector.from_elements(words_t, fx.Int32), rsrc(scratch),
-                                (XQT + bid * (HIDDEN // 2) + tid * 16) // 4, cache_modifier=CM_DEV)
-                if const_expr(XS_PACK):
-                    bo.buffer_store(fx.Int8(byte_t), rsrc(scratch), XST + bid * GROUPS + _xs_pos(tid), cache_modifier=CM_DEV)
-                else:
-                    bo.buffer_store(byte_t, rsrc(scratch), (XST + (bid * GROUPS + tid) * 4) // 4,
-                                    cache_modifier=CM_DEV)
-            _release()
-            if lane == 0:
-                box["mb"].put(box["qf"], bid * WAVES + wave, fx.Int32(1))
+        # ---- Q: quantize x (hip rule), a thread a group (the fused layer: earlier, ``q_early``)
+        if const_expr(not q_early):
+            emit_routed_q(ctx, args, tokens, shared, in_cm)
         mark(8)
 
     if const_expr(last >= 2):
