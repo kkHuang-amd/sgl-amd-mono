@@ -123,6 +123,16 @@ FOLD_RQ = os.environ.get("LAGUNA_FOLD_RQ", "1") == "1"
 MS_PACK = os.environ.get("LAGUNA_MS_PACK", "1") == "1"
 # W2 scales: aiter's shuffle_scale dword holds rows (r, r + 16) x K groups (c, c + 4) = a DOWN lane's
 # groups j, j + 1 (j even): one dword load a pair instead of one a group (routed experts only)
+# x scales as bytes, a UG lane's 4 K steps of a quarter adjacent: one load a quarter instead of four
+XS_PACK = os.environ.get("LAGUNA_XS_PACK", "1") == "1"  # bit-identical; UG TP8 M8 -3..4 us, TP4 M4 -3 us
+
+
+def _xs_pos(g):
+    """byte of x group ``g`` in its token row of XS / XST (XS_PACK): group 64 w + 4 s + l (UG wave w,
+    K step s = 4 q + j, lane quarter l) at 64 w + 16 l + s"""
+    return (g // 64) * 64 + (g % 4) * 16 + (g % 64) // 4
+
+
 UGS_PAIR = os.environ.get("LAGUNA_UGS_PAIR", "1") == "1"  # the same for UG's W13 scales (routed experts): TP4 M8 UG 324 -> 317 us
 W2S_PAIR = os.environ.get("LAGUNA_W2S_PAIR", "1") == "1"  # bit-identical; DOWN TP4 M8 160 -> 158 us  # TP4 M8 DOWN 183 -> 161 us, TP8 95 -> 90
 
@@ -209,13 +219,19 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
             words, byte = quant_group(vals, "hip")
             bo.buffer_store(fx.Vector.from_elements(words, fx.Int32), rsrc(scratch),
                             (XQ + bid * (HIDDEN // 2) + tid * 16) // 4, cache_modifier=CM_DEV)
-            bo.buffer_store(byte, rsrc(scratch), (XS + (bid * GROUPS + tid) * 4) // 4, cache_modifier=CM_DEV)
+            if const_expr(XS_PACK):
+                bo.buffer_store(fx.Int8(byte), rsrc(scratch), XS + bid * GROUPS + _xs_pos(tid), cache_modifier=CM_DEV)
+            else:
+                bo.buffer_store(byte, rsrc(scratch), (XS + (bid * GROUPS + tid) * 4) // 4, cache_modifier=CM_DEV)
             if const_expr(shared):
                 words_t, byte_t = quant_group(vals, "triton")
                 bo.buffer_store(fx.Vector.from_elements(words_t, fx.Int32), rsrc(scratch),
                                 (XQT + bid * (HIDDEN // 2) + tid * 16) // 4, cache_modifier=CM_DEV)
-                bo.buffer_store(byte_t, rsrc(scratch), (XST + (bid * GROUPS + tid) * 4) // 4,
-                                cache_modifier=CM_DEV)
+                if const_expr(XS_PACK):
+                    bo.buffer_store(fx.Int8(byte_t), rsrc(scratch), XST + bid * GROUPS + _xs_pos(tid), cache_modifier=CM_DEV)
+                else:
+                    bo.buffer_store(byte_t, rsrc(scratch), (XST + (bid * GROUPS + tid) * 4) // 4,
+                                    cache_modifier=CM_DEV)
             _release()
             if lane == 0:
                 box["mb"].put(box["qf"], bid * WAVES + wave, fx.Int32(1))
@@ -270,6 +286,12 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
                                                        vec_width=1, dtype=T.i32))
                         g_wsp[(g_j, g_r)] = (g_sw >> (g_a * 8)) & fx.Int32(0xFF)
                         g_wsp[(g_j + 1, g_r)] = (g_sw >> ((2 + g_a) * 8)) & fx.Int32(0xFF)
+            if const_expr(XS_PACK):
+                # the lane's 4 x scale bytes of this quarter: one dword
+                g_xw = fx.Int32(bo.buffer_load(
+                    rsrc(scratch, SCRATCH_BYTES),
+                    g_on.select((g_xsr + g_col * GROUPS + wave * 64 + g_sub * 16 + g_q * 4) // 4, fx.Int32(OOB)),
+                    vec_width=1, dtype=T.i32, cache_modifier=CM_DEV))
             for g_j in range_constexpr(4):
                 g_gi = wave * 64 + (g_q * 4 + g_j) * 4 + g_sub
                 g_wi = [_w13_index(g_rr[g_r], g_gi) for g_r in range(2)]
@@ -285,9 +307,12 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
                 g_xv = fx.Vector(bo.buffer_load(
                     rsrc(scratch, SCRATCH_BYTES), g_on.select((g_xq + g_col * (HIDDEN // 2) + g_gi * 16) // 4, fx.Int32(OOB)), vec_width=4,
                     dtype=T.i32, cache_modifier=CM_DEV))
-                g_xs = fx.Int32(bo.buffer_load(
-                    rsrc(scratch, SCRATCH_BYTES), g_on.select((g_xsr + (g_col * GROUPS + g_gi) * 4) // 4, fx.Int32(OOB)), vec_width=1,
-                    dtype=T.i32, cache_modifier=CM_DEV))
+                if const_expr(XS_PACK):
+                    g_xs = (g_xw >> (g_j * 8)) & fx.Int32(0xFF)
+                else:
+                    g_xs = fx.Int32(bo.buffer_load(
+                        rsrc(scratch, SCRATCH_BYTES), g_on.select((g_xsr + (g_col * GROUPS + g_gi) * 4) // 4, fx.Int32(OOB)), vec_width=1,
+                        dtype=T.i32, cache_modifier=CM_DEV))
                 g_l += g_w + g_ws + [g_xv, g_xs]
             return g_l
 
@@ -545,6 +570,7 @@ def build_routed(tokens: int, upto: str = "DOWN", shared: bool = False):
         MS_PACK,
         W2S_PAIR,
         UGS_PAIR,
+        XS_PACK,
         os.environ.get("LAGUNA_DN_BATCH", "4"),
         upto,
         shared,
