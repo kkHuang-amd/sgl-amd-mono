@@ -87,6 +87,7 @@ def build_layer(npes: int, tokens: int, eps: float, prof: bool = False):
     @fx.struct
     class Smem:
         red: fx.Array[fx.Float32, WAVES, 16]
+        fsum: fx.Array[fx.Float32, MAX_TOKENS * seam.COLS, 16]
         rpart: fx.Array[fx.Float32, WAVES * MAX_TOKENS, 16]
         uexp: fx.Array[fx.Int32, U, 16]
         umask: fx.Array[fx.Int32, U, 16]
@@ -120,7 +121,7 @@ def build_layer(npes: int, tokens: int, eps: float, prof: bool = False):
                 "rt": sreg(scratch, RT, "rt"),
             }
             ctx = {"tid": tid, "bid": bid, "lane": lane, "wave": wave, "box": box,
-                   "red": lds.red.ptr, "rpart": lds.rpart.ptr}
+                   "red": lds.red.ptr, "fsum": lds.fsum.ptr, "rpart": lds.rpart.ptr}
             for n in ("uexp", "umask", "uw", "sids", "swts", "wc", "part", "gu", "spart"):
                 ctx[n] = getattr(lds, n).ptr
             h = scratch + fx.Int64(H)

@@ -38,7 +38,7 @@ epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
 def shared_ref(x):
     xq, xs = dynamic_mxfp4_quant(x)
     gu = gemm_afp4wfp4(xq, sw13, xs, ss13, torch.bfloat16)
-    mid = (F.silu(gu[:, :I].float()) * gu[:, I:].float()).to(torch.bfloat16)
+    mid = F.silu(gu[:, :I]) * gu[:, I:]  # SGLang's SiluAndMul: bf16(silu(gate)) * up
     mq, ms = dynamic_mxfp4_quant(mid)
     return gemm_afp4wfp4(mq, sw2, ms, ss2, torch.bfloat16)
 

@@ -55,6 +55,11 @@ assert COLS * BLOCKS == HIDDEN and PAIRS == 32
 # it can only start a phase after every rank pushed the other one.
 PHASES = 2
 
+# aiter's opus fused add + RMSNorm (SGLang's, hidden > 8192) normalizes its register-
+# cached first 8192 columns from the fp32 sum and reloads the rest as the rounded
+# (stored) residual; the sum of squares is over the fp32 sum. One rounding at the end.
+NORM_FP32_COLS = 8192
+
 
 def region_bytes(npes: int) -> int:
     return npes * MAX_TOKENS * HIDDEN * 4
@@ -84,7 +89,7 @@ def emit_seam(ctx, args, npes, tokens, eps, phase, in_cm=0, out_cm=0):
     W = npes
     REG = phase * region_bytes(W)
     SS = phase * MAX_TOKENS * BLOCKS * 8
-    tid, bid, lane, wave, box, red = (ctx[n] for n in ("tid", "bid", "lane", "wave", "box", "red"))
+    tid, bid, lane, wave, box, red, fsum = (ctx[n] for n in ("tid", "bid", "lane", "wave", "box", "red", "fsum"))
     partial, residual, norm_w, x_out, res_out = (args[n] for n in ("partial", "residual", "norm_w", "x_out", "res_out"))
     peers, rank = args["peers"], args["rank"]
     partial2 = args.get("partial2")
@@ -142,15 +147,21 @@ def emit_seam(ctx, args, npes, tokens, eps, phase, in_cm=0, out_cm=0):
             )
         )
         r0, r1 = bf2_f32(rw)
-        n0 = bf16_round(bf16_round(s0) + r0)
-        n1 = bf16_round(bf16_round(s1) + r1)
+        # SGLang's fused add + RMSNorm (aiter opus): the residual is the rounded sum, the
+        # sum of squares is over the fp32 sum, the norm reads it (see NORM_FP32_COLS)
+        f0 = bf16_round(s0) + r0
+        f1 = bf16_round(s1) + r1
+        n0 = bf16_round(f0)
+        n1 = bf16_round(f1)
+        fx.ptr_store(f0, fsum + tk * COLS + (tid % PAIRS) * 2)
+        fx.ptr_store(f1, fsum + tk * COLS + (tid % PAIRS) * 2 + 1)
         bo.buffer_store(
             fx.Vector.from_elements([n0, n1], fx.Float32).to(fx.BFloat16),
             rsrc(res_out),
             tk * HIDDEN + col,
             cache_modifier=out_cm,
         )
-        sq = n0 * n0 + n1 * n1
+        sq = f0 * f0 + f1 * f1
     # the token's 32 threads are one half-wave: reduce within it
     sq = butterfly(sq, (16, 8, 4, 2, 1))
     if (tid < PAIRS * tokens) & (tid % PAIRS == 0):
@@ -175,17 +186,12 @@ def emit_seam(ctx, args, npes, tokens, eps, phase, in_cm=0, out_cm=0):
             col = c0 + tid * 2
             nw = fx.Int32(bo.buffer_load(rsrc(norm_w), col // 2, vec_width=1, dtype=T.i32))
             w0, w1 = bf2_f32(nw)
-            rw2 = fx.Int32(
-                bo.buffer_load(
-                    rsrc(res_out), (tk * HIDDEN + col) // 2, vec_width=1, dtype=T.i32,
-                    cache_modifier=CM_DEV,
-                )
-            )
-            n0, n1 = bf2_f32(rw2)
+            n0 = fx.ptr_load(fsum + tk * COLS + tid * 2)
+            n1 = fx.ptr_load(fsum + tk * COLS + tid * 2 + 1)
+            n0 = (c0 >= NORM_FP32_COLS).select(bf16_round(n0), n0)
+            n1 = (c0 >= NORM_FP32_COLS).select(bf16_round(n1), n1)
             bo.buffer_store(
-                fx.Vector.from_elements(
-                    [bf16_round(n0 * rstd) * w0, bf16_round(n1 * rstd) * w1], fx.Float32
-                ).to(fx.BFloat16),
+                fx.Vector.from_elements([n0 * rstd * w0, n1 * rstd * w1], fx.Float32).to(fx.BFloat16),
                 rsrc(x_out),
                 tk * HIDDEN + col,
                 cache_modifier=out_cm,
@@ -206,6 +212,7 @@ def build_seam(npes: int, tokens: int, eps: float, phase: int = 0):
     @fx.struct
     class Smem:
         red: fx.Array[fx.Float32, WAVES, 16]
+        fsum: fx.Array[fx.Float32, MAX_TOKENS * COLS, 16]
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def k(
@@ -237,7 +244,7 @@ def build_seam(npes: int, tokens: int, eps: float, phase: int = 0):
             step = uniform(bo.buffer_load(rsrc(epoch), 0, vec_width=1, dtype=T.i32))
             # held in a dict: traced branches carry IR values only
             box = {"mb": Mailbox(step * LAYER_SLOTS + layer + 1)}
-            c = {"tid": tid, "bid": bid, "lane": lane, "wave": wave, "box": box, "red": red}
+            c = {"tid": tid, "bid": bid, "lane": lane, "wave": wave, "box": box, "red": red, "fsum": lds.fsum.ptr}
             a = {
                 "partial": partial, "residual": residual, "norm_w": norm_w, "x_out": x_out,
                 "res_out": res_out, "scratch": scratch, "sym": sym, "peers": peers, "rank": rank,

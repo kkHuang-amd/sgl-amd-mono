@@ -149,8 +149,13 @@ class _Built:
 
     def __init__(self, lm, rt=None):
         self.lm, self.model, self.rt = lm, lm.model, rt
-        self.check = os.environ.get("SGLANG_AMD_MONO_CHECK", "0") == "1"
+        mode = os.environ.get("SGLANG_AMD_MONO_CHECK", "0")
+        self.check = mode in ("1", "2")
+        self.check_parts = mode == "2"  # also the launch's hand-offs vs SGLang's ops on them
         self._checked = 0
+
+    def _check_parts(self, i, layer, partial, residual, forward_batch, x=None, res=None, norm=None):
+        _check_parts_impl(self.rt, i, layer, partial, residual, x, res, norm)
 
     def forward(self, plan, input_ids, positions, forward_batch, *args, **kwargs):
         lm = self.lm
@@ -179,11 +184,18 @@ class _Built:
                 out, residual = _ffn_reference(layer, partial, residual, forward_batch)
                 x, residual = norm(out, residual)
             else:
+                if self.check_parts and check:
+                    pin, rin = partial.clone(), residual.clone()
                 x, residual = self.rt.launch(i, partial.contiguous(), residual)
+                if self.check_parts and check and self._checked < 2:
+                    self._check_parts(i, layer, pin, rin, forward_batch, x, residual, norm)
             if check:
                 rels.append((_rel(x, ref_x), _rel(residual, ref_res)))
         if self.rt is not None:
             self.rt.advance_step()
+        if check and self._checked < 3:
+            logger.info("SGLANG_AMD_MONO_CHECK laguna per layer next input rel: %s",
+                        " ".join(f"{r[0]:.1e}" for r in rels))
         if check and self._checked < 50:
             self._checked += 1
             logger.info(
@@ -192,6 +204,77 @@ class _Built:
                 "" if self.rt is None else f" guard errors {self.rt.errors()}",
             )
         return x
+
+def _check_parts_impl(rt, i, layer, partial, residual, x_out=None, res_out=None, norm=None):
+    """Layer i's hand-offs in the launch's scratch vs SGLang's ops on the same inputs."""
+    from sglang.srt.distributed import tensor_model_parallel_all_reduce
+
+    from sgl_amd_mono.laguna.gfx950 import layer as L
+
+    torch.cuda.synchronize()
+    w, H = partial.shape[0], L.HIDDEN
+    sb = rt.scratch
+
+    def view(off, n, dt):
+        return sb[off:off + n * torch.empty(0, dtype=dt).element_size()].view(dt)
+
+    h = view(L.H, w * H, torch.bfloat16).view(w, H).clone()
+    ids = view(L.IDS, w * 16, torch.int32).view(w, 16).clone()
+    wts = view(L.WTS, w * 16, torch.float32).view(w, 16).clone()
+    moe = view(L.MOE, w * H, torch.bfloat16).view(w, H).clone()
+    sh = view(L.SH, w * H, torch.bfloat16).view(w, H).clone()
+    res_mid = view(L.RES_MID, w * H, torch.bfloat16).view(w, H).clone()
+    if x_out is not None:
+        # S5 alone: SGLang's MoE all-reduce + add + norm on our own partials and residual
+        part = (moe.float() + sh.float()).to(torch.bfloat16)
+        s5_ar = tensor_model_parallel_all_reduce(part.clone())
+        s5_x, s5_res = norm(s5_ar.clone(), res_mid.clone())
+        logger.info(
+            "SGLANG_AMD_MONO_CHECK parts layer %d S5 alone: x rel %.2e res rel %.2e | ar norm %.3e res_mid norm %.3e "
+            "| S1 alone: res_mid vs SGLang add rel %.2e",
+            i, _rel(x_out, s5_x), _rel(res_out, s5_res), s5_ar.float().norm().item(), res_mid.float().norm().item(),
+            _rel(res_mid, layer.post_attention_layernorm(tensor_model_parallel_all_reduce(partial.clone()), residual.clone())[1]),
+        )
+    attn = tensor_model_parallel_all_reduce(partial)
+    h_ref, _ = layer.post_attention_layernorm(attn, residual)
+    mlp = layer.mlp
+    logits = mlp.gate(h)
+    tk = mlp.topk(h, logits)
+    rid, rwt = tk.topk_ids.to(torch.int32), tk.topk_weights.float()
+    same_set = (ids.sort(1).values == rid.sort(1).values).all(1)
+    shared_ref = mlp.shared_expert(h)
+    shared_ref2 = mlp.shared_expert(h)
+    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
+    from aiter.ops.triton.quant import dynamic_mxfp4_quant
+
+    gu_l, dn_l = mlp.shared_expert.gate_up_proj, mlp.shared_expert.down_proj
+    xq, xs = dynamic_mxfp4_quant(h)
+    gu = gemm_afp4wfp4(xq, gu_l.weight.view(torch.uint8), xs, gu_l.weight_scale.view(torch.uint8), torch.bfloat16)
+    nI = gu.shape[1] // 2
+    mid = (torch.nn.functional.silu(gu[:, :nI].float()) * gu[:, nI:].float()).to(torch.bfloat16)
+    mq, ms = dynamic_mxfp4_quant(mid)
+    quark = gemm_afp4wfp4(mq, dn_l.weight.view(torch.uint8), ms, dn_l.weight_scale.view(torch.uint8), torch.bfloat16)
+    gu_sg = gu_l(h)[0]
+    mid_sg = mlp.shared_expert.act_fn(gu)
+    logger.info(
+        "SGLANG_AMD_MONO_CHECK parts layer %d shared: gate_up SGLang vs ops %.2e | act SGLang vs fp32 silu*up->bf16 %.2e "
+        "(%d of %d elements differ; SGLang vs bf16(silu(g)) * u %.2e, vs bf16(bf16(silu(g)) * u) %.2e)",
+        i, _rel(gu_sg, gu), _rel(mid_sg, mid), int((mid_sg != mid).sum()), mid.numel(),
+        _rel(mid_sg, (torch.nn.functional.silu(gu[:, :nI].float()).to(torch.bfloat16).float() * gu[:, nI:].float()).to(torch.bfloat16)),
+        _rel(mid_sg, (torch.nn.functional.silu(gu[:, :nI].float()).to(torch.bfloat16) * gu[:, nI:])),
+    )
+    routed_ref = mlp.experts(h, tk)
+    # our routed output with SGLang's routing only when the sets agree for every row
+    logger.info(
+        "SGLANG_AMD_MONO_CHECK parts layer %d rows %d: h rel %.2e | top-k sets equal %d/%d, order equal %d, "
+        "weight sums ours %.4f ref %.4f | shared rel %.2e (SGLang vs itself %.2e, ours vs quark ops %.2e, "
+        "SGLang vs quark ops %.2e) | routed rel %.2e | ids0 %s ref %s",
+        i, w, _rel(h, h_ref), int(same_set.sum()), w, int((ids == rid).all(1).sum()),
+        wts.sum(1).mean().item(), rwt.sum(1).mean().item(), _rel(sh, shared_ref), _rel(shared_ref2, shared_ref),
+        _rel(sh, quark), _rel(shared_ref, quark), _rel(moe, routed_ref),
+        ids[0, :6].tolist(), rid[0, :6].tolist(),
+    )
+
 
 def _rel(a, b) -> float:
     return ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-30)).item()

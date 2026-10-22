@@ -184,7 +184,8 @@ def emit_shared(ctx, args, tokens, stages=STAGES, in_cm=0, out_cm=0):
                                 rsrc(scratch), (PART + ((k2 * 2 * INTER + hrow) * MAX_TOKENS + ht) * 4) // 4,
                                 vec_width=1, dtype=T.f32, cache_modifier=CM_DEV))
                         hv.append(bf16_round(htot))
-                    hh.append(_silu_mul(hv[0], hv[1]))
+                    # SGLang's SiluAndMul: silu(gate) rounded to bf16, times up
+                    hh.append(bf16_round(_silu_mul(hv[0], fx.Float32(1.0))) * hv[1])
                 bo.buffer_store(
                     fx.Vector.from_elements(hh, fx.Float32).to(fx.BFloat16), rsrc(scratch),
                     MID // 2 + ht * INTER + bid * 16 + hc, cache_modifier=CM_DEV,
