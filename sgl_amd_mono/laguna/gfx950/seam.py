@@ -77,7 +77,10 @@ def ag_offset(npes: int) -> int:
 # rank (all-gather): ~4x fewer xGMI bytes than one-shot (every partial to every rank), one
 # more hop. Same sums, same rounding: bit-identical results.
 TWO_SHOT_MIN = int(os.environ.get("LAGUNA_SEAM_TWO_SHOT_MIN", "2"))  # seam M1-16: 8.0/10.2/13.1/19.2/32.9 -> 8.5/9.2/10.9/13.9/20.6 us
-ENV_KEY = (TWO_SHOT_MIN,)  # for the fused layer's kernel cache key
+# norm for every token at once: thread (token, s) sums partials 8 s .. 8 s + 7 of its token, a half-wave
+# reduces them (the per-token loop polled + barriered once a token: ~2/3 of a seam at M16)
+NORM_PAR = os.environ.get("LAGUNA_SEAM_NORM_PAR", "1") == "1"  # layer M16 -5 us (TP8 + TP4)
+ENV_KEY = (TWO_SHOT_MIN, NORM_PAR)  # for the fused layer's kernel cache key
 
 
 def peer_bytes(npes: int) -> int:
@@ -118,6 +121,7 @@ def emit_seam(ctx, args, npes, tokens, eps, phase, in_cm=0, out_cm=0):
     REG = phase * region_bytes(W)
     SS = phase * MAX_TOKENS * BLOCKS * 8
     tid, bid, lane, wave, box, red, fsum = (ctx[n] for n in ("tid", "bid", "lane", "wave", "box", "red", "fsum"))
+    mark = ctx.get("mark", lambda i: None)  # the fused layer's prof build: 16 + 3 phase + k
     partial, residual, norm_w, x_out, res_out = (args[n] for n in ("partial", "residual", "norm_w", "x_out", "res_out"))
     peers, rank = args["peers"], args["rank"]
     partial2 = args.get("partial2")
@@ -154,6 +158,7 @@ def emit_seam(ctx, args, npes, tokens, eps, phase, in_cm=0, out_cm=0):
                     [v0, v1],
                 )
 
+    mark(16 + 3 * phase)
     if const_expr(two):
         # owner: the ranks' partials of these columns summed in rank order, rounded to bf16
         # (the all-reduce's output), pushed to every rank's AG region
@@ -174,6 +179,7 @@ def emit_seam(ctx, args, npes, tokens, eps, phase, in_cm=0, out_cm=0):
                     for p in range_constexpr(W):
                         box["mb"].put_bf(box[f"ag{p}"], tk * HIDDEN + col, [a0, a1])
 
+    mark(17 + 3 * phase)
     # sum: every rank's partials in rank order (two-shot: the owner's sum), + residual; squares
     sq = fx.Float32(0.0)
     if tid < PAIRS * tokens:
@@ -216,35 +222,67 @@ def emit_seam(ctx, args, npes, tokens, eps, phase, in_cm=0, out_cm=0):
     if (tid < PAIRS * tokens) & (tid % PAIRS == 0):
         box["mb"].put(box["ss"], (tid // PAIRS) * BLOCKS + bid, sq)
 
-    # norm: each token's BLOCKS partial sums of squares -> rstd
-    for tk in range_constexpr(tokens):
+    mark(18 + 3 * phase)
+    if const_expr(NORM_PAR):
+        # norm: thread (token tk, s) = the sum phase's thread (tk, pair s): its token's partials
+        # 8 s .. 8 s + 7 (4 tagged pairs-of-two), a half-wave sum -> rstd, then its own pair's output
+        assert BLOCKS == 8 * PAIRS and THREADS >= PAIRS * MAX_TOKENS
         part = fx.Float32(0.0)
-        if tid < BLOCKS:
-            got = box["mb"].poll([(box["ss"], tk * BLOCKS + tid, 1)])
-            part = got[0][0].bitcast(fx.Float32)
-        part = butterfly(part, (32, 16, 8, 4, 2, 1))
-        gpu.barrier()
-        if lane == 0:
-            fx.ptr_store(part, red + wave)
-        gpu.barrier()
-        tot = fx.ptr_load(red + 0)
-        for w in range_constexpr(1, BLOCKS // 64):
-            tot = tot + fx.ptr_load(red + w)
-        rstd = hw_rsq(tot / fx.Float32(float(HIDDEN)) + fx.Float32(eps))
-        if tid < PAIRS:
-            col = c0 + tid * 2
+        if tid < PAIRS * tokens:
+            n_tk = tid // PAIRS
+            n_p = tid % PAIRS
+            for q in range_constexpr(4):  # one pending load a spin (4 at once: a polling storm at M16)
+                got = box["mb"].poll([(box["ss"], n_tk * BLOCKS + n_p * 8 + 2 * q, 2)])
+                for i in range_constexpr(2):
+                    part = part + got[0][i].bitcast(fx.Float32)
+        part = butterfly(part, (16, 8, 4, 2, 1))  # the token's 32 threads are one half-wave
+        rstd = hw_rsq(part / fx.Float32(float(HIDDEN)) + fx.Float32(eps))
+        if tid < PAIRS * tokens:
+            n_tk = tid // PAIRS
+            n_p = tid % PAIRS
+            col = c0 + n_p * 2
             nw = fx.Int32(bo.buffer_load(rsrc(norm_w), col // 2, vec_width=1, dtype=T.i32))
             w0, w1 = bf2_f32(nw)
-            n0 = fx.ptr_load(fsum + tk * COLS + tid * 2)
-            n1 = fx.ptr_load(fsum + tk * COLS + tid * 2 + 1)
+            n0 = fx.ptr_load(fsum + n_tk * COLS + n_p * 2)
+            n1 = fx.ptr_load(fsum + n_tk * COLS + n_p * 2 + 1)
             n0 = (c0 >= NORM_FP32_COLS).select(bf16_round(n0), n0)
             n1 = (c0 >= NORM_FP32_COLS).select(bf16_round(n1), n1)
             bo.buffer_store(
                 fx.Vector.from_elements([n0 * rstd * w0, n1 * rstd * w1], fx.Float32).to(fx.BFloat16),
                 rsrc(x_out),
-                tk * HIDDEN + col,
+                n_tk * HIDDEN + col,
                 cache_modifier=out_cm,
             )
+    else:
+        # norm: each token's BLOCKS partial sums of squares -> rstd
+        for tk in range_constexpr(tokens):
+            part = fx.Float32(0.0)
+            if tid < BLOCKS:
+                got = box["mb"].poll([(box["ss"], tk * BLOCKS + tid, 1)])
+                part = got[0][0].bitcast(fx.Float32)
+            part = butterfly(part, (32, 16, 8, 4, 2, 1))
+            gpu.barrier()
+            if lane == 0:
+                fx.ptr_store(part, red + wave)
+            gpu.barrier()
+            tot = fx.ptr_load(red + 0)
+            for w in range_constexpr(1, BLOCKS // 64):
+                tot = tot + fx.ptr_load(red + w)
+            rstd = hw_rsq(tot / fx.Float32(float(HIDDEN)) + fx.Float32(eps))
+            if tid < PAIRS:
+                col = c0 + tid * 2
+                nw = fx.Int32(bo.buffer_load(rsrc(norm_w), col // 2, vec_width=1, dtype=T.i32))
+                w0, w1 = bf2_f32(nw)
+                n0 = fx.ptr_load(fsum + tk * COLS + tid * 2)
+                n1 = fx.ptr_load(fsum + tk * COLS + tid * 2 + 1)
+                n0 = (c0 >= NORM_FP32_COLS).select(bf16_round(n0), n0)
+                n1 = (c0 >= NORM_FP32_COLS).select(bf16_round(n1), n1)
+                bo.buffer_store(
+                    fx.Vector.from_elements([n0 * rstd * w0, n1 * rstd * w1], fx.Float32).to(fx.BFloat16),
+                    rsrc(x_out),
+                    tk * HIDDEN + col,
+                    cache_modifier=out_cm,
+                )
 
 
 
@@ -255,7 +293,7 @@ def build_seam(npes: int, tokens: int, eps: float, phase: int = 0):
     is ``tag_slot(layer, phase)``."""
     assert 1 <= tokens <= MAX_TOKENS and 1 <= npes <= WAVES and phase in (0, 1)
     W = npes
-    keyed = (W, tokens, eps, phase, TWO_SHOT_MIN, kernel_sources(__name__), kernel_sources(guard.__name__))
+    keyed = (W, tokens, eps, phase, TWO_SHOT_MIN, NORM_PAR, kernel_sources(__name__), kernel_sources(guard.__name__))
     name = f"laguna_seam_tp{W}_t{tokens}_p{phase}"
 
     @fx.struct

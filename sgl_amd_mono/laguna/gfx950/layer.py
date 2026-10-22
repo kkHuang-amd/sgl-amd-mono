@@ -72,7 +72,7 @@ PROF = SH + MAX_TOKENS * HIDDEN * 2
 # 2 tokens - 1, instead of after S3's union: its flags are visible by UG (critical path: the U -> UG gap
 # was ~6-7 us a layer at every M, ~5 us of it the qf hand-off)
 Q_EARLY = os.environ.get("LAGUNA_Q_EARLY", "1") == "1"  # TP8 M1 82.4 -> 76.8 us/layer, TP4 116.7 -> 110.9
-MARKS = 16  # prof build: per CTA, s_memrealtime at the stage boundaries (7-12: inside S3)
+MARKS = 24  # prof build: per CTA, s_memrealtime at the stage boundaries (7-12 S3, 13-15 router, 16-21 seams)
 SCRATCH_BYTES = PROF + BLOCKS * MARKS * 8
 
 

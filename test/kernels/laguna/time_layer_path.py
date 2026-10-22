@@ -42,10 +42,12 @@ scr = [torch.zeros(layer.SCRATCH_BYTES // 4, dtype=torch.int32, device=dev) for 
 P = lambda t: t.data_ptr()
 cs = torch.cuda.current_stream
 # program order of the marks (layer.py 0-6, routed.py 7-12)
-ORDER = [(0, "start"), (1, "S1 seam"), (2, "xf sync"), (3, "S2 logits+push, S4 Q/GU"),
+ORDER = [(0, "start"), (16, "S1 push"), (17, "S1 owner sum+AG push"), (18, "S1 AG wait, +res, ss"), (1, "S1 norm"),
+         (2, "xf sync"), (3, "S2 logits+push, S4 Q/GU"),
          (13, "logits in (topk CTAs)"), (14, "topk (topk CTAs)"), (15, "rt put, S4 GR/RQ"), (4, "rt wait"),
          (7, "S3 U"), (8, "S3 Q"), (9, "S3 qf wait"), (10, "S3 UG"), (11, "S3 rf wait"), (12, "S3 DOWN"),
-         (5, "S3 out, S4 DOWN, barrier"), (6, "S5 seam")]
+         (5, "S3 out, S4 DOWN, barrier"), (19, "S5 push"), (20, "S5 owner sum+AG push"),
+         (21, "S5 AG wait, +res, ss"), (6, "S5 norm")]
 
 for m in widths:
     fused = layer.build_layer(ws, m, EPS, prof=True)
