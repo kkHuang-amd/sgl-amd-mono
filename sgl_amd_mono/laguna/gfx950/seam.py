@@ -64,12 +64,17 @@ NORM_FP32_COLS = 8192
 
 
 def region_bytes(npes: int) -> int:
-    # [src rank][token][HIDDEN] partials, then [token][HIDDEN] all-gathered sums (two-shot)
-    return (npes + 1) * MAX_TOKENS * HIDDEN * 4
+    # [src rank][token][HIDDEN] partials, then [token][HIDDEN] all-gathered sums (two-shot), then
+    # [token][CTA] the owners' sums of squares (two-shot, SS_AG)
+    return (npes + 1) * MAX_TOKENS * HIDDEN * 4 + MAX_TOKENS * BLOCKS * 8
 
 
 def ag_offset(npes: int) -> int:
     return npes * MAX_TOKENS * HIDDEN * 4
+
+
+def ags_offset(npes: int) -> int:
+    return (npes + 1) * MAX_TOKENS * HIDDEN * 4
 
 
 # from this many rows the all-reduce runs two-shot: each CTA's columns go to their owner rank
@@ -80,7 +85,11 @@ TWO_SHOT_MIN = int(os.environ.get("LAGUNA_SEAM_TWO_SHOT_MIN", "2"))  # seam M1-1
 # norm for every token at once: thread (token, s) sums partials 8 s .. 8 s + 7 of its token, a half-wave
 # reduces them (the per-token loop polled + barriered once a token: ~2/3 of a seam at M16)
 NORM_PAR = os.environ.get("LAGUNA_SEAM_NORM_PAR", "1") == "1"  # layer M16 -5 us (TP8 + TP4)
-ENV_KEY = (TWO_SHOT_MIN, NORM_PAR)  # for the fused layer's kernel cache key
+# two-shot: the owner CTA, which has its columns' final sums, also adds the residual and pushes the
+# columns' sum of squares with the all-gather, so the norm reads it from the peer region instead of a
+# second hand-off between the CTAs of a rank (same values, same order: bit-identical)
+SS_AG = os.environ.get("LAGUNA_SEAM_SS_AG", "1") == "1"  # layer M16 TP8 418 -> 408, TP4 778 -> 764 us
+ENV_KEY = (TWO_SHOT_MIN, NORM_PAR, SS_AG)  # for the fused layer's kernel cache key
 
 
 def peer_bytes(npes: int) -> int:
@@ -131,6 +140,10 @@ def emit_seam(ctx, args, npes, tokens, eps, phase, in_cm=0, out_cm=0):
     c0 = bid * COLS
 
     two = tokens >= TWO_SHOT_MIN
+    ss_ag = two and SS_AG
+    assert not ss_ag or (NORM_PAR and PAIRS * MAX_TOKENS <= THREADS)
+    if const_expr(ss_ag):
+        box["ags"] = preg(args["sym"], REG + ags_offset(W), "ags")
     owner = bid // (BLOCKS // W)  # two-shot: the rank that reduces this CTA's columns
     if const_expr(two):
         # reduce-scatter push: every wave, its share of the CTA's pairs, to the owner only
@@ -164,6 +177,9 @@ def emit_seam(ctx, args, npes, tokens, eps, phase, in_cm=0, out_cm=0):
         # (the all-reduce's output), pushed to every rank's AG region
         for p in range_constexpr(W):
             box[f"ag{p}"] = preg(load_ptr64(peers, p), REG + ag_offset(W), "ag")
+            if const_expr(ss_ag):
+                box[f"ags{p}"] = preg(load_ptr64(peers, p), REG + ags_offset(W), "ags")
+        osq = fx.Float32(0.0)
         if owner == rank:
             for ci in range_constexpr((PAIRS * tokens + THREADS - 1) // THREADS):
                 i = tid + THREADS * ci
@@ -178,6 +194,19 @@ def emit_seam(ctx, args, npes, tokens, eps, phase, in_cm=0, out_cm=0):
                     )
                     for p in range_constexpr(W):
                         box["mb"].put_bf(box[f"ag{p}"], tk * HIDDEN + col, [a0, a1])
+                    if const_expr(ss_ag):
+                        # the receivers' f = bf16(sum) + residual, squared (as the sum phase below)
+                        orw = fx.Int32(bo.buffer_load(rsrc(residual), (tk * HIDDEN + col) // 2, vec_width=1,
+                                                      dtype=T.i32, cache_modifier=in_cm))
+                        or0, or1 = bf2_f32(orw)
+                        of0 = bf16_round(a0) + or0
+                        of1 = bf16_round(a1) + or1
+                        osq = of0 * of0 + of1 * of1
+        if const_expr(ss_ag):
+            osq = butterfly(osq, (16, 8, 4, 2, 1))  # thread (token, pair): a token is a half-wave
+            if (owner == rank) & (tid < PAIRS * tokens) & (tid % PAIRS == 0):
+                for p in range_constexpr(W):
+                    box["mb"].put(box[f"ags{p}"], (tid // PAIRS) * BLOCKS + bid, osq)
 
     mark(17 + 3 * phase)
     # sum: every rank's partials in rank order (two-shot: the owner's sum), + residual; squares
@@ -217,10 +246,11 @@ def emit_seam(ctx, args, npes, tokens, eps, phase, in_cm=0, out_cm=0):
             cache_modifier=out_cm,
         )
         sq = f0 * f0 + f1 * f1
-    # the token's 32 threads are one half-wave: reduce within it
-    sq = butterfly(sq, (16, 8, 4, 2, 1))
-    if (tid < PAIRS * tokens) & (tid % PAIRS == 0):
-        box["mb"].put(box["ss"], (tid // PAIRS) * BLOCKS + bid, sq)
+    if const_expr(not ss_ag):
+        # the token's 32 threads are one half-wave: reduce within it
+        sq = butterfly(sq, (16, 8, 4, 2, 1))
+        if (tid < PAIRS * tokens) & (tid % PAIRS == 0):
+            box["mb"].put(box["ss"], (tid // PAIRS) * BLOCKS + bid, sq)
 
     mark(18 + 3 * phase)
     if const_expr(NORM_PAR):
@@ -232,7 +262,7 @@ def emit_seam(ctx, args, npes, tokens, eps, phase, in_cm=0, out_cm=0):
             n_tk = tid // PAIRS
             n_p = tid % PAIRS
             for q in range_constexpr(4):  # one pending load a spin (4 at once: a polling storm at M16)
-                got = box["mb"].poll([(box["ss"], n_tk * BLOCKS + n_p * 8 + 2 * q, 2)])
+                got = box["mb"].poll([(box["ags" if ss_ag else "ss"], n_tk * BLOCKS + n_p * 8 + 2 * q, 2)])
                 for i in range_constexpr(2):
                     part = part + got[0][i].bitcast(fx.Float32)
         part = butterfly(part, (16, 8, 4, 2, 1))  # the token's 32 threads are one half-wave
@@ -293,7 +323,7 @@ def build_seam(npes: int, tokens: int, eps: float, phase: int = 0):
     is ``tag_slot(layer, phase)``."""
     assert 1 <= tokens <= MAX_TOKENS and 1 <= npes <= WAVES and phase in (0, 1)
     W = npes
-    keyed = (W, tokens, eps, phase, TWO_SHOT_MIN, NORM_PAR, kernel_sources(__name__), kernel_sources(guard.__name__))
+    keyed = (W, tokens, eps, phase, TWO_SHOT_MIN, NORM_PAR, SS_AG, kernel_sources(__name__), kernel_sources(guard.__name__))
     name = f"laguna_seam_tp{W}_t{tokens}_p{phase}"
 
     @fx.struct
