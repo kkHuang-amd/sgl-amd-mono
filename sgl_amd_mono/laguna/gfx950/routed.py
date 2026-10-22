@@ -118,6 +118,16 @@ STAGES = ("U", "Q", "UG", "RQ", "DOWN")
 # UG requantizes MID itself (task pairs a CTA): no RQ stage, one grid sync before DOWN
 # (S3 M1/2/4/8/16 50.7/86.8/158.5/268.9/455.2 -> 47.5/82.5/156.7/269.5/447.3 us; LAGUNA_FOLD_RQ=0: old path)
 FOLD_RQ = os.environ.get("LAGUNA_FOLD_RQ", "1") == "1"
+# MID scales as bytes, a DOWN lane's MGROUPS / 8 groups adjacent: one scale load an expert instead of
+# MGROUPS / 8 (ATT, TP4 M8: DOWN is buffer_load issue-bound, 16 loads an expert a lane for 160 B)
+MS_PACK = os.environ.get("LAGUNA_MS_PACK", "1") == "1"  # TP4 M8 DOWN 183 -> 161 us, TP8 95 -> 90
+
+
+def _ms_pos(grp):
+    """byte of MID group ``grp`` in its (expert, token) row of MS (MS_PACK): group h * MGROUPS / 2
+    + 4 j + s (DOWN wave half h, K step j, lane quarter s) at h * MGROUPS / 2 + s * MGROUPS / 8 + j"""
+    half, r = grp // (MGROUPS // 2), grp % (MGROUPS // 2)
+    return half * (MGROUPS // 2) + (r % 4) * (MGROUPS // 8) + r // 4
 
 
 @flyc.jit
@@ -357,8 +367,12 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
                         bo.buffer_store(fx.Vector.from_elements(f_words, fx.Int32), rsrc(scratch),
                                         (MQ + (g_u * MAX_TOKENS + tid) * (INTER // 2) + f_grp * 16) // 4,
                                         cache_modifier=CM_DEV)
-                        bo.buffer_store(f_byte, rsrc(scratch), (MS + ((g_u * MAX_TOKENS + tid) * MGROUPS + f_grp) * 4) // 4,
-                                        cache_modifier=CM_DEV)
+                        if const_expr(MS_PACK):
+                            bo.buffer_store(fx.Int8(f_byte), rsrc(scratch), MS + (g_u * MAX_TOKENS + tid) * MGROUPS + _ms_pos(f_grp),
+                                            cache_modifier=CM_DEV)
+                        else:
+                            bo.buffer_store(f_byte, rsrc(scratch), (MS + ((g_u * MAX_TOKENS + tid) * MGROUPS + f_grp) * 4) // 4,
+                                            cache_modifier=CM_DEV)
         _release()
         gpu.barrier()
         if tid == 0:
@@ -387,8 +401,12 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
                 q_words, q_byte = _quant_for(q_vals, shared, fx.ptr_load(uexp + q_u) == fx.Int32(SHARED_ID))
                 bo.buffer_store(fx.Vector.from_elements(q_words, fx.Int32), rsrc(scratch),
                                 (MQ + (q_u * MAX_TOKENS + q_t) * (INTER // 2) + q_grp * 16) // 4, cache_modifier=CM_DEV)
-                bo.buffer_store(q_byte, rsrc(scratch), (MS + ((q_u * MAX_TOKENS + q_t) * MGROUPS + q_grp) * 4) // 4,
-                                cache_modifier=CM_DEV)
+                if const_expr(MS_PACK):
+                    bo.buffer_store(fx.Int8(q_byte), rsrc(scratch), MS + (q_u * MAX_TOKENS + q_t) * MGROUPS + _ms_pos(q_grp),
+                                    cache_modifier=CM_DEV)
+                else:
+                    bo.buffer_store(q_byte, rsrc(scratch), (MS + ((q_u * MAX_TOKENS + q_t) * MGROUPS + q_grp) * 4) // 4,
+                                    cache_modifier=CM_DEV)
         _release()
         gpu.barrier()
         if tid == 0:
@@ -434,9 +452,16 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
             dmv = [fx.Vector(bo.buffer_load(
                 rsrc(scratch, SCRATCH_BYTES), don.select((MQ + (d_c * MAX_TOKENS + d_col) * (INTER // 2) + dg * 16) // 4, fx.Int32(OOB)),
                 vec_width=4, dtype=T.i32, cache_modifier=CM_DEV)) for dg in d_gis]
-            dms = [fx.Int32(bo.buffer_load(
-                rsrc(scratch, SCRATCH_BYTES), don.select((MS + ((d_c * MAX_TOKENS + d_col) * MGROUPS + dg) * 4) // 4, fx.Int32(OOB)),
-                vec_width=1, dtype=T.i32, cache_modifier=CM_DEV)) for dg in d_gis]
+            if const_expr(MS_PACK):
+                # the lane's DNG scale bytes are adjacent: one dword (TP8: 2 bytes at byte 0 or 2 of it)
+                d_sb = MS + (d_c * MAX_TOKENS + d_col) * MGROUPS + (wave % 2) * (MGROUPS // 2) + d_sub * DNG
+                d_sw = fx.Int32(bo.buffer_load(rsrc(scratch, SCRATCH_BYTES), don.select(d_sb // 4, fx.Int32(OOB)),
+                                               vec_width=1, dtype=T.i32, cache_modifier=CM_DEV))
+                dms = [(d_sw >> ((d_sb % 4 + q) * 8)) & fx.Int32(0xFF) for q in range(DNG)]
+            else:
+                dms = [fx.Int32(bo.buffer_load(
+                    rsrc(scratch, SCRATCH_BYTES), don.select((MS + ((d_c * MAX_TOKENS + d_col) * MGROUPS + dg) * 4) // 4, fx.Int32(OOB)),
+                    vec_width=1, dtype=T.i32, cache_modifier=CM_DEV)) for dg in d_gis]
             return [de, dm] + dww + dsc + dmv + dms
 
         d_acc = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -491,6 +516,7 @@ def build_routed(tokens: int, upto: str = "DOWN", shared: bool = False):
         tokens,
         INTER,
         FOLD_RQ,
+        MS_PACK,
         os.environ.get("LAGUNA_DN_BATCH", "4"),
         upto,
         shared,
