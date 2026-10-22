@@ -28,7 +28,7 @@ from flydsl.expr.typing import Int32, Int64, T
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.mx import FP4, mfma_scaled, scale_index
 from sgl_amd_mono.common.ops import (
-    CM_DEV, ballot, bf2_f32, butterfly, hw_exp2, hw_rcp, lanes_below, popcount, rsrc, uniform, xshfl,
+    CM_DEV, ballot, bf2_f32, bf16_round, butterfly, hw_exp2, hw_rcp, lanes_below, popcount, rsrc, uniform, xshfl,
 )
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, kernel_sources
 from sgl_amd_mono.common.sync import Mailbox, sreg
@@ -40,7 +40,8 @@ INTER = 512
 EXPERTS = 512
 TOPK = 16
 MAX_TOKENS = 16
-U_MAX = MAX_TOKENS * TOPK  # distinct experts a step at most
+U_MAX = MAX_TOKENS * TOPK + 1  # distinct experts a step at most, + the shared expert (fused build)
+SHARED_ID = EXPERTS  # the shared expert's id in the union (fused build)
 LAYER_SLOTS = 64
 GROUPS = HIDDEN // 32
 MGROUPS = INTER // 32
@@ -52,7 +53,9 @@ assert EXPERTS == THREADS and GROUPS == THREADS and 2 * BLOCKS == INTER
 # scratch layout (bytes)
 XQ = 0
 XS = XQ + MAX_TOKENS * HIDDEN // 2
-MID = XS + MAX_TOKENS * GROUPS * 4
+XQT = XS + MAX_TOKENS * GROUPS * 4  # x quantized with the triton rule (the shared expert's)
+XST = XQT + MAX_TOKENS * HIDDEN // 2
+MID = XST + MAX_TOKENS * GROUPS * 4
 MQ = MID + U_MAX * MAX_TOKENS * INTER * 2
 MS = MQ + U_MAX * MAX_TOKENS * INTER // 2
 QF = MS + U_MAX * MAX_TOKENS * MGROUPS * 4
@@ -69,6 +72,15 @@ def _release():
 def _byte(ptr, byte_index, cm=0):
     w = fx.Int32(bo.buffer_load(rsrc(ptr), byte_index // 4, vec_width=1, dtype=T.i32, cache_modifier=cm))
     return (w >> ((byte_index % 4) * 8)) & fx.Int32(0xFF)
+
+
+def _quant_for(vals, shared, is_shared):
+    """The MXFP4 quant of a mid group: hip rule (routed), or triton for the shared expert."""
+    if not shared:
+        return quant_group(vals, "hip")
+    wh, bh = quant_group(vals, "hip")
+    wt, bt = quant_group(vals, "triton")
+    return [is_shared.select(wt[i], wh[i]) for i in range(4)], is_shared.select(bt, bh)
 
 
 def _silu_mul(g, u):
@@ -97,18 +109,22 @@ def _w2_group_index(row, grp):
 STAGES = ("U", "Q", "UG", "RQ", "DOWN")
 
 
-def build_routed(tokens: int, upto: str = "DOWN"):
-    """``upto``: the last stage to run (a timing aid; anything short of DOWN writes no output)."""
+def build_routed(tokens: int, upto: str = "DOWN", shared: bool = False):
+    """``upto``: the last stage to run (a timing aid; anything short of DOWN writes no output).
+    ``shared``: fuse the shared expert in as union entry ``SHARED_ID`` (every token, weight 1.0):
+    its quark row-major weights read in place, its activations quantized with the triton rule,
+    as the separate S4 launch does; the output is then routed + shared, summed in fp32."""
     assert 1 <= tokens <= MAX_TOKENS
     last = STAGES.index(upto)
     keyed = (
         tokens,
         upto,
+        shared,
         kernel_sources(__name__),
         kernel_sources(mxq.__name__),
         kernel_sources(guard.__name__),
     )
-    name = f"laguna_routed_t{tokens}" + ("" if upto == "DOWN" else f"_upto{upto}")
+    name = f"laguna_routed_t{tokens}" + ("_sh" if shared else "") + ("" if upto == "DOWN" else f"_upto{upto}")
 
     @fx.struct
     class Smem:
@@ -125,6 +141,7 @@ def build_routed(tokens: int, upto: str = "DOWN"):
     def k(
         x: Int64, ids: Int64, wts: Int64, w13: Int64, s13: Int64, w2: Int64, s2: Int64, out: Int64,
         scratch: Int64, epoch: Int64, layer: Int32, skip: Int32,
+        sw13: Int64, ss13: Int64, sw2: Int64, ss2: Int64,
     ):
         _ = keyed
         with guard.scope(guard.Guard(epoch)):
@@ -177,6 +194,12 @@ def build_routed(tokens: int, upto: str = "DOWN"):
                 tot = fx.Int32(0)
                 for w in range_constexpr(WAVES):
                     tot = tot + fx.ptr_load(wc + w)
+                if const_expr(shared):
+                    fx.ptr_store(fx.Int32(SHARED_ID), uexp + tot)
+                    fx.ptr_store(fx.Int32((1 << tokens) - 1), umask + tot)
+                    for t in range_constexpr(tokens):
+                        fx.ptr_store(fx.Float32(1.0), uw + tot * MAX_TOKENS + t)
+                    tot = tot + 1
                 fx.ptr_store(tot, wc + WAVES)
             gpu.barrier()
             nu = uniform(fx.ptr_load(wc + WAVES))
@@ -196,6 +219,12 @@ def build_routed(tokens: int, upto: str = "DOWN"):
                     bo.buffer_store(fx.Vector.from_elements(words, fx.Int32), rsrc(scratch),
                                     (XQ + bid * (HIDDEN // 2) + tid * 16) // 4, cache_modifier=CM_DEV)
                     bo.buffer_store(byte, rsrc(scratch), (XS + (bid * GROUPS + tid) * 4) // 4, cache_modifier=CM_DEV)
+                    if const_expr(shared):
+                        words_t, byte_t = quant_group(vals, "triton")
+                        bo.buffer_store(fx.Vector.from_elements(words_t, fx.Int32), rsrc(scratch),
+                                        (XQT + bid * (HIDDEN // 2) + tid * 16) // 4, cache_modifier=CM_DEV)
+                        bo.buffer_store(byte_t, rsrc(scratch), (XST + (bid * GROUPS + tid) * 4) // 4,
+                                        cache_modifier=CM_DEV)
                     _release()
                     if lane == 0:
                         box["mb"].put(box["qf"], bid * WAVES + wave, fx.Int32(1))
@@ -224,21 +253,32 @@ def build_routed(tokens: int, upto: str = "DOWN"):
                     return g_uu, g_cc, g_ee
 
                 def g_quarter_of(g_ee, g_cc, g_q):
-                    g_bb = w13 + fx.Int64(g_ee) * W13_BYTES
                     g_rr = [g_cc * 16 + g_ni, INTER + g_cc * 16 + g_ni]
+                    if const_expr(shared):
+                        g_sh = g_ee == fx.Int32(SHARED_ID)
+                        g_bb = g_sh.select(sw13, w13 + fx.Int64(fx.min(g_ee, fx.Int32(EXPERTS - 1))) * W13_BYTES)
+                        g_sp = g_sh.select(ss13, s13)
+                        g_xq = g_sh.select(fx.Int32(XQT), fx.Int32(XQ))
+                        g_xsr = g_sh.select(fx.Int32(XST), fx.Int32(XS))
+                    else:
+                        g_bb = w13 + fx.Int64(g_ee) * W13_BYTES
+                        g_sp = s13
+                        g_xq, g_xsr = XQ, XS
                     g_l = []
                     for g_j in range_constexpr(4):
                         g_gi = wave * 64 + (g_q * 4 + g_j) * 4 + g_sub
-                        g_w = [
-                            fx.Vector(bo.buffer_load(rsrc(g_bb), _w13_index(g_rr[g_r], g_gi), vec_width=4, dtype=T.i32))
-                            for g_r in range(2)
-                        ]
-                        g_ws = [_byte(s13, scale_index(g_ee * (2 * INTER) + g_rr[g_r], g_gi, GROUPS)) for g_r in range(2)]
+                        g_wi = [_w13_index(g_rr[g_r], g_gi) for g_r in range(2)]
+                        g_si = [scale_index(g_ee * (2 * INTER) + g_rr[g_r], g_gi, GROUPS) for g_r in range(2)]
+                        if const_expr(shared):  # the shared expert: quark row-major [N, K/2] / [N, K/32]
+                            g_wi = [g_sh.select((g_rr[g_r] * (HIDDEN // 2) + g_gi * 16) // 4, g_wi[g_r]) for g_r in range(2)]
+                            g_si = [g_sh.select(g_rr[g_r] * GROUPS + g_gi, g_si[g_r]) for g_r in range(2)]
+                        g_w = [fx.Vector(bo.buffer_load(rsrc(g_bb), g_wi[g_r], vec_width=4, dtype=T.i32)) for g_r in range(2)]
+                        g_ws = [_byte(g_sp, g_si[g_r]) for g_r in range(2)]
                         g_xv = fx.Vector(bo.buffer_load(
-                            rsrc(scratch), (XQ + g_col * (HIDDEN // 2) + g_gi * 16) // 4, vec_width=4,
+                            rsrc(scratch), (g_xq + g_col * (HIDDEN // 2) + g_gi * 16) // 4, vec_width=4,
                             dtype=T.i32, cache_modifier=CM_DEV))
                         g_xs = fx.Int32(bo.buffer_load(
-                            rsrc(scratch), (XS + (g_col * GROUPS + g_gi) * 4) // 4, vec_width=1,
+                            rsrc(scratch), (g_xsr + (g_col * GROUPS + g_gi) * 4) // 4, vec_width=1,
                             dtype=T.i32, cache_modifier=CM_DEV))
                         g_l += g_w + g_ws + [g_xv, g_xs]
                     return g_l
@@ -256,24 +296,7 @@ def build_routed(tokens: int, upto: str = "DOWN"):
                     g_rows = [g_cb * 16 + g_ni, INTER + g_cb * 16 + g_ni]
 
                     def g_quarter(g_q):
-                        g_l = []
-                        for g_j in range_constexpr(4):
-                            g_gi = wave * 64 + (g_q * 4 + g_j) * 4 + g_sub
-                            g_w = [
-                                fx.Vector(bo.buffer_load(rsrc(g_base), _w13_index(g_rows[g_r], g_gi),
-                                                         vec_width=4, dtype=T.i32))
-                                for g_r in range(2)
-                            ]
-                            g_ws = [_byte(s13, scale_index(g_e * (2 * INTER) + g_rows[g_r], g_gi, GROUPS))
-                                    for g_r in range(2)]
-                            g_xv = fx.Vector(bo.buffer_load(
-                                rsrc(scratch), (XQ + g_col * (HIDDEN // 2) + g_gi * 16) // 4, vec_width=4,
-                                dtype=T.i32, cache_modifier=CM_DEV))
-                            g_xs = fx.Int32(bo.buffer_load(
-                                rsrc(scratch), (XS + (g_col * GROUPS + g_gi) * 4) // 4, vec_width=1,
-                                dtype=T.i32, cache_modifier=CM_DEV))
-                            g_l.append((g_w, g_ws, g_xv, g_xs))
-                        return g_l
+                        return g_unpack(g_quarter_of(g_e, g_cb, g_q))
 
                     g_c = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
                     g_next = g_unpack(g_first)
@@ -311,6 +334,11 @@ def build_routed(tokens: int, upto: str = "DOWN"):
                                 for g_w2 in range_constexpr(1, WAVES):
                                     g_gg = g_gg + fx.ptr_load(part + g_par + ((g_w2 * 2) * 16 + g_c2 + g_q) * MAX_TOKENS + g_t2)
                                     g_uu = g_uu + fx.ptr_load(part + g_par + ((g_w2 * 2 + 1) * 16 + g_c2 + g_q) * MAX_TOKENS + g_t2)
+                                if const_expr(shared):
+                                    # the shared expert's gate / up are its GEMM's bf16 outputs (S4, quark path)
+                                    g_isd = g_e == fx.Int32(SHARED_ID)
+                                    g_gg = g_isd.select(bf16_round(g_gg), g_gg)
+                                    g_uu = g_isd.select(bf16_round(g_uu), g_uu)
                                 g_h2.append(_silu_mul(g_gg, g_uu))
                             bo.buffer_store(
                                 fx.Vector.from_elements(g_h2, fx.Float32).to(fx.BFloat16), rsrc(scratch),
@@ -341,7 +369,7 @@ def build_routed(tokens: int, upto: str = "DOWN"):
                             for q_i in range_constexpr(4):
                                 q_a, q_b = bf2_f32(fx.Int32(q_wv4[q_i]))
                                 q_vals += [q_a, q_b]
-                        q_words, q_byte = quant_group(q_vals, "hip")
+                        q_words, q_byte = _quant_for(q_vals, shared, fx.ptr_load(uexp + q_u) == fx.Int32(SHARED_ID))
                         bo.buffer_store(fx.Vector.from_elements(q_words, fx.Int32), rsrc(scratch),
                                         (MQ + (q_u * MAX_TOKENS + q_t) * (INTER // 2) + q_grp * 16) // 4, cache_modifier=CM_DEV)
                         bo.buffer_store(q_byte, rsrc(scratch), (MS + ((q_u * MAX_TOKENS + q_t) * MGROUPS + q_grp) * 4) // 4,
@@ -371,12 +399,19 @@ def build_routed(tokens: int, upto: str = "DOWN"):
                     d_c = fx.min(d_i, fx.max(nu - 1, fx.Int32(0)))
                     de = uniform(fx.ptr_load(uexp + d_c))
                     dm = uniform(fx.ptr_load(umask + d_c))
-                    dbase = w2 + fx.Int64(de) * W2_BYTES
-                    dww = [
-                        fx.Vector(bo.buffer_load(rsrc(dbase), _w2_group_index(d_row, dg), vec_width=4, dtype=T.i32))
-                        for dg in d_gis
-                    ]
-                    dsc = [_byte(s2, scale_index(de * HIDDEN + d_row, dg, MGROUPS)) for dg in d_gis]
+                    dwi = [_w2_group_index(d_row, dg) for dg in d_gis]
+                    dsi = [scale_index(de * HIDDEN + d_row, dg, MGROUPS) for dg in d_gis]
+                    if const_expr(shared):
+                        dsh = de == fx.Int32(SHARED_ID)
+                        dbase = dsh.select(sw2, w2 + fx.Int64(fx.min(de, fx.Int32(EXPERTS - 1))) * W2_BYTES)
+                        dsp = dsh.select(ss2, s2)
+                        dwi = [dsh.select((d_row * (INTER // 2) + dg * 16) // 4, dwi[q]) for q, dg in enumerate(d_gis)]
+                        dsi = [dsh.select(d_row * MGROUPS + dg, dsi[q]) for q, dg in enumerate(d_gis)]
+                    else:
+                        dbase = w2 + fx.Int64(de) * W2_BYTES
+                        dsp = s2
+                    dww = [fx.Vector(bo.buffer_load(rsrc(dbase), dwi[q], vec_width=4, dtype=T.i32)) for q in range(2)]
+                    dsc = [_byte(dsp, dsi[q]) for q in range(2)]
                     dmv = [fx.Vector(bo.buffer_load(
                         rsrc(scratch), (MQ + (d_c * MAX_TOKENS + d_col) * (INTER // 2) + dg * 16) // 4,
                         vec_width=4, dtype=T.i32, cache_modifier=CM_DEV)) for dg in d_gis]
@@ -426,11 +461,12 @@ def build_routed(tokens: int, upto: str = "DOWN"):
     @flyc.jit
     def launch(
         x: Int64, ids: Int64, wts: Int64, w13: Int64, s13: Int64, w2: Int64, s2: Int64, out: Int64,
-        scratch: Int64, epoch: Int64, layer: Int32, skip: Int32 = 0, stream: fx.Stream = fx.Stream(None),
+        scratch: Int64, epoch: Int64, layer: Int32, skip: Int32 = 0,
+        sw13: Int64 = 0, ss13: Int64 = 0, sw2: Int64 = 0, ss2: Int64 = 0, stream: fx.Stream = fx.Stream(None),
     ):
         """``skip``: timing aid (bit 0 skips UG's tasks, bit 1 DOWN's experts; the same binary)."""
         _ = keyed
-        k(x, ids, wts, w13, s13, w2, s2, out, scratch, epoch, layer, skip).launch(
+        k(x, ids, wts, w13, s13, w2, s2, out, scratch, epoch, layer, skip, sw13, ss13, sw2, ss2).launch(
             grid=(BLOCKS,), block=(THREADS,), stream=stream
         )
 
