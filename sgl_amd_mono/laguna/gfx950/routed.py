@@ -123,6 +123,7 @@ FOLD_RQ = os.environ.get("LAGUNA_FOLD_RQ", "1") == "1"
 MS_PACK = os.environ.get("LAGUNA_MS_PACK", "1") == "1"
 # W2 scales: aiter's shuffle_scale dword holds rows (r, r + 16) x K groups (c, c + 4) = a DOWN lane's
 # groups j, j + 1 (j even): one dword load a pair instead of one a group (routed experts only)
+UGS_PAIR = os.environ.get("LAGUNA_UGS_PAIR", "1") == "1"  # the same for UG's W13 scales (routed experts): TP4 M8 UG 324 -> 317 us
 W2S_PAIR = os.environ.get("LAGUNA_W2S_PAIR", "1") == "1"  # bit-identical; DOWN TP4 M8 160 -> 158 us  # TP4 M8 DOWN 183 -> 161 us, TP8 95 -> 90
 
 
@@ -258,6 +259,17 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
                 g_sp = s13
                 g_xq, g_xsr = XQ, XS
             g_l = []
+            if const_expr(UGS_PAIR and not shared):
+                # groups j, j + 1 (j even) of a row: bytes a and 2 + a of one shuffle_scale dword (a = cc % 2)
+                g_a = g_cc % 2
+                g_wsp = {}
+                for g_j in range_constexpr(0, 4, 2):
+                    g_gi0 = wave * 64 + (g_q * 4 + g_j) * 4 + g_sub
+                    for g_r in range_constexpr(2):
+                        g_sw = fx.Int32(bo.buffer_load(rsrc(g_sp), scale_index(g_ee * (2 * INTER) + g_rr[g_r], g_gi0, GROUPS) // 4,
+                                                       vec_width=1, dtype=T.i32))
+                        g_wsp[(g_j, g_r)] = (g_sw >> (g_a * 8)) & fx.Int32(0xFF)
+                        g_wsp[(g_j + 1, g_r)] = (g_sw >> ((2 + g_a) * 8)) & fx.Int32(0xFF)
             for g_j in range_constexpr(4):
                 g_gi = wave * 64 + (g_q * 4 + g_j) * 4 + g_sub
                 g_wi = [_w13_index(g_rr[g_r], g_gi) for g_r in range(2)]
@@ -266,7 +278,10 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
                     g_wi = [g_sh.select((g_rr[g_r] * (HIDDEN // 2) + g_gi * 16) // 4, g_wi[g_r]) for g_r in range(2)]
                     g_si = [g_sh.select(g_rr[g_r] * GROUPS + g_gi, g_si[g_r]) for g_r in range(2)]
                 g_w = [fx.Vector(bo.buffer_load(rsrc(g_bb), g_wi[g_r], vec_width=4, dtype=T.i32, cache_modifier=CM_NT)) for g_r in range(2)]
-                g_ws = [_byte(g_sp, g_si[g_r]) for g_r in range(2)]
+                if const_expr(UGS_PAIR and not shared):
+                    g_ws = [g_wsp[(g_j, g_r)] for g_r in range(2)]
+                else:
+                    g_ws = [_byte(g_sp, g_si[g_r]) for g_r in range(2)]
                 g_xv = fx.Vector(bo.buffer_load(
                     rsrc(scratch, SCRATCH_BYTES), g_on.select((g_xq + g_col * (HIDDEN // 2) + g_gi * 16) // 4, fx.Int32(OOB)), vec_width=4,
                     dtype=T.i32, cache_modifier=CM_DEV))
@@ -529,6 +544,7 @@ def build_routed(tokens: int, upto: str = "DOWN", shared: bool = False):
         FOLD_RQ,
         MS_PACK,
         W2S_PAIR,
+        UGS_PAIR,
         os.environ.get("LAGUNA_DN_BATCH", "4"),
         upto,
         shared,
