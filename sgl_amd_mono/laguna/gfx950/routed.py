@@ -204,6 +204,8 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
         fx.ptr_store(tot, wc + WAVES)
     gpu.barrier()
     nu = uniform(fx.ptr_load(wc + WAVES))
+    mark = ctx.get("mark", lambda i: None)  # the fused layer's prof build: per-CTA time marks
+    mark(7)
 
     if const_expr(last >= 1):
         # ---- Q: quantize x (hip rule), a thread a group
@@ -235,6 +237,7 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
             _release()
             if lane == 0:
                 box["mb"].put(box["qf"], bid * WAVES + wave, fx.Int32(1))
+        mark(8)
 
     if const_expr(last >= 2):
         # ---- UG (MFMA): tasks (union expert, 16-channel block); per wave K groups
@@ -245,6 +248,7 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
         if tid < tokens * WAVES:
             box["mb"].poll([(box["qf"], tid, 1)])
         gpu.barrier()
+        mark(9)
         g_ni = lane % 16
         g_sub = lane // 16
         g_col_ok = g_ni < tokens
@@ -418,6 +422,7 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
                                             cache_modifier=CM_DEV)
         _release()
         gpu.barrier()
+        mark(10)
         if tid == 0:
             box["mb"].put(box["rf" if FOLD_RQ else "gf"], bid, fx.Int32(1))
 
@@ -463,6 +468,7 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
         if tid < BLOCKS:
             box["mb"].poll([(box["rf"], tid, 1)])
         gpu.barrier()
+        mark(11)
         d_ni = lane % 16
         d_sub = lane // 16
         d_row = bid * 64 + (wave // 2) * 16 + d_ni
@@ -536,6 +542,7 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
                 d_acc = fx.Vector.from_elements(
                     [fx.Float32(d_acc[d_i]) + d_wt * fx.Float32(d_cc[d_i]) for d_i in range(4)], fx.Float32
                 )
+        mark(12)
         # the wave pair (K halves) through LDS, then rows x tokens out
         for d_i in range_constexpr(4):
             fx.ptr_store(fx.Float32(d_acc[d_i]), part + (wave * 16 + d_sub * 4 + d_i) * MAX_TOKENS + d_ni)

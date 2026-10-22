@@ -66,7 +66,7 @@ WTS = IDS + MAX_TOKENS * TOPK * 4
 SHS = WTS + MAX_TOKENS * TOPK * 4  # S4's scratch
 SH = SHS + shared.SCRATCH_BYTES  # S4's output
 PROF = SH + MAX_TOKENS * HIDDEN * 2
-MARKS = 8  # prof build: per CTA, s_memrealtime at the stage boundaries
+MARKS = 16  # prof build: per CTA, s_memrealtime at the stage boundaries (7-12: inside S3)
 SCRATCH_BYTES = PROF + BLOCKS * MARKS * 8
 
 
@@ -139,6 +139,7 @@ def build_layer(npes: int, tokens: int, eps: float, prof: bool = False):
                         bo.buffer_store(fx.Vector.from_elements([fx.Int32(now), fx.Int32(now >> 32)], fx.Int32),
                                         rsrc(scratch), (PROF + (bid * MARKS + i) * 8) // 4)
 
+            ctx["mark"] = mark
             mark(0)
 
             # S1
