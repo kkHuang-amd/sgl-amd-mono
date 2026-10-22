@@ -133,11 +133,14 @@ def _xs_pos(g):
     return (g // 64) * 64 + (g % 4) * 16 + (g % 64) // 4
 
 
+# U: the top-k threads scatter k + 1 into an LDS flag table [expert][token] (aliasing UG's ``part``),
+# each expert thread reads its row instead of scanning every top-k entry (2 x 16 M LDS reads)
+U_SCATTER = os.environ.get("LAGUNA_U_SCATTER", "1") == "1"  # layer M16 TP8 444 -> 425, TP4 804 -> 785 us
 UGS_PAIR = os.environ.get("LAGUNA_UGS_PAIR", "1") == "1"  # the same for UG's W13 scales (routed experts): TP4 M8 UG 324 -> 317 us
 W2S_PAIR = os.environ.get("LAGUNA_W2S_PAIR", "1") == "1"  # bit-identical; DOWN TP4 M8 160 -> 158 us  # TP4 M8 DOWN 183 -> 161 us, TP8 95 -> 90
 # every env switch above: the fused layer's kernel cache key must carry them (its key has the module
 # sources, not the env, and the binary cache outlives the process)
-ENV_KEY = (FOLD_RQ, MS_PACK, XS_PACK, UGS_PAIR, W2S_PAIR, os.environ.get("LAGUNA_DN_BATCH", "4"))
+ENV_KEY = (FOLD_RQ, MS_PACK, XS_PACK, UGS_PAIR, W2S_PAIR, U_SCATTER, os.environ.get("LAGUNA_DN_BATCH", "4"))
 
 
 def _ms_pos(grp):
@@ -206,19 +209,38 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0, q_early=False):
 
     # ---- U: the union, thread e = expert e
     # the top-k table lands in LDS once (a thread an entry), then every thread scans it
+    e_me = fx.Int32(tid)
+    if const_expr(U_SCATTER):
+        assert EXPERTS == THREADS and 2 * WAVES * 32 >= EXPERTS  # flag rows of MAX_TOKENS fit in ``part``
+        u_nq = (tokens + 3) // 4
+        for q in range_constexpr(u_nq):  # this expert's row of flags := 0
+            fx.ptr_store(fx.Vector.filled(4, 0.0, fx.Float32).ir_value(), part + tid * MAX_TOKENS + 4 * q)
     if tid < tokens * TOPK:
         fx.ptr_store(fx.Int32(bo.buffer_load(rsrc(ids), tid, vec_width=1, dtype=T.i32, cache_modifier=in_cm)), sids + tid)
         fx.ptr_store(fx.Float32(bo.buffer_load(rsrc(wts), tid, vec_width=1, dtype=T.f32, cache_modifier=in_cm)), swts + tid)
     gpu.barrier()
-    e_me = fx.Int32(tid)
     m_me = fx.Int32(0)
     w_me = [fx.Float32(0.0) for _ in range(tokens)]
-    for t in range_constexpr(tokens):
-        for kk in range_constexpr(TOPK):
-            v = fx.ptr_load(sids + t * TOPK + kk)
-            hit = v == e_me
+    if const_expr(U_SCATTER):
+        if tid < tokens * TOPK:  # entry (t, k) -> flag[e][t] := k + 1 (an expert once a token: no conflict)
+            fx.ptr_store(fx.Int32(tid % TOPK + 1).bitcast(fx.Float32),
+                         part + fx.ptr_load(sids + tid) * MAX_TOKENS + tid // TOPK)
+        gpu.barrier()
+        u_fl = []
+        for q in range_constexpr(u_nq):
+            u_v = fx.Vector(fx.ptr_load(part + tid * MAX_TOKENS + 4 * q, result_type=T.vec(4, T.f32)))
+            u_fl += [fx.Float32(u_v[i]).bitcast(fx.Int32) for i in range(4)]
+        for t in range_constexpr(tokens):
+            hit = u_fl[t] != fx.Int32(0)
             m_me = m_me | hit.select(fx.Int32(1 << t), fx.Int32(0))
-            w_me[t] = hit.select(fx.ptr_load(swts + t * TOPK + kk), w_me[t])
+            w_me[t] = hit.select(fx.ptr_load(swts + t * TOPK + fx.max(u_fl[t] - 1, fx.Int32(0))), fx.Float32(0.0))
+    else:
+        for t in range_constexpr(tokens):
+            for kk in range_constexpr(TOPK):
+                v = fx.ptr_load(sids + t * TOPK + kk)
+                hit = v == e_me
+                m_me = m_me | hit.select(fx.Int32(1 << t), fx.Int32(0))
+                w_me[t] = hit.select(fx.ptr_load(swts + t * TOPK + kk), w_me[t])
     used = m_me != fx.Int32(0)
     bal = ballot(used)
     if lane == 0:
@@ -591,6 +613,7 @@ def build_routed(tokens: int, upto: str = "DOWN", shared: bool = False):
         INTER,
         FOLD_RQ,
         MS_PACK,
+        U_SCATTER,
         W2S_PAIR,
         UGS_PAIR,
         XS_PACK,

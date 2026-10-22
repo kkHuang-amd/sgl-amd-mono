@@ -18,6 +18,8 @@ mailboxes between them):
            (8 of the 512 K); bf16 partial rows of this rank -> ``out``
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
@@ -63,6 +65,18 @@ def _release():
     """Order this wave's device-scope stores before a flag other CTAs poll."""
     rocdl.s_waitcnt(vmcnt=0)
     fx.memory_fence(syncscope=rocdl.SyncScope.Workgroup, ordering=fx.AtomicOrdering.Release)
+
+
+# scales a lane needs for its K steps j (bytes 4 j + sub of a run): one load of the run instead of one a
+# step (x and MID scales stored as bytes; quark weight scales are row-major bytes already)
+SPACK = os.environ.get("LAGUNA_SH_SPACK", "1") == "1"  # layer TP4 -3 us, TP8 -0.5..-1
+ENV_KEY = (SPACK,)  # for the fused layer's kernel cache key
+
+
+def _scale_run(ptr, byte0, steps, sub, cm=0):
+    """bytes byte0 + 4 j + sub, j < steps (byte0 4-aligned): one dword-vector load"""
+    v = fx.Vector(bo.buffer_load(rsrc(ptr), byte0 // 4, vec_width=steps, dtype=T.i32, cache_modifier=cm))
+    return [(fx.Int32(v[j]) >> (sub * 8)) & fx.Int32(0xFF) for j in range(steps)]
 
 
 def _byte(ptr, byte_index, cm=0):
@@ -112,7 +126,10 @@ def emit_shared(ctx, args, tokens, stages=STAGES, in_cm=0, out_cm=0):
                 fx.Vector.from_elements(words, fx.Int32), rsrc(scratch),
                 (XQ + bid * (HIDDEN // 2) + tid * 16) // 4, cache_modifier=CM_DEV,
             )
-            bo.buffer_store(byte, rsrc(scratch), (XS + (bid * GROUPS + tid) * 4) // 4, cache_modifier=CM_DEV)
+            if const_expr(SPACK):
+                bo.buffer_store(fx.Int8(byte), rsrc(scratch), XS + bid * GROUPS + tid, cache_modifier=CM_DEV)
+            else:
+                bo.buffer_store(byte, rsrc(scratch), (XS + (bid * GROUPS + tid) * 4) // 4, cache_modifier=CM_DEV)
             _release()
             if lane == 0:
                 box["mb"].put(box["qf"], bid * WAVES + wave, fx.Int32(1))
@@ -130,16 +147,20 @@ def emit_shared(ctx, args, tokens, stages=STAGES, in_cm=0, out_cm=0):
         grow = [cb * 16 + ni, INTER + cb * 16 + ni]
         cacc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
         ld = []
+        if const_expr(SPACK):
+            g0 = ks * KG + wave * KGW
+            sw_run = [_scale_run(s13, gr * GROUPS + g0, KGW // 4, sub) for gr in grow]
+            sx_run = _scale_run(scratch, XS + col * GROUPS + g0, KGW // 4, sub, cm=CM_DEV)
         for j in range_constexpr(KGW // 4):
             gk = ks * KG + wave * KGW + j * 4 + sub
             ld.append((
                 [fx.Vector(bo.buffer_load(rsrc(w13), (gr * (HIDDEN // 2) + gk * 16) // 4, vec_width=4, dtype=T.i32))
                  for gr in grow],
-                [_byte(s13, gr * GROUPS + gk) for gr in grow],
+                [sw_run[r][j] for r in range(2)] if const_expr(SPACK) else [_byte(s13, gr * GROUPS + gk) for gr in grow],
                 fx.Vector(bo.buffer_load(rsrc(scratch), (XQ + col * (HIDDEN // 2) + gk * 16) // 4, vec_width=4,
                                          dtype=T.i32, cache_modifier=CM_DEV)),
-                fx.Int32(bo.buffer_load(rsrc(scratch), (XS + (col * GROUPS + gk) * 4) // 4, vec_width=1,
-                                        dtype=T.i32, cache_modifier=CM_DEV)),
+                sx_run[j] if const_expr(SPACK) else fx.Int32(bo.buffer_load(rsrc(scratch), (XS + (col * GROUPS + gk) * 4) // 4, vec_width=1,
+                                                                            dtype=T.i32, cache_modifier=CM_DEV)),
             ))
         for j in range_constexpr(KGW // 4):
             wv2, ws2, xv, xs = ld[j]
@@ -220,8 +241,11 @@ def emit_shared(ctx, args, tokens, stages=STAGES, in_cm=0, out_cm=0):
                     words, byte = quant_group(vals, "triton")
                     bo.buffer_store(fx.Vector.from_elements(words, fx.Int32), rsrc(scratch),
                                     (MQ + t * (INTER // 2) + grp * 16) // 4, cache_modifier=CM_DEV)
-                    bo.buffer_store(byte, rsrc(scratch), (MS + (t * MGROUPS + grp) * 4) // 4,
-                                    cache_modifier=CM_DEV)
+                    if const_expr(SPACK):
+                        bo.buffer_store(fx.Int8(byte), rsrc(scratch), MS + t * MGROUPS + grp, cache_modifier=CM_DEV)
+                    else:
+                        bo.buffer_store(byte, rsrc(scratch), (MS + (t * MGROUPS + grp) * 4) // 4,
+                                        cache_modifier=CM_DEV)
                     _release()
                     box["mb"].put(box["rf"], t * MGROUPS + grp, fx.Int32(1))
 
@@ -234,14 +258,20 @@ def emit_shared(ctx, args, tokens, stages=STAGES, in_cm=0, out_cm=0):
         gpu.barrier()
         drow = bid * 64 + (wave // 2) * 16 + ni
         dacc = fx.Vector.filled(4, 0.0, fx.Float32)
+        if const_expr(SPACK):
+            dsw_run = _scale_run(s2, drow * MGROUPS + (wave % 2) * (MGROUPS // 2), MGROUPS // 8, sub)
+            dsm_run = _scale_run(scratch, MS + col * MGROUPS + (wave % 2) * (MGROUPS // 2), MGROUPS // 8, sub, cm=CM_DEV)
         for j in range_constexpr(MGROUPS // 8):
             dg = (wave % 2) * (MGROUPS // 2) + j * 4 + sub
             dw = fx.Vector(bo.buffer_load(rsrc(w2), (drow * (INTER // 2) + dg * 16) // 4, vec_width=4, dtype=T.i32))
-            dsc = _byte(s2, drow * MGROUPS + dg)
+            dsc = dsw_run[j] if const_expr(SPACK) else _byte(s2, drow * MGROUPS + dg)
             dmv = fx.Vector(bo.buffer_load(rsrc(scratch), (MQ + col * (INTER // 2) + dg * 16) // 4, vec_width=4,
                                            dtype=T.i32, cache_modifier=CM_DEV))
-            dms = fx.Int32(bo.buffer_load(rsrc(scratch), (MS + (col * MGROUPS + dg) * 4) // 4, vec_width=1,
-                                          dtype=T.i32, cache_modifier=CM_DEV))
+            if const_expr(SPACK):
+                dms = dsm_run[j]
+            else:
+                dms = fx.Int32(bo.buffer_load(rsrc(scratch), (MS + (col * MGROUPS + dg) * 4) // 4, vec_width=1,
+                                              dtype=T.i32, cache_modifier=CM_DEV))
             dacc = mfma_scaled(dw, col_ok.select(dmv, zero4), dacc, dsc, col_ok.select(dms, fx.Int32(127)), FP4, FP4)
         gpu.barrier()
         for i in range_constexpr(4):
@@ -268,6 +298,7 @@ def build_shared(tokens: int):
     keyed = (
         tokens,
         INTER,
+        SPACK,
         kernel_sources(__name__),
         kernel_sources(mxq.__name__),
         kernel_sources(guard.__name__),
