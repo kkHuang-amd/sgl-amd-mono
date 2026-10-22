@@ -22,13 +22,13 @@ One launch, BLOCKS CTAs x THREADS threads, stages in order:
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.mx import scale_index
 from sgl_amd_mono.common.ops import (
-    CM_DEV, ballot, bf2_f32, butterfly, hw_exp2, hw_rcp, lanes_below, popcount, rsrc, uniform,
+    CM_DEV, ballot, bf2_f32, butterfly, hw_exp2, hw_rcp, lanes_below, popcount, rsrc, uniform, xshfl,
 )
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, kernel_sources
 from sgl_amd_mono.common.sync import Mailbox, sreg
@@ -88,15 +88,27 @@ def _w2_index(row, lane):
     return ((((n0 * (INTER // 64) + kb // 32) * 2 + (kb // 16) % 2) * 16 + ni) * 16 + kb % 16) // 4
 
 
-def build_routed(tokens: int):
+def _w2_group_index(row, grp):
+    """i32 index of row ``row``'s 32-element K group ``grp`` (16 bytes) in one expert's shuffled W2."""
+    n0, ni = row // 16, row % 16
+    return ((((n0 * (INTER // 64) + grp // 2) * 2 + grp % 2) * 16 + ni) * 16) // 4
+
+
+STAGES = ("U", "Q", "UG", "RQ", "DOWN")
+
+
+def build_routed(tokens: int, upto: str = "DOWN"):
+    """``upto``: the last stage to run (a timing aid; anything short of DOWN writes no output)."""
     assert 1 <= tokens <= MAX_TOKENS
+    last = STAGES.index(upto)
     keyed = (
         tokens,
+        upto,
         kernel_sources(__name__),
         kernel_sources(mxq.__name__),
         kernel_sources(guard.__name__),
     )
-    name = f"laguna_routed_t{tokens}"
+    name = f"laguna_routed_t{tokens}" + ("" if upto == "DOWN" else f"_upto{upto}")
 
     @fx.struct
     class Smem:
@@ -104,7 +116,7 @@ def build_routed(tokens: int):
         umask: fx.Array[fx.Int32, U_MAX, 16]
         uw: fx.Array[fx.Float32, U_MAX * MAX_TOKENS, 16]
         wc: fx.Array[fx.Int32, WAVES + 1, 16]
-        part: fx.Array[fx.Float32, WAVES * 4 * MAX_TOKENS, 16]
+        part: fx.Array[fx.Float32, 2 * WAVES * 32 * MAX_TOKENS, 16]
         gu: fx.Array[fx.Float32, 4 * MAX_TOKENS, 16]
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -162,144 +174,206 @@ def build_routed(tokens: int):
             gpu.barrier()
             nu = uniform(fx.ptr_load(wc + WAVES))
 
-            # ---- Q: quantize x (hip rule), a thread a group
-            if bid < tokens:
-                vals = []
-                for c in range_constexpr(4):
-                    wv4 = fx.Vector(
-                        bo.buffer_load(rsrc(x), (bid * HIDDEN + tid * 32) // 2 + 4 * c, vec_width=4, dtype=T.i32)
-                    )
-                    for i in range_constexpr(4):
-                        a, b = bf2_f32(fx.Int32(wv4[i]))
-                        vals += [a, b]
-                words, byte = quant_group(vals, "hip")
-                bo.buffer_store(fx.Vector.from_elements(words, fx.Int32), rsrc(scratch),
-                                (XQ + bid * (HIDDEN // 2) + tid * 16) // 4, cache_modifier=CM_DEV)
-                bo.buffer_store(byte, rsrc(scratch), (XS + (bid * GROUPS + tid) * 4) // 4, cache_modifier=CM_DEV)
-                _release()
-                if lane == 0:
-                    box["mb"].put(box["qf"], bid * WAVES + wave, fx.Int32(1))
-
-            # ---- UG: channels 2b, 2b + 1 of every union expert
-            box["mb"].poll([(box["qf"], g_t * WAVES + g_w, 1) for g_t in range(tokens) for g_w in range(WAVES)])
-            gi = wave * 64 + lane
-            xw = [
-                fx.Vector(bo.buffer_load(rsrc(scratch), (XQ + g_t * (HIDDEN // 2) + gi * 16) // 4, vec_width=4,
-                                         dtype=T.i32, cache_modifier=CM_DEV))
-                for g_t in range(tokens)
-            ]
-            xsc = [
-                pow2(fx.Int32(bo.buffer_load(rsrc(scratch), (XS + (g_t * GROUPS + gi) * 4) // 4, vec_width=1,
-                                             dtype=T.i32, cache_modifier=CM_DEV)))
-                for g_t in range(tokens)
-            ]
-            rows = [bid * 2, bid * 2 + 1, INTER + bid * 2, INTER + bid * 2 + 1]
-            for u in range(nu):
-                g_e = uniform(fx.ptr_load(uexp + u))
-                g_m = uniform(fx.ptr_load(umask + u))
-                g_wbase = w13 + fx.Int64(g_e) * W13_BYTES
-                g_ww = [
-                    fx.Vector(bo.buffer_load(rsrc(g_wbase), _w13_index(g_r, gi), vec_width=4, dtype=T.i32))
-                    for g_r in rows
-                ]
-                g_wsc = [pow2(_byte(s13, scale_index(g_e * (2 * INTER) + g_r, gi, GROUPS))) for g_r in rows]
-                for g_t in range_constexpr(tokens):
-                    if ((g_m >> g_t) & fx.Int32(1)) != fx.Int32(0):
-                        g_acc = [fx.Float32(0.0) for _ in range(4)]
-                        for g_c in range_constexpr(4):
-                            g_xd = decode_word(fx.Int32(xw[g_t][g_c]), xsc[g_t])
-                            for g_r in range_constexpr(4):
-                                g_wd = decode_word(fx.Int32(g_ww[g_r][g_c]), g_wsc[g_r])
-                                g_s = g_acc[g_r]
-                                for g_j in range_constexpr(8):
-                                    g_s = g_s + g_wd[g_j] * g_xd[g_j]
-                                g_acc[g_r] = g_s
-                        for g_r in range_constexpr(4):
-                            g_v = butterfly(g_acc[g_r], (32, 16, 8, 4, 2, 1))
-                            if lane == 0:
-                                fx.ptr_store(g_v, part + (wave * 4 + g_r) * MAX_TOKENS + g_t)
-                gpu.barrier()
-                if tid < tokens:
-                    if ((g_m >> tid) & fx.Int32(1)) != fx.Int32(0):
-                        g_g4 = []
-                        for g_r in range_constexpr(4):
-                            g_tot = fx.ptr_load(part + g_r * MAX_TOKENS + tid)
-                            for g_w in range_constexpr(1, WAVES):
-                                g_tot = g_tot + fx.ptr_load(part + (g_w * 4 + g_r) * MAX_TOKENS + tid)
-                            g_g4.append(g_tot)
-                        g_h0 = _silu_mul(g_g4[0], g_g4[2])
-                        g_h1 = _silu_mul(g_g4[1], g_g4[3])
-                        bo.buffer_store(
-                            fx.Vector.from_elements([g_h0, g_h1], fx.Float32).to(fx.BFloat16), rsrc(scratch),
-                            MID // 2 + (u * MAX_TOKENS + tid) * INTER + bid * 2, cache_modifier=CM_DEV,
+            if const_expr(last >= 1):
+                # ---- Q: quantize x (hip rule), a thread a group
+                if bid < tokens:
+                    vals = []
+                    for c in range_constexpr(4):
+                        wv4 = fx.Vector(
+                            bo.buffer_load(rsrc(x), (bid * HIDDEN + tid * 32) // 2 + 4 * c, vec_width=4, dtype=T.i32)
                         )
-                gpu.barrier()
-            _release()
-            gpu.barrier()
-            if tid == 0:
-                box["mb"].put(box["gf"], bid, fx.Int32(1))
-
-            # ---- RQ: q_a thread q_a (expert, token, group) of MID
-            box["mb"].poll([(box["gf"], q_i, 1) for q_i in range(BLOCKS)])
-            q_n_tasks = nu * (tokens * MGROUPS)
-            for q_task in range(bid * THREADS + tid, q_n_tasks, BLOCKS * THREADS):
-                q_u = q_task // (tokens * MGROUPS)
-                q_t = (q_task // MGROUPS) % tokens
-                q_grp = q_task % MGROUPS
-                q_m = fx.ptr_load(umask + q_u)
-                if ((q_m >> q_t) & fx.Int32(1)) != fx.Int32(0):
-                    q_vals = []
-                    for q_c in range_constexpr(4):
-                        q_wv4 = fx.Vector(bo.buffer_load(
-                            rsrc(scratch), (MID + ((q_u * MAX_TOKENS + q_t) * INTER + q_grp * 32) * 2) // 4 + 4 * q_c,
-                            vec_width=4, dtype=T.i32, cache_modifier=CM_DEV))
-                        for q_i in range_constexpr(4):
-                            q_a, q_b = bf2_f32(fx.Int32(q_wv4[q_i]))
-                            q_vals += [q_a, q_b]
-                    q_words, q_byte = quant_group(q_vals, "hip")
-                    bo.buffer_store(fx.Vector.from_elements(q_words, fx.Int32), rsrc(scratch),
-                                    (MQ + (q_u * MAX_TOKENS + q_t) * (INTER // 2) + q_grp * 16) // 4, cache_modifier=CM_DEV)
-                    bo.buffer_store(q_byte, rsrc(scratch), (MS + ((q_u * MAX_TOKENS + q_t) * MGROUPS + q_grp) * 4) // 4,
-                                    cache_modifier=CM_DEV)
-            _release()
-            gpu.barrier()
-            if tid == 0:
-                box["mb"].put(box["rf"], bid, fx.Int32(1))
-
-            # ---- DOWN: rows [64 b, 64 b + 64), the route-weighted sum over the union
-            box["mb"].poll([(box["rf"], i, 1) for i in range(BLOCKS)])
-            d_acc = [fx.Float32(0.0) for _ in range(8 * tokens)]
-            for d_u in range(nu):
-                d_e = uniform(fx.ptr_load(uexp + d_u))
-                d_m = uniform(fx.ptr_load(umask + d_u))
-                d_wbase = w2 + fx.Int64(d_e) * W2_BYTES
-                d_wd = []
-                for d_rr in range_constexpr(8):
-                    d_row = bid * 64 + wave * 8 + d_rr
-                    d_wv = fx.Int32(bo.buffer_load(rsrc(d_wbase), _w2_index(d_row, lane), vec_width=1, dtype=T.i32))
-                    d_wd.append(decode_word(d_wv, pow2(_byte(s2, scale_index(d_e * HIDDEN + d_row, lane // 4, MGROUPS)))))
-                for d_t in range_constexpr(tokens):
-                    d_rt = ((d_m >> d_t) & fx.Int32(1)) != fx.Int32(0)
-                    d_mw = fx.Int32(bo.buffer_load(rsrc(scratch), (MQ + (d_u * MAX_TOKENS + d_t) * (INTER // 2)) // 4 + lane,
-                                                 vec_width=1, dtype=T.i32, cache_modifier=CM_DEV))
-                    d_ms = fx.Int32(bo.buffer_load(rsrc(scratch), (MS + ((d_u * MAX_TOKENS + d_t) * MGROUPS + lane // 4) * 4) // 4,
-                                                 vec_width=1, dtype=T.i32, cache_modifier=CM_DEV))
-                    d_md = decode_word(d_mw, pow2(d_ms))
-                    d_wt = d_rt.select(fx.ptr_load(uw + d_u * MAX_TOKENS + d_t), fx.Float32(0.0))
-                    for d_rr in range_constexpr(8):
-                        d_s = fx.Float32(0.0)
-                        for d_j in range_constexpr(8):
-                            d_s = d_s + d_wd[d_rr][d_j] * d_md[d_j]
-                        d_acc[d_rr * tokens + d_t] = d_acc[d_rr * tokens + d_t] + d_wt * d_s
-            for d_pr in range_constexpr(4):
-                for d_t in range_constexpr(tokens):
-                    d_v0 = butterfly(d_acc[(2 * d_pr) * tokens + d_t], (32, 16, 8, 4, 2, 1))
-                    d_v1 = butterfly(d_acc[(2 * d_pr + 1) * tokens + d_t], (32, 16, 8, 4, 2, 1))
+                        for i in range_constexpr(4):
+                            a, b = bf2_f32(fx.Int32(wv4[i]))
+                            vals += [a, b]
+                    words, byte = quant_group(vals, "hip")
+                    bo.buffer_store(fx.Vector.from_elements(words, fx.Int32), rsrc(scratch),
+                                    (XQ + bid * (HIDDEN // 2) + tid * 16) // 4, cache_modifier=CM_DEV)
+                    bo.buffer_store(byte, rsrc(scratch), (XS + (bid * GROUPS + tid) * 4) // 4, cache_modifier=CM_DEV)
+                    _release()
                     if lane == 0:
-                        bo.buffer_store(
-                            fx.Vector.from_elements([d_v0, d_v1], fx.Float32).to(fx.BFloat16),
-                            rsrc(out), d_t * HIDDEN + bid * 64 + wave * 8 + d_pr * 2,
+                        box["mb"].put(box["qf"], bid * WAVES + wave, fx.Int32(1))
+
+            if const_expr(last >= 2):
+                # ---- UG: tasks (union expert, 16-channel block): gate rows 16 cb .. +15 and
+                # up rows 512 + 16 cb .. +15, whole (16, 16) shuffle groups (no read
+                # amplification). Lane = (row ni = lane % 16, K group 4 q + lane // 16): a wave
+                # load is 1 KB contiguous; wave w owns K groups [64 w, 64 w + 64) (16 loads).
+                if tid < tokens * WAVES:
+                    box["mb"].poll([(box["qf"], tid, 1)])
+                gpu.barrier()
+                g_ni = lane % 16
+                g_sub = lane // 16
+                g_ntask = nu * (INTER // 16)
+                for g_task in range(bid, g_ntask, BLOCKS):
+                    g_u = g_task // (INTER // 16)
+                    g_cb = g_task % (INTER // 16)
+                    g_e = uniform(fx.ptr_load(uexp + g_u))
+                    g_m = uniform(fx.ptr_load(umask + g_u))
+                    g_base = w13 + fx.Int64(g_e) * W13_BYTES
+                    g_rows = [g_cb * 16 + g_ni, INTER + g_cb * 16 + g_ni]
+                    g_acc = [fx.Float32(0.0) for _ in range(2 * tokens)]
+                    for g_h in range_constexpr(2):
+                        g_ld = []
+                        for g_j in range_constexpr(8):
+                            g_gi = wave * 64 + (g_h * 8 + g_j) * 4 + g_sub
+                            for g_r in range_constexpr(2):
+                                g_ld.append((
+                                    fx.Vector(bo.buffer_load(rsrc(g_base), _w13_index(g_rows[g_r], g_gi),
+                                                             vec_width=4, dtype=T.i32)),
+                                    _byte(s13, scale_index(g_e * (2 * INTER) + g_rows[g_r], g_gi, GROUPS)),
+                                ))
+                        # per routed token: its eight x groups of this half in one batch of
+                        # loads, then the math against the half's weights
+                        for g_t in range_constexpr(tokens):
+                            if ((g_m >> g_t) & fx.Int32(1)) != fx.Int32(0):
+                                g_xb = []
+                                for g_j in range_constexpr(8):
+                                    g_gi = wave * 64 + (g_h * 8 + g_j) * 4 + g_sub
+                                    g_xb.append((
+                                        fx.Vector(bo.buffer_load(
+                                            rsrc(scratch), (XQ + g_t * (HIDDEN // 2) + g_gi * 16) // 4, vec_width=4,
+                                            dtype=T.i32, cache_modifier=CM_DEV)),
+                                        fx.Int32(bo.buffer_load(
+                                            rsrc(scratch), (XS + (g_t * GROUPS + g_gi) * 4) // 4, vec_width=1,
+                                            dtype=T.i32, cache_modifier=CM_DEV)),
+                                    ))
+                                for g_j in range_constexpr(8):
+                                    g_xs = pow2(g_xb[g_j][1])
+                                    for g_c in range_constexpr(4):
+                                        g_xd = decode_word(fx.Int32(g_xb[g_j][0][g_c]), g_xs)
+                                        for g_r in range_constexpr(2):
+                                            g_wd = decode_word(fx.Int32(g_ld[2 * g_j + g_r][0][g_c]),
+                                                               pow2(g_ld[2 * g_j + g_r][1]))
+                                            g_s = g_acc[g_r * tokens + g_t]
+                                            for g_k in range_constexpr(8):
+                                                g_s = g_s + g_wd[g_k] * g_xd[g_k]
+                                            g_acc[g_r * tokens + g_t] = g_s
+                    g_par = (g_task // BLOCKS % 2) * (WAVES * 32 * MAX_TOKENS)
+                    for g_r in range_constexpr(2):
+                        for g_t in range_constexpr(tokens):
+                            g_v = butterfly(g_acc[g_r * tokens + g_t], (16, 32))
+                            if g_sub == 0:
+                                fx.ptr_store(g_v, part + g_par + ((wave * 2 + g_r) * 16 + g_ni) * MAX_TOKENS + g_t)
+                    gpu.barrier()
+                    if tid < tokens * 8:
+                        g_t2 = tid // 8
+                        g_c2 = (tid % 8) * 2
+                        if ((g_m >> g_t2) & fx.Int32(1)) != fx.Int32(0):
+                            g_h2 = []
+                            for g_q in range_constexpr(2):
+                                g_gg = fx.ptr_load(part + g_par + (0 * 16 + g_c2 + g_q) * MAX_TOKENS + g_t2)
+                                g_uu = fx.ptr_load(part + g_par + (1 * 16 + g_c2 + g_q) * MAX_TOKENS + g_t2)
+                                for g_w in range_constexpr(1, WAVES):
+                                    g_gg = g_gg + fx.ptr_load(part + g_par + ((g_w * 2) * 16 + g_c2 + g_q) * MAX_TOKENS + g_t2)
+                                    g_uu = g_uu + fx.ptr_load(part + g_par + ((g_w * 2 + 1) * 16 + g_c2 + g_q) * MAX_TOKENS + g_t2)
+                                g_h2.append(_silu_mul(g_gg, g_uu))
+                            bo.buffer_store(
+                                fx.Vector.from_elements(g_h2, fx.Float32).to(fx.BFloat16), rsrc(scratch),
+                                MID // 2 + (g_u * MAX_TOKENS + g_t2) * INTER + g_cb * 16 + g_c2, cache_modifier=CM_DEV,
+                            )
+                _release()
+                gpu.barrier()
+                if tid == 0:
+                    box["mb"].put(box["gf"], bid, fx.Int32(1))
+
+            if const_expr(last >= 3):
+                # ---- RQ: q_a thread q_a (expert, token, group) of MID
+                if tid < BLOCKS:
+                    box["mb"].poll([(box["gf"], tid, 1)])
+                gpu.barrier()
+                q_n_tasks = nu * (tokens * MGROUPS)
+                for q_task in range(bid * THREADS + tid, q_n_tasks, BLOCKS * THREADS):
+                    q_u = q_task // (tokens * MGROUPS)
+                    q_t = (q_task // MGROUPS) % tokens
+                    q_grp = q_task % MGROUPS
+                    q_m = fx.ptr_load(umask + q_u)
+                    if ((q_m >> q_t) & fx.Int32(1)) != fx.Int32(0):
+                        q_vals = []
+                        for q_c in range_constexpr(4):
+                            q_wv4 = fx.Vector(bo.buffer_load(
+                                rsrc(scratch), (MID + ((q_u * MAX_TOKENS + q_t) * INTER + q_grp * 32) * 2) // 4 + 4 * q_c,
+                                vec_width=4, dtype=T.i32, cache_modifier=CM_DEV))
+                            for q_i in range_constexpr(4):
+                                q_a, q_b = bf2_f32(fx.Int32(q_wv4[q_i]))
+                                q_vals += [q_a, q_b]
+                        q_words, q_byte = quant_group(q_vals, "hip")
+                        bo.buffer_store(fx.Vector.from_elements(q_words, fx.Int32), rsrc(scratch),
+                                        (MQ + (q_u * MAX_TOKENS + q_t) * (INTER // 2) + q_grp * 16) // 4, cache_modifier=CM_DEV)
+                        bo.buffer_store(q_byte, rsrc(scratch), (MS + ((q_u * MAX_TOKENS + q_t) * MGROUPS + q_grp) * 4) // 4,
+                                        cache_modifier=CM_DEV)
+                _release()
+                gpu.barrier()
+                if tid == 0:
+                    box["mb"].put(box["rf"], bid, fx.Int32(1))
+
+            if const_expr(last >= 4):
+                # ---- DOWN: rows [64 b, 64 b + 64) = four (16, 16) shuffle groups; wave w takes
+                # group w // 2, K groups (w % 2) * 8 .. + 8 as two 1 KB loads (lane = row ni,
+                # K group 4 j + lane // 16); route-weighted fp32 sum over the union
+                if tid < BLOCKS:
+                    box["mb"].poll([(box["rf"], tid, 1)])
+                gpu.barrier()
+                d_ni = lane % 16
+                d_sub = lane // 16
+                d_row = bid * 64 + (wave // 2) * 16 + d_ni
+                d_gis = [(wave % 2) * 8 + d_j * 4 + d_sub for d_j in range(2)]
+
+                def d_load(d_i):
+                    d_c = fx.min(d_i, fx.max(nu - 1, fx.Int32(0)))
+                    de = uniform(fx.ptr_load(uexp + d_c))
+                    dm = uniform(fx.ptr_load(umask + d_c))
+                    dbase = w2 + fx.Int64(de) * W2_BYTES
+                    dww = [
+                        fx.Vector(bo.buffer_load(rsrc(dbase), _w2_group_index(d_row, dg), vec_width=4, dtype=T.i32))
+                        for dg in d_gis
+                    ]
+                    dsc = [_byte(s2, scale_index(de * HIDDEN + d_row, dg, MGROUPS)) for dg in d_gis]
+                    return [de, dm] + dww + dsc
+
+                d_acc = [fx.Float32(0.0) for _ in range(tokens)]
+                d_pre = d_load(fx.Int32(0))
+                for d_u in range(nu):
+                    d_cur = d_pre
+                    d_pre = d_load(d_u + 1)
+                    d_m = d_cur[1]
+                    d_wd = [
+                        [decode_word(fx.Int32(d_cur[2 + d_j][d_c]), pow2(d_cur[4 + d_j])) for d_c in range(4)]
+                        for d_j in range(2)
+                    ]
+                    for d_t in range_constexpr(tokens):
+                        if ((d_m >> d_t) & fx.Int32(1)) != fx.Int32(0):
+                            d_s = fx.Float32(0.0)
+                            for d_j in range_constexpr(2):
+                                d_mw = fx.Vector(bo.buffer_load(
+                                    rsrc(scratch), (MQ + (d_u * MAX_TOKENS + d_t) * (INTER // 2) + d_gis[d_j] * 16) // 4,
+                                    vec_width=4, dtype=T.i32, cache_modifier=CM_DEV))
+                                d_ms = pow2(fx.Int32(bo.buffer_load(
+                                    rsrc(scratch), (MS + ((d_u * MAX_TOKENS + d_t) * MGROUPS + d_gis[d_j]) * 4) // 4,
+                                    vec_width=1, dtype=T.i32, cache_modifier=CM_DEV)))
+                                for d_c in range_constexpr(4):
+                                    d_md = decode_word(fx.Int32(d_mw[d_c]), d_ms)
+                                    for d_k in range_constexpr(8):
+                                        d_s = d_s + d_wd[d_j][d_c][d_k] * d_md[d_k]
+                            d_acc[d_t] = d_acc[d_t] + fx.ptr_load(uw + d_u * MAX_TOKENS + d_t) * d_s
+                for d_t in range_constexpr(tokens):
+                    d_v = butterfly(d_acc[d_t], (16, 32))
+                    if d_sub == 0:
+                        fx.ptr_store(d_v, part + (wave * 16 + d_ni) * MAX_TOKENS + d_t)
+                gpu.barrier()
+                if tid < 4 * 8 * tokens:
+                    d_t2 = tid // 32
+                    d_rb = (tid % 32) // 8
+                    d_p = (tid % 8) * 2
+                    d_vals = []
+                    for d_q in range_constexpr(2):
+                        d_vals.append(
+                            fx.ptr_load(part + ((d_rb * 2) * 16 + d_p + d_q) * MAX_TOKENS + d_t2)
+                            + fx.ptr_load(part + ((d_rb * 2 + 1) * 16 + d_p + d_q) * MAX_TOKENS + d_t2)
                         )
+                    bo.buffer_store(
+                        fx.Vector.from_elements(d_vals, fx.Float32).to(fx.BFloat16),
+                        rsrc(out), d_t2 * HIDDEN + bid * 64 + d_rb * 16 + d_p,
+                    )
 
     @flyc.jit
     def launch(
