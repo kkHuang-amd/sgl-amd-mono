@@ -287,6 +287,9 @@ def emit_routed(ctx, args, tokens, last, shared, in_cm=0):
                     g_bs = g_col_ok.select(g_xs, fx.Int32(127))
                     for g_r in range_constexpr(2):
                         g_c[g_r] = mfma_scaled(g_w[g_r], g_b, g_c[g_r], g_ws[g_r], g_bs, FP4, FP4)
+                # one scheduling region a quarter: the compiler otherwise moves the next
+                # quarter's loads / waits across the MFMAs (M16 S3 503 -> 456 us)
+                rocdl.sched_barrier(0)
             # C: lane holds rows 4 (lane // 16) + i of column lane % 16 (a token)
             g_par = (g_task // BLOCKS % 2) * (WAVES * 32 * MAX_TOKENS)
             for g_r in range_constexpr(2):
