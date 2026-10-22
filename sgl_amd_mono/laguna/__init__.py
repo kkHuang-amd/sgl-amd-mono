@@ -13,6 +13,7 @@ import os
 MAX_ROWS = 16
 # the widths routed to the plugin: 1..SERVED_ROWS (SGLANG_AMD_MONO_LAGUNA_MAX_ROWS);
 # wider decode steps run SGLang's normal path, where it is faster than the launch
-# (TP8, 1024/256 serving 2026-10-22: wins through CONC 6, loses at 8 and 16)
-SERVED_ROWS = max(1, min(MAX_ROWS, int(os.environ.get("SGLANG_AMD_MONO_LAGUNA_MAX_ROWS", 6))))
+# (TP8, 1024/256 serving 2026-10-22, two-shot seams + S3 NT / sched_barrier / folded RQ: TPOT
+# -26 / -12 / -15 / -6 / -3 % at CONC 1 / 4 / 6 / 8 / 16, so every width by default)
+SERVED_ROWS = max(1, min(MAX_ROWS, int(os.environ.get("SGLANG_AMD_MONO_LAGUNA_MAX_ROWS", MAX_ROWS))))
 TP = 8
