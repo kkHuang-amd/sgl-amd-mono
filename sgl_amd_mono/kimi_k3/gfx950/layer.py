@@ -68,8 +68,8 @@ H0 = 8  # the shared SiTU's CTAs (after their AttnRes work)
 SD0 = k2b.DOWN_TASKS  # 224: the shared down's CTAs
 # timeline points: 0 start, 1 o_proj done / AR reduced, 2 early done / slice,
 # 3 ug, 4 down/sdown, 5 lnorm, 6 up, 7 reduce, 8 gate, 9 mix (x published),
-# 10 route, 11 route table, 12 latent quant, 13 route starts
-TL_POINTS = 17  # + 14 (unused), 15 INTER loaded, 16 down done
+# 10 route, 11 route table, 12 latent quant, 13 route starts, 14 router part pushed
+TL_POINTS = 20  # 15 INTER loaded, 16 down done, 17 route logits in, 18 top-16 picked, 19 latent part pushed
 
 assert E0 + k2b.R_TASKS + k2b.L_TASKS <= BLOCKS and k2b.G_TASKS <= E0 - O0
 
@@ -370,6 +370,7 @@ def build(key: K2Build):
                 "isc",
                 "lmsq",
                 "lnrdy",
+                "latqp",
                 "shrdy",
             ):
                 c[region] = sreg(scratch, lay[region][0], region)
@@ -387,11 +388,13 @@ def build(key: K2Build):
                 stamp(on, tls, tid, 1)
                 rops = k2b.early_loads(c, 0, eb // k2b.R_PARTS, eb % k2b.R_PARTS)
                 k2b.early_compute(c, 0, eb // k2b.R_PARTS, eb % k2b.R_PARTS, rops)
+                stamp(on, tls, tid, 14)
             if is_l:
                 stage_oproj(c, bid - O0)
                 stamp(on, tls, tid, 1)
                 lops = k2b.early_loads(c, 1, lb // k2b.L_PARTS, lb % k2b.L_PARTS)
                 k2b.early_compute(c, 1, lb // k2b.L_PARTS, lb % k2b.L_PARTS, lops)
+                stamp(on, tls, tid, 19)
             if (bid >= O0) & ~is_r & ~is_l:
                 stage_oproj(c, bid - O0)
                 stamp(on, tls, tid, 1)

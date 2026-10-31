@@ -70,6 +70,9 @@ from sgl_amd_mono.common.ops import (
     sum_partials,
     uniform,
     wave_sum,
+    wave_umax,
+    write_lane_i32,
+    bpermute_i32,
 )
 from sgl_amd_mono.common.plan import (
     BLOCKS,
@@ -107,6 +110,7 @@ REGIONS = (
     "lmsq",
     "lnrdy",
     "shrdy",
+    "latqp",
     "rlog",
     "lat",
     "latr",
@@ -203,6 +207,7 @@ def scratch_layout(key: MoeBuild) -> dict:
         "lmsq": LN_TASKS * s,
         "lnrdy": LN_TASKS,
         "shrdy": UP_TASKS,
+        "latqp": s * (LAT // 8 + LAT // 32),
     }
     lay = pair_layout(pairs.items())
     end = max(o + n for o, n in lay.values())
@@ -424,90 +429,98 @@ def _okey(v):
     return fx.Uint32(neg.select(~b, b ^ fx.Int32(-2147483648)))
 
 
+def _merge_pairs(lo, hi, r):
+    step = r * 2
+    if step < hi - lo:
+        yield from _merge_pairs(lo, hi, step)
+        yield from _merge_pairs(lo + r, hi, step)
+        yield from ((i, i + r) for i in range(lo + r, hi - r, step))
+    else:
+        yield (lo, lo + r)
+
+
+def _sort_pairs(lo, hi):
+    if hi - lo >= 1:
+        mid = lo + (hi - lo) // 2
+        yield from _sort_pairs(lo, mid)
+        yield from _sort_pairs(mid + 1, hi)
+        yield from _merge_pairs(lo, hi, 1)
+
+
+# A lane's 14 candidates (E / 64): Batcher's odd-even merge sort of 16, without the
+# comparators that touch the two absent (least) inputs.
+PER = E // 64
+SORT_PAIRS = tuple((a, b) for a, b in _sort_pairs(0, 15) if b < PER)
+ID_SPAN = 1 << 10  # > E: a pick's lowest-expert tie key, ID_SPAN - e, is never 0
+
+
 @flyc.jit
 def stage_route(c, t):
     """Token t (wave 0): 896 logits, 14 a lane (expert lane + 64 i) -> sigmoid
-    (v_rcp) + bias -> the top-16 by a radix select (the 16th largest key by a
-    32-step bit search of ballot counts; equal keys: the lower experts) -> the
-    16 ranked by score, descending (aiter's slot order) -> the pre-bias
+    (v_rcp) + bias -> each lane's 14 sorted by key -> 16 rounds of a wave
+    maximum over the lanes' heads (equal keys: the lower expert), so the picks
+    come out ranked by score, descending (aiter's slot order) -> the pre-bias
     sigmoids renormalized in that order (IEEE 1 / sum)."""
     lane, wave, red = c["lane"], c["wave"], c["red"]
     a = c["args"]
     if wave == 0:
         s = c["S"]
-        per = E // 64
         specs = []
-        for i in range_constexpr(per):
+        for i in range_constexpr(PER):
             e = lane + 64 * i
             src = e // (E // TP)
             specs.append(
                 (c["peer"]["rlog_own"], (src * s + t) * (E // TP) + e % (E // TP), 1)
             )
         got = c["poll"](specs)
-        keys, sigs = [], []
-        for i in range_constexpr(per):
+        stamp(c["tl_on"], c["tls"], c["tid"], 17)
+        ks, es, sigs = [], [], []
+        for i in range_constexpr(PER):
             e = lane + 64 * i
             lg = f32_of(got[i][0])
             sg = hw_rcp(fx.Float32(1.0) + hw_exp2(lg * fx.Float32(-LOG2E)))
             sc = sg + bo_ld_f32(a["bias"], e)
             # a NaN logit (a warmup's garbage row) ranks last
-            keys.append(_okey((sc == sc).select(sc, fx.Float32(-3.0e38))))
+            ks.append(_okey((sc == sc).select(sc, fx.Float32(-3.0e38))))
+            es.append(fx.Int32(e))
             sigs.append((sg == sg).select(sg, fx.Float32(0.0)))
-
-        def count_ge(th):
-            n = fx.Int32(0)
-            for i in range_constexpr(per):
-                n = n + popcount(ballot(keys[i] >= th))
-            return n
-
-        th = fx.Uint32(0)
-        for bit in range_constexpr(31, -1, -1):
-            cand = th | fx.Uint32(1 << bit)
-            th = (count_ge(cand) >= TOPK).select(cand, th)
-        # selected: key > th, then the lowest experts with key == th
-        n_gt = fx.Int32(0)
-        for i in range_constexpr(per):
-            n_gt = n_gt + popcount(ballot(keys[i] > th))
-        need = fx.Int32(TOPK) - n_gt
-        eq_before = fx.Int32(0)
-        sel_before = fx.Int32(0)
-        for i in range_constexpr(per):
-            eqb = ballot(keys[i] == th)
-            eq_rank = eq_before + lanes_below(eqb, lane)
-            sel = (keys[i] > th) | ((keys[i] == th) & (eq_rank < need))
-            selb = ballot(sel)
-            pos = sel_before + lanes_below(selb, lane)
-            if sel:
-                fx.ptr_store(keys[i].bitcast(fx.Float32), red + pos * 3)
-                fx.ptr_store(
-                    fx.Int32(lane + 64 * i).bitcast(fx.Float32), red + (pos * 3 + 1)
-                )
-                fx.ptr_store(sigs[i], red + (pos * 3 + 2))
-            eq_before = eq_before + popcount(eqb)
-            sel_before = sel_before + popcount(selb)
-        # rank the 16 by key descending, the lower expert first on a tie
-        q = fx.min(lane, TOPK - 1)
-        mk = fx.Uint32(fx.ptr_load(red + q * 3).bitcast(fx.Int32))
-        me = fx.ptr_load(red + (q * 3 + 1)).bitcast(fx.Int32)
-        ms = fx.ptr_load(red + (q * 3 + 2))
-        rank = fx.Int32(0)
-        for j in range_constexpr(TOPK):
-            ok = fx.Uint32(fx.ptr_load(red + j * 3).bitcast(fx.Int32))
-            oe = fx.ptr_load(red + (j * 3 + 1)).bitcast(fx.Int32)
-            before = (ok > mk) | ((ok == mk) & (oe < me))
-            rank = rank + before.select(fx.Int32(1), fx.Int32(0))
+        for x, y in SORT_PAIRS:
+            first = (ks[x] > ks[y]) | ((ks[x] == ks[y]) & (es[x] < es[y]))
+            kx, ky, ex, ey = ks[x], ks[y], es[x], es[y]
+            ks[x], ks[y] = first.select(kx, ky), first.select(ky, kx)
+            es[x], es[y] = first.select(ex, ey), first.select(ey, ex)
+        # a popped lane's head becomes 0, which no key reaches (_okey(-3e38) > 0)
+        ks = [fx.Int32(k) for k in ks] + [fx.Int32(0)]
+        es = es + [fx.Int32(E)]
+        pick = fx.Int32(0)  # lane k: the expert of pick k
+        for k in range_constexpr(TOPK):
+            m = wave_umax(ks[0])
+            top = ks[0] == m
+            e_w = fx.Int32(ID_SPAN) - wave_umax(
+                top.select(fx.Int32(ID_SPAN) - es[0], fx.Int32(0))
+            )
+            hit = top & (es[0] == e_w)
+            ks = [hit.select(ks[i + 1], ks[i]) for i in range(PER)] + [ks[PER]]
+            es = [hit.select(es[i + 1], es[i]) for i in range(PER)] + [es[PER]]
+            pick = write_lane_i32(e_w, k, pick)
+        stamp(c["tl_on"], c["tls"], c["tid"], 18)
+        # pick k's pre-bias sigmoid, from the lane that held expert e (e % 64, slot e / 64)
+        me = fx.min(fx.max(pick, 0), fx.Int32(E - 1))
+        held = [bpermute_i32((me % 64) * 4, sigs[i].bitcast(fx.Int32)) for i in range(PER)]
+        ms = held[0]
+        for i in range_constexpr(1, PER):
+            ms = (me // 64 == i).select(held[i], ms)
+        ms = ms.bitcast(fx.Float32)
         # the sigmoids in rank order, summed serially (aiter's renorm)
         if lane < TOPK:
-            fx.ptr_store(ms, red + (64 + rank))
+            fx.ptr_store(ms, red + (64 + lane))
         total = fx.Float32(0.0)
         for j in range_constexpr(TOPK):
             total = total + fx.ptr_load(red + (64 + j))
         inv = fx.Float32(1.0) / total
         if lane < TOPK:
-            c["put"](
-                c["route"], t * 2 * TOPK + rank, fx.min(fx.max(me, 0), fx.Int32(E - 1))
-            )
-            c["put"](c["route"], t * 2 * TOPK + TOPK + rank, ms * inv)
+            c["put"](c["route"], t * 2 * TOPK + lane, me)
+            c["put"](c["route"], t * 2 * TOPK + TOPK + lane, ms * inv)
     gpu.barrier()
 
 
@@ -564,20 +577,32 @@ def load_route(c):
     return uniform(tot)
 
 
+# load_latq's quantizing CTAs: the router and latent CTAs and the ones after them
+# (layer.py's E0 = 160), which reach it ~10 us before the AttnRes / route CTAs.
+Q0 = 160
+QCTAS = BLOCKS - Q0
+
+
 @flyc.jit
 def load_latq(c):
-    """LAT (every rank's 448 columns) -> MXFP4 as aiter's inline quant: a
-    thread a (token, 32-block): amax of |bf16| bits, the ceil code of amax / 6,
-    v_cvt_scalef32_pk_fp4_bf16 -> latq words, latsc codes."""
-    s, tid = c["S"], c["tid"]
+    """LAT (every rank's 448 columns) -> MXFP4 as aiter's inline quant, once a
+    launch: a block (token, 32 columns) on thread b / QCTAS of CTA Q0 + b % QCTAS,
+    the CTAs whose early (router / latent) tasks end first:
+    amax of |bf16| bits, the ceil code of amax / 6, v_cvt_scalef32_pk_fp4_bf16
+    -> LATQP (4 words and the code a block); then every CTA polls LATQP into its
+    latq words and latsc codes. Quantizing on every CTA instead had each read
+    the whole bf16 latent (~115 KB of tagged pairs; ~9 us a launch at 8 rows)."""
+    s, tid, bid = c["S"], c["tid"], c["bid"]
     nblk = s * (LAT // 32)
-    for i in range_constexpr((nblk + THREADS - 1) // THREADS):
-        b = fx.min(tid + THREADS * i, nblk - 1)
+    nq = s * (LAT // 8)
+    per = (nblk + QCTAS - 1) // QCTAS
+    if (bid >= Q0) & (tid < per):
+        b = fx.min(bid - Q0 + QCTAS * tid, nblk - 1)
         t = b // (LAT // 32)
         kb = b % (LAT // 32)
         base = (t * LAT + kb * 32) // 2
-        got = c["poll"]([(c["peer"]["lat_own"], base + j, 1) for j in range(16)])
-        ws = [got[j][0] for j in range(16)]
+        got = c["poll"]([(c["peer"]["lat_own"], base + 2 * j, 2) for j in range(8)])
+        ws = [got[j // 2][j % 2] for j in range(16)]
         am = fx.Int32(0)
         for w in ws:
             am = fx.max(am, w & 0x7FFF)
@@ -585,13 +610,27 @@ def load_latq(c):
         amax = (am << 16).bitcast(fx.Float32)
         code = e8m0_roundup(amax)
         scale = (code << 23).bitcast(fx.Float32)
-        if tid + THREADS * i < nblk:
-            for q in range_constexpr(4):
-                pk = fx.Int32(0)
-                for j in range_constexpr(4):
-                    pk = pk_fp4_bf16(pk, ws[4 * q + j], scale, j)
-                fx.ptr_store(pk, c["latq"] + (t * (LAT // 8) + kb * 4 + q))
-            fx.ptr_store(code, c["latsc"] + (t * (LAT // 32) + kb))
+        pks = []
+        for q in range_constexpr(4):
+            pk = fx.Int32(0)
+            for j in range_constexpr(4):
+                pk = pk_fp4_bf16(pk, ws[4 * q + j], scale, j)
+            pks.append(pk)
+        if bid - Q0 + QCTAS * tid < nblk:
+            c["put_words"](c["latqp"], t * (LAT // 8) + kb * 4, pks[:2])
+            c["put_words"](c["latqp"], t * (LAT // 8) + kb * 4 + 2, pks[2:])
+            c["put"](c["latqp"], nq + t * (LAT // 32) + kb, code)
+    total = nq + nblk
+    for i in range_constexpr((total + 4 * THREADS - 1) // (4 * THREADS)):
+        at = fx.min((tid + THREADS * i) * 4, total - 4)
+        got = c["poll"]([(c["latqp"], at, 2), (c["latqp"], at + 2, 2)])
+        if (tid + THREADS * i) * 4 < total:
+            for j in range_constexpr(4):
+                w = got[j // 2][j % 2]
+                if at + j < nq:
+                    fx.ptr_store(w, c["latq"] + (at + j))
+                if at + j >= nq:
+                    fx.ptr_store(w, c["latsc"] + (at + j - nq))
     gpu.barrier()
 
 
@@ -1226,6 +1265,9 @@ def build(key: MoeBuild):
         c = {
             "S": s,
             "tid": tid,
+            # the route's marks (17, 18) are the layer launch's; this launch has 8
+            "tl_on": False,
+            "tls": tid,
             "bid": bid,
             "lane": tid % 64,
             "wave": tid // 64,
@@ -1286,6 +1328,7 @@ def build(key: MoeBuild):
             "isc",
             "lmsq",
             "lnrdy",
+            "latqp",
             "shrdy",
         ):
             c[region] = sreg(scratch, lay[region][0], region)

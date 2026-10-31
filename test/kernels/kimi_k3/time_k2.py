@@ -90,6 +90,26 @@ def main():
     for _ in range(3):
         tgraph.replay()
     torch.cuda.synchronize()
+    import torch.distributed as dist
+
+    every = [torch.empty_like(tl) for _ in range(TP)]
+    dist.all_gather(every, tl)
+    if rank == 0:
+        # the route's chain per rank, against one clock (the wall clock is shared)
+        t0 = min(int(t[:, 0][t[:, 0] > 0].min()) for t in every)
+        q = lambda t, p, rows=None: (t[rows, p] if rows is not None else t[:, p])  # noqa: E731
+        print("rank: x published (9, max) | router part pushed (14, max) | logits in (17) | top-16 (18)"
+              " | route CTAs done (10)  [17, 18, 10 on CTAs 0..7, max] | latent part pushed (19, max) | latent quant (12, median) | route table (11, median)", flush=True)
+        for r, t in enumerate(every):
+            t = t.cpu()
+            vals = [q(t, 9, slice(0, 56)), q(t, 14), q(t, 17, slice(0, ROWS)), q(t, 18, slice(0, ROWS)),
+                    q(t, 10, slice(0, ROWS)), q(t, 19), q(t, 12), q(t, 11)]
+            out_s = []
+            for i, v in enumerate(vals):
+                v = v[v > 0]
+                x = v.max() if i < 6 else v.median()
+                out_s.append(f"{(int(x) - t0) / 100.0:6.1f}")
+            print(f"  {r}: " + "  ".join(out_s), flush=True)
     if rank == 0:
         print(f"layer launch, rows {ROWS}: {us:.1f} us a launch (graph-replayed)", flush=True)
         t = tl.cpu()
