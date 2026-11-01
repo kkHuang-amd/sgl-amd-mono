@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """LDS tile GEMM stage (``kimi_k31.gfx950.stages.tile_mma``) on 1 gfx950 GPU:
 rel L2 against fp32 and, with ``--time``, graph-replayed us against tgemm.
-ks > 1 times the stage alone (f32 partials); ``--sum`` adds a torch sum of
-the partials as a stand-in for the consumer's reads.
+ks > 1 times the stage alone (``--mode`` part / atom / atombf); ``--sum`` adds
+the partials' torch sum, or the atomics' zeroing, each one launch.
 
     python mma_bench.py [--time] [--sum] [--m 128] [--shapes N:K,...] [--cfg bm:bn:wm:wn:ks[:depth],...]
 """
@@ -30,6 +30,7 @@ def main():
     ap.add_argument("--m", default="128")
     ap.add_argument("--shapes", default=SHAPES)
     ap.add_argument("--cfg", default=CFG)
+    ap.add_argument("--mode", default="part", help="part,atom,atombf,lin,linbf (ks > 1)")
     a = ap.parse_args()
     if a.time:
         from aiter.tuned_gemm import tgemm
@@ -44,26 +45,32 @@ def main():
             tg = ""
             if a.time:
                 tg = f"  tgemm {bench(lambda w: tgemm.mm(x, w, None, otype=torch.bfloat16), ws):6.1f} us"
-            for cfg in a.cfg.split(","):
+            for cfg, mode in ((c, md) for c in a.cfg.split(",") for md in a.mode.split(",")):
                 bm, bn, wm, wn, ks, *d = map(int, cfg.split(":"))
+                if ks == 1 and mode != a.mode.split(",")[0]:
+                    continue
                 depth = d[0] if d else tile_mma.DEPTH
                 if (k // ks) % tile_mma.BK or k % ks:
                     continue
-                shape = (m, n) if ks == 1 else (ks, m, n)
-                out = torch.empty(shape, device="cuda", dtype=torch.bfloat16 if ks == 1 else torch.float32)
-                launch = tile_mma.standalone(m, n, k, bm, bn, wm, wn, ks, depth)
+                part = ks > 1 and mode == "part"
+                shape = (ks, m, n) if part else (m, n)
+                dt = torch.bfloat16 if ks == 1 or mode in ("atombf", "linbf") else torch.float32
+                out = torch.zeros(shape, device="cuda", dtype=dt)
+                launch = tile_mma.standalone(m, n, k, bm, bn, wm, wn, ks, depth, mode)
 
-                def fn(w, launch=launch, out=out, ks=ks):
+                def fn(w, launch=launch, out=out, part=part, ks=ks):
+                    if a.sum and ks > 1 and not part:
+                        out.zero_()
                     launch(x.data_ptr(), w.data_ptr(), out.data_ptr(), stream=torch.cuda.current_stream())
-                    if a.sum and ks > 1:
+                    if a.sum and part:
                         out.sum(0)
 
                 fn(ws[0])
                 torch.cuda.synchronize()
-                got = out.float() if ks == 1 else out.sum(0)
+                got = out.sum(0) if part else out.float()
                 err = ((got - ref).norm() / ref.norm()).item()
                 worst = max(worst, err)
-                line = f"m={m:3d} n={n:5d} k={k:5d} t{bm}x{bn} w{wm}x{wn} ks{ks} d{depth} relL2 {err:.1e}"
+                line = f"m={m:3d} n={n:5d} k={k:5d} t{bm}x{bn} w{wm}x{wn} ks{ks} d{depth} {mode if ks > 1 else 'bf16':6s} relL2 {err:.1e}"
                 if a.time:
                     line += f"  mma {bench(fn, ws):6.1f} us"
                 print(line + tg, flush=True)

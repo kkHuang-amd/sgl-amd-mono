@@ -23,7 +23,7 @@ from flydsl.expr.typing import Int64, T
 
 from sgl_amd_mono.common.ops import CM_NT, mfma_bf16, rsrc
 from sgl_amd_mono.common.plan import THREADS, WAVES
-from sgl_amd_mono.kimi_k31.gfx950.stages.tile import bf16_emit, f32_emit
+from sgl_amd_mono.kimi_k31.gfx950.stages.tile import atomic_emit, atomic_lin, bf16_emit, f32_emit
 
 BK = 64
 RW = (BK + 8) // 2  # i32 words an LDS row
@@ -32,8 +32,33 @@ DEPTH = 3  # K steps of loads in flight
 
 
 def lds_words(bm, bn):
-    """i32 words of LDS a (bm, bn) task uses: two buffers of x and W rows."""
-    return 2 * (bm + bn) * RW
+    """i32 words of LDS a (bm, bn) task uses: two buffers of x and W rows (the
+    shuffled epilogue's f32 tile reuses them)."""
+    return max(2 * (bm + bn) * RW, bm * (bn + 4))
+
+
+def _shuffle(tid, lane, wave, acc, cl, bm, bn, tm, tn, wy, wx, m0, lin):
+    """Accumulators -> the f32 [bm, bn + 4] tile in LDS ``cl`` -> ``lin`` = (e,
+    add): consecutive lanes add consecutive e-element runs of a row."""
+    e, add = lin
+    gpu.barrier()
+    for t in range_constexpr(len(acc)):
+        for b in range_constexpr(len(acc[0])):
+            row = wy * tm + t * 16 + lane % 16
+            col = wx * tn + b * 16 + 4 * (lane // 16)
+            fx.ptr_store(acc[t][b], cl + row * (bn + 4) + col)
+    gpu.barrier()
+    per = 64 * e
+    assert bn % per == 0 or per % bn == 0
+    for i in range_constexpr(bm * bn // (per * WAVES)):
+        idx = (i * WAVES + wave) * per + lane * e
+        row, col = idx // bn, idx % bn
+        p = cl + row * (bn + 4) + col
+        if const_expr(e > 1):
+            v = fx.Vector(fx.ptr_load(p, result_type=fx.Vector.make_type(e, fx.Float32)))
+            add(m0 + row, col, [v[d] for d in range(e)])
+        else:
+            add(m0 + row, col, [fx.ptr_load(p)])
 
 
 def _loads(tid, xr, ldx, m, m0, wr, ldw, n, n0, k0, bm, bn):
@@ -68,10 +93,13 @@ def _frag(lds, buf, rows, row, kk, lane):
     )
 
 
-def mma_tile(tid, x, ldx, m, m0, w, ldw, n, n0, k0, kt, bm, bn, wm, wn, xs, ws, emit, depth=DEPTH):
+def mma_tile(tid, x, ldx, m, m0, w, ldw, n, n0, k0, kt, bm, bn, wm, wn, xs, ws, emit, depth=DEPTH,
+             lin=None, cl=None):
     """One task: K columns k0 .. k0 + kt of the [bm, bn] tile at (m0, n0);
     ``emit(row, col, v, live)`` gets 4 output columns n0 + col .. of token
-    row ``row`` (absolute; the emit masks row >= m and columns >= n)."""
+    row ``row`` (absolute; the emit masks row >= m and columns >= n). With ``lin``
+    (``tile.atomic_lin``) the tile is shuffled through the f32 LDS ``cl`` (aliasing
+    xs / ws) into lane-contiguous adds instead."""
     assert wm * wn == WAVES and kt % BK == 0
     lane, wave = tid % 64, tid // 64
     tm, tn = bm // wm, bn // wn
@@ -106,6 +134,9 @@ def mma_tile(tid, x, ldx, m, m0, w, ldw, n, n0, k0, kt, bm, bn, wm, wn, xs, ws, 
                 pend.append(loads(j + 1 + depth))
             rocdl.sched_barrier(0)
             gpu.barrier()
+    if const_expr(lin is not None):
+        _shuffle(tid, lane, wave, acc, cl, bm, bn, tm, tn, wy, wx, m0, lin)
+        return
     for t in range_constexpr(mt):
         for b in range_constexpr(nt):
             row = m0 + wy * tm + t * 16 + lane % 16
@@ -116,10 +147,13 @@ def mma_tile(tid, x, ldx, m, m0, w, ldw, n, n0, k0, kt, bm, bn, wm, wn, xs, ws, 
 _BUILDS: dict = {}
 
 
-def standalone(m, n, k, bm=128, bn=128, wm=2, wn=4, ks=1, depth=DEPTH):
-    """Grid (n tiles, ks, m tiles): bf16 out[m, n], or with ks > 1 f32 partials
-    out[ks, m, n] that the consumer sums."""
-    key = (m, n, k, bm, bn, wm, wn, ks, depth)
+def standalone(m, n, k, bm=128, bn=128, wm=2, wn=4, ks=1, depth=DEPTH, mode="part"):
+    """Grid (n tiles, ks, m tiles): bf16 out[m, n] at ks = 1; with ks > 1 by
+    ``mode``: "part" f32 partials out[ks, m, n] that the consumer sums, "atom"
+    f32 adds into a zeroed out[m, n], "atombf" packed bf16x2 adds into a zeroed
+    bf16 out[m, n]; "lin" / "linbf" the same adds after an LDS shuffle, lane
+    contiguous."""
+    key = (m, n, k, bm, bn, wm, wn, ks, depth, mode)
     if key in _BUILDS:
         return _BUILDS[key]
     kt = k // ks
@@ -127,11 +161,20 @@ def standalone(m, n, k, bm=128, bn=128, wm=2, wn=4, ks=1, depth=DEPTH):
     tn_, tm_ = (n + bn - 1) // bn, (m + bm - 1) // bm
 
     @fx.struct
-    class Smem:
+    class AbLds:
         xs: fx.Array[fx.Int32, 2 * bm * RW, 16]
         ws: fx.Array[fx.Int32, 2 * bn * RW, 16]
 
-    name = f"k31_mma_m{m}_n{n}_k{k}_t{bm}x{bn}_w{wm}x{wn}_ks{ks}_d{depth}"
+    @fx.struct
+    class CLds:
+        c: fx.Array[fx.Float32, bm * (bn + 4), 16]
+
+    @fx.union
+    class Smem:
+        ab: AbLds
+        c: CLds
+
+    name = f"k31_mma_m{m}_n{n}_k{k}_t{bm}x{bn}_w{wm}x{wn}_ks{ks}_d{depth}_{mode}"
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def mma_kernel(x: Int64, w: Int64, out: Int64):
@@ -139,12 +182,20 @@ def standalone(m, n, k, bm=128, bn=128, wm=2, wn=4, ks=1, depth=DEPTH):
         n0 = fx.block_idx.x * bn
         sk = fx.block_idx.y
         m0 = fx.block_idx.z * bm
-        lds = fx.SharedAllocator().allocate(Smem).peek()
+        st = fx.SharedAllocator().allocate(Smem)
+        lds, cl = st.ab.peek(), st.c.peek().c.ptr
+        lin = None
         if const_expr(ks == 1):
             emit = bf16_emit(out, n, n0, m, n)
-        else:
+        elif const_expr(mode == "part"):
             emit = f32_emit(out + fx.Int64(sk) * (m * n * 4), n, n0, m, n)
-        mma_tile(tid, x, k, m, m0, w, k, n, n0, sk * kt, kt, bm, bn, wm, wn, lds.xs.ptr, lds.ws.ptr, emit, depth)
+        elif const_expr(mode in ("atom", "atombf")):
+            emit = atomic_emit(out, n, n0, m, n, mode == "atombf")
+        else:
+            emit = None
+            lin = atomic_lin(out, n, n0, m, n, mode == "linbf")
+        mma_tile(tid, x, k, m, m0, w, k, n, n0, sk * kt, kt, bm, bn, wm, wn, lds.xs.ptr, lds.ws.ptr, emit, depth,
+                 lin, cl)
 
     @flyc.jit
     def launch(x: Int64, w: Int64, out: Int64, stream: fx.Stream = fx.Stream(None)):  # noqa: B008

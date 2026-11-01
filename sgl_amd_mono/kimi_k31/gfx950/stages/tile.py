@@ -160,6 +160,52 @@ def f32_emit(out, ldo, n0, m, n):
     return emit
 
 
+def atomic_emit(out, ldo, n0, m, n, bf16):
+    """``emit`` adding into the zeroed row-major [m, ldo] at ``out``: f32 adds,
+    or with ``bf16`` packed bf16x2 adds (half the bytes, bf16 rounding a K slice)."""
+    eb = 2 if bf16 else 4
+    size = m * ldo * eb
+    r_o = rsrc(out, size)
+    z = fx.Int32(0)
+
+    def emit(row, col, v, live):
+        ok = (row < m) & (n0 + col < n)
+        ok = ok if live is None else ok & live
+        # a masked lane adds at the buffer's end: out of range for every + 4 j
+        # (0x7FFFFFFF + 4 j would wrap)
+        off = ok.select((row * ldo + n0 + col) * eb, fx.Int32(size))
+        if const_expr(bf16):
+            for j in range_constexpr(2):
+                pair = fx.Vector.from_elements([v[2 * j], v[2 * j + 1]], fx.Float32).to(fx.BFloat16)
+                rocdl.raw_ptr_buffer_atomic_fadd(pair, r_o, off + 4 * j, z, z)
+        else:
+            for j in range_constexpr(4):
+                rocdl.raw_ptr_buffer_atomic_fadd(v[j], r_o, off + 4 * j, z, z)
+
+    return emit
+
+
+def atomic_lin(out, ldo, n0, m, n, bf16):
+    """Lane-contiguous adds for an LDS-shuffled epilogue: (elements a lane,
+    ``add(row, col, vals)``); consecutive lanes take consecutive columns, so a
+    wave's add covers whole 64 B lines."""
+    eb = 2 if bf16 else 4
+    size = m * ldo * eb
+    r_o = rsrc(out, size)
+    z = fx.Int32(0)
+
+    def add(row, col, vals):
+        ok = (row < m) & (n0 + col < n)
+        off = ok.select((row * ldo + n0 + col) * eb, fx.Int32(size))
+        if const_expr(bf16):
+            pair = fx.Vector.from_elements(vals, fx.Float32).to(fx.BFloat16)
+            rocdl.raw_ptr_buffer_atomic_fadd(pair, r_o, off, z, z)
+        else:
+            rocdl.raw_ptr_buffer_atomic_fadd(vals[0], r_o, off, z, z)
+
+    return (2 if bf16 else 1), add
+
+
 _BUILDS: dict = {}
 
 
