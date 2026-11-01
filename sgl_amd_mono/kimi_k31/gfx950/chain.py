@@ -91,20 +91,25 @@ def _rs_piece(c, piece, m, sl, rb, bn, res, res_out, pdone, tl_on, tls, first, r
     if first:
         stamp(tl_on, tls, tid, 3)
     band, cj = piece // ct, piece % ct
-    r_res, r_out, r_rs = rsrc(res), rsrc(res_out), rsrc(c["rs_own"].value)
+    # res None: a block-write layer, whose prefix restarts at the attention output
+    r_res = rsrc(res) if res is not None else None
+    r_out, r_rs = rsrc(res_out), rsrc(c["rs_own"].value)
     for u in range(tid, rb * q8, THREADS):
         row = band * rb + u // q8
         col = cj * bn + 8 * (u % q8)
         if row < m:
             got = [fx.Vector(bo.buffer_load(r_rs, (src * m * sl + row * sl + col) // 2, vec_width=4, dtype=T.i32,
                                             cache_modifier=CM_SYS)) for src in range(TP)]
-            rv = fx.Vector(bo.buffer_load(r_res, (row * sl + col) // 2, vec_width=4, dtype=T.i32, cache_modifier=res_cm))
+            if const_expr(res is not None):
+                rv = fx.Vector(bo.buffer_load(r_res, (row * sl + col) // 2, vec_width=4, dtype=T.i32,
+                                              cache_modifier=res_cm))
             acc = None
             for src in range_constexpr(TP):
                 cur = [v for e in range(4) for v in bf2_f32(got[src][e])]
                 acc = cur if acc is None else [a + b for a, b in zip(acc, cur)]
-            r = [v for e in range(4) for v in bf2_f32(rv[e])]
-            acc = [a + b for a, b in zip(acc, r)]
+            if const_expr(res is not None):
+                r = [v for e in range(4) for v in bf2_f32(rv[e])]
+                acc = [a + b for a, b in zip(acc, r)]
             words = [bf16_pair(acc[2 * j], acc[2 * j + 1]).bitcast(fx.Int32) for j in range(4)]
             bo.buffer_store(fx.Vector.from_elements(words, fx.Int32), r_out, (row * sl + col) // 2,
                             cache_modifier=CM_DEV)

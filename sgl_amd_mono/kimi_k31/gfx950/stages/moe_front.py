@@ -84,8 +84,9 @@ def _sigmoid(x):
 
 
 @flyc.jit
-def route_row(c, row, m, rbf, nbf, bn, bias, lat_out, topk_ids, topk_w):
-    """The row's gathered latent -> the experts' input; top-16 of the gathered logits."""
+def route_row(c, row, m, rbf, nbf, bn, bias, lat_out, topk_ids, topk_w, logits_out=None):
+    """The row's gathered latent -> the experts' input; top-16 of the gathered logits
+    (and the logits themselves -> ``logits_out`` f32 [m, 896], for SGLang's own top-k)."""
     tid = c["tid"]
     lane, wave = tid % 64, tid // 64
     nt = gathered_tiles(bn)
@@ -97,6 +98,9 @@ def route_row(c, row, m, rbf, nbf, bn, bias, lat_out, topk_ids, topk_w):
     for u in range(tid, LAT // 8, THREADS):
         v = fx.Vector(bo.buffer_load(lg, (row * LAT + 8 * u) // 2, vec_width=4, dtype=T.i32, cache_modifier=CM_SYS))
         bo.buffer_store(v, rsrc(lat_out), (row * LAT + 8 * u) // 2)
+    if const_expr(logits_out is not None):
+        for e in range(tid, E, THREADS):
+            bo.buffer_store(ld_f32(c["rgat_own"].value, row * E + e), rsrc(logits_out), row * E + e)
     if wave == 0:
         per = E // 64  # 14 experts a lane
         sc, key = [], []

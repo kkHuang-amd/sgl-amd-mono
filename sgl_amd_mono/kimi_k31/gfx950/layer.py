@@ -99,7 +99,7 @@ _BUILDS: dict = {}
 
 
 def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk=8, launches=1, eps=1e-5,
-              eps_n=1e-5, kpt=16, capture=False, t1=True):
+              eps_n=1e-5, kpt=16, capture=False, t1=True, restart=False, half_bytes=0):
     """Build the layer launch; returns (launch, plan). Arguments: the pre half's
     (lat_p, sh_p, w_up (``pre.fold_up``), prefix, cw_a, w_in, w_ip, ip_buf (in_proj
     merge, bf16 [m, 6288] zeroed once), acc_u (bf16 [m, 896] zeroed once)), mid
@@ -114,8 +114,14 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
     front in f32 (router logits). ``capture``: DSpark's capture of the previous
     layer (the attention seam's pre-norm mixture, gathered) -> cap_out [m, H] with
     row stride cap_ld; else cap_out is unused. ``t1=False`` (check builds): no MoE tail;
-    ``mid`` is an input (the prefix after the previous layer, written by the caller)."""
-    key = (m, cfg.key(), L, nf, nvb_a, nvb_m, write_a, write_m, nbk, launches, eps, eps_n, kpt, capture, t1)
+    ``mid`` is an input (the prefix after the previous layer, written by the caller).
+    ``restart``: a block-write layer -- its prefix restarts at the attention output
+    (SGLang passes no prefix_sum there). ``logits_out`` f32 [m, 896]: the gathered
+    router logits, for SGLang's own top-k and experts. ``half_bytes``: lay the peer
+    buffer out with at least this half size (every variant sharing one buffer must
+    agree on its halves and on where the guard's flags are)."""
+    key = (m, cfg.key(), L, nf, nvb_a, nvb_m, write_a, write_m, nbk, launches, eps, eps_n, kpt, capture, t1, restart,
+           half_bytes)
     if key in _BUILDS:
         return _BUILDS[key]
     gu, gi, go, gf, gs = cfg.up, cfg.inp, cfg.oproj, cfg.front, cfg.sdown
@@ -124,12 +130,14 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
     assert gu.ks > 1 and gi.ks > 1
     pl, pp, po = plan(m, cfg, L, nvb_a, nvb_m, nf, capture)
     offs, half = pl.peer_offsets
+    assert half_bytes == 0 or half <= half_bytes, (half, half_bytes)
+    half = max(half, half_bytes)
     soffs, _ = pl.scratch_offsets
     pre_offs = {r.name: offs[r.name] for r in pp.regions if r.peer}
     if capture:
         pre_offs.update(cap=offs["cap"], capf=offs["capf"])
     post_offs = {r.name: offs["o_" + r.name] for r in po.regions if r.peer}
-    fo = pl.flags_offset()
+    fo = 2 * half
     state_len = L + k1.CONV_W - 1
     nin = k1.NPROJ
     # pre half
@@ -185,14 +193,14 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
         red: fx.Array[fx.Float32, max(red_words(nvb_a), red_words(nvb_m)), 16]
 
     name = (f"k31_kda_layer_m{m}_{'_'.join('x'.join(map(str, g)) for g in cfg.key())}_L{L}_n{nf}_a{nvb_a}{int(write_a)}"
-            f"_m{nvb_m}{int(write_m)}of{nbk}_l{launches}_p{kpt}_c{int(capture)}_t{int(t1)}")
+            f"_m{nvb_m}{int(write_m)}of{nbk}_l{launches}_p{kpt}_c{int(capture)}_t{int(t1)}_r{int(restart)}")
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def layer_kernel(lat_p: Int64, sh_p: Int64, w_up: Int64, prefix: Int64, mid: Int64, prefix_out: Int64,
                      bank: Int64, cw_a: Int64, w_in: Int64, w_ip: Int64, ip_buf: Int64, acc_u: Int64, kda_tab: Int64,
                      core: Int64, wo: Int64, cw_m: Int64, w_ln: Int64, wf: Int64, acc_o: Int64, bias: Int64,
                      lat_out: Int64, topk_ids: Int64, topk_w: Int64, w_sd: Int64, sh_out: Int64, cap_out: Int64,
-                     cap_ld: Int32, cnt: Int64, scratch: Int64, peers: Int64, rank: Int32, epoch: Int64,
+                     cap_ld: Int32, logits_out: Int64, cnt: Int64, scratch: Int64, peers: Int64, rank: Int32, epoch: Int64,
                      slot_i: Int32):
         own = load_ptr64(peers, rank)
         with guard.scope(guard.Guard(epoch, own=own, peers=peers, rank=rank, npes=TP, flags_offset=fo)):
@@ -280,7 +288,8 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
                 _push_band_flag(co, acc_o, m, H, m0 + sk * rb_o, rb_o, n0, go.bn, go.ks, "linbf", SL, piece)
             # ---- T5: RS + residual, MLP seam
             for piece in range(bid, ((m + rb_o - 1) // rb_o) * ct_o, BLOCKS):
-                post._rs_piece(co, piece, m, SL, rb_o, go.bn, mid, prefix_out, pd_m, False, None, False, CM_DEV)
+                post._rs_piece(co, piece, m, SL, rb_o, go.bn, None if restart else mid, prefix_out, pd_m, False, None,
+                               False, CM_DEV)
             for row in range(bid, m, BLOCKS):
                 post._seam_row(co, row, m, SL, rb_o, ct_o, nvb_m, nbk, prefix_out, bank, cw_m, w_ln, eps, pd_m, red,
                                write_m, False, None, False, CM_DEV if write_a else 0)
@@ -300,7 +309,7 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
                 mf.finish_front(cf, fbuf, sgu, m, r0, rbf, n0, gf.bn, r0 // rbf, n0 // gf.bn, nbf, smark, tnf)
             # ---- T6 tail: routing + latent for the experts, shared SiTU + down
             for row in range(bid, m, BLOCKS):
-                mf.route_row(cf, row, m, rbf, nbf, gf.bn, bias, lat_out, topk_ids, topk_w)
+                mf.route_row(cf, row, m, rbf, nbf, gf.bn, bias, lat_out, topk_ids, topk_w, logits_out)
             for row in range(first_task(bid, max(BLOCKS - m, 0)), m, BLOCKS):
                 mf.situ_row(cf, row, m, rbf, tnf, gf.bn, sgu, smark, hbuf, hmark)
             for task in range(bid, n_s, BLOCKS):
@@ -321,11 +330,13 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
     def launch(lat_p: Int64, sh_p: Int64, w_up: Int64, prefix: Int64, mid: Int64, prefix_out: Int64, bank: Int64,
                cw_a: Int64, w_in: Int64, w_ip: Int64, ip_buf: Int64, acc_u: Int64, kda_tab: Int64, core: Int64,
                wo: Int64, cw_m: Int64, w_ln: Int64, wf: Int64, acc_o: Int64, bias: Int64, lat_out: Int64,
-               topk_ids: Int64, topk_w: Int64, w_sd: Int64, sh_out: Int64, cap_out: Int64, cap_ld: Int32, cnt: Int64,
+               topk_ids: Int64, topk_w: Int64, w_sd: Int64, sh_out: Int64, cap_out: Int64, cap_ld: Int32,
+               logits_out: Int64, cnt: Int64,
                scratch: Int64, peers: Int64, rank: Int32, epoch: Int64, slot_i: Int32,
                stream: fx.Stream = fx.Stream(None)):  # noqa: B008
         layer_kernel(lat_p, sh_p, w_up, prefix, mid, prefix_out, bank, cw_a, w_in, w_ip, ip_buf, acc_u, kda_tab, core,
-                     wo, cw_m, w_ln, wf, acc_o, bias, lat_out, topk_ids, topk_w, w_sd, sh_out, cap_out, cap_ld, cnt,
+                     wo, cw_m, w_ln, wf, acc_o, bias, lat_out, topk_ids, topk_w, w_sd, sh_out, cap_out, cap_ld,
+                     logits_out, cnt,
                      scratch, peers, rank, epoch, slot_i).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     _BUILDS[key] = (launch, pl)

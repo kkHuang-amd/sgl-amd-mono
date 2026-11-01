@@ -18,6 +18,8 @@ declines K1 and runs SGLang's attention before the layer launch.
 
 from __future__ import annotations
 
+import os
+
 import msgspec
 
 try:
@@ -26,6 +28,7 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.monokernels.spec import Feature
 
 from sgl_amd_mono.kimi_k3 import spec as k3
+from sgl_amd_mono.kimi_k31 import wide
 
 SGLANG_READS = {
     "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": ("Feature",),
@@ -50,18 +53,69 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     return reasons
 
 
+class _K31Built(k3._Built):
+    """Kimi-K3's built launches for the narrow widths, and the wide-row layer
+    launch (``wide.py``) for the R x 8 verify steps above them."""
+
+    def __init__(self, base, wide_runner):
+        self.__dict__.update(base.__dict__)
+        self._wide = wide_runner
+        self._shim = k3._LanguageModelShim(self)
+
+    def _backbone(self, input_ids, forward_batch, input_embeds):
+        seen = self.__dict__.setdefault("_seen_rows", set())
+        if self._plan.key.rows not in seen:
+            seen.add(self._plan.key.rows)
+            wide._say(f"routed: {self._plan.key}")
+        if self._plan.key.rows > wide.NARROW:
+            if not self.__dict__.get("_said_wide"):
+                self._said_wide = True
+                wide._say(f"wide backbone: rows {self._plan.key.rows}")
+            try:
+                out = self._wide.backbone(self, input_ids, forward_batch, input_embeds)
+            except BaseException as e:  # surface it: the caller's handling must not hide a wide-path failure
+                import traceback
+
+                wide._say(f"wide backbone raised {type(e).__name__}: {e}\n{traceback.format_exc()[-2000:]}")
+                raise
+            if not self.__dict__.get("_said_wide_done"):
+                self._said_wide_done = True
+                wide._say("wide backbone returned")
+            return out
+        return super()._backbone(input_ids, forward_batch, input_embeds)
+
+
 def _build(model, hf_config, ctx):
-    built = k3.SPEC.build(model, hf_config, ctx)
+    narrow = tuple(w for w in ctx.widths if w <= wide.NARROW)
+    built = k3.SPEC.build(model, hf_config, msgspec.structs.replace(ctx, widths=narrow))
     # an eager check of the wide-row layer launch on this model (off unless asked)
     from sgl_amd_mono.kimi_k31 import wide_check
 
     wide_check.install(model)
+    if wide.enabled() and any(w > wide.NARROW for w in ctx.widths):
+        from sglang.srt.runtime_context import get_parallel
+
+        p = get_parallel()
+        device = k3._backbone(model).layers[0].input_layernorm.weight.device
+        w = wide.Wide(model, p.tp_rank, p.tp_group.cpu_group, device)
+        buckets = os.environ.get("SGLANG_AMD_MONO_K31_WIDE_BUCKETS")
+        w.warmup(buckets=tuple(int(x) for x in buckets.split(",")) if buckets else None)
+        built = _K31Built(built, w)
     return built
+
+
+def _devices():
+    devs = dict(k3.SPEC.devices)
+    if wide.enabled():
+        lim = devs["gfx950"]
+        devs["gfx950"] = msgspec.structs.replace(lim, widths=tuple(lim.widths) + wide.wide_widths())
+    return devs
 
 
 SPEC = msgspec.structs.replace(
     k3.SPEC,
     build=_build,
+    devices=_devices(),
     name="kimi_k31_hip",
     features=k3.SPEC.features | {Feature.CONTEXT_PARALLEL},
     requires=msgspec.structs.replace(

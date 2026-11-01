@@ -174,6 +174,7 @@ def run(args, m, rank, dev, cpu):
     tk_w = torch.zeros(nl, m, TOPK, device=dev)
     sh_out = torch.zeros(nl, m, H, dtype=BF, device=dev)
     aux = torch.zeros(nl, m, NCAP * H, dtype=BF, device=dev)
+    logits_out = torch.zeros(nl, m, E, device=dev)
     cap_view = aux[..., CAP_SLOT * H : (CAP_SLOT + 1) * H]
     cnt = torch.zeros(lay.counters(m, cfg, nf), dtype=torch.int32, device=dev)
     scratch = torch.zeros(pl.scratch_bytes(), dtype=torch.uint8, device=dev)
@@ -188,7 +189,7 @@ def run(args, m, rank, dev, cpu):
                w_ip.data_ptr(), ip_buf[i].data_ptr(), acc_u[i].data_ptr(), tabs[i].data_ptr(), core[i].data_ptr(),
                wo.data_ptr(), cw_m.data_ptr(), ln["post"].data_ptr(), wf.data_ptr(), acc_o[i].data_ptr(),
                bias.data_ptr(), lat_out[i].data_ptr(), tk_ids[i].data_ptr(), tk_w[i].data_ptr(), w_sd.data_ptr(),
-               sh_out[i].data_ptr(), cap_view[i].data_ptr(), NCAP * H, cnt.data_ptr(), scratch.data_ptr(), pa_, rank, epoch.data_ptr(), i % step,
+               sh_out[i].data_ptr(), cap_view[i].data_ptr(), NCAP * H, logits_out[i].data_ptr(), cnt.data_ptr(), scratch.data_ptr(), pa_, rank, epoch.data_ptr(), i % step,
                stream=torch.cuda.current_stream())
 
     for i in range(nl):

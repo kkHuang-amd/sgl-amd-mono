@@ -267,7 +267,7 @@ class WideCheck:
         o = {k: torch.zeros(*shape, dtype=dt, device=dev) for k, shape, dt in (
             ("pout", (rows, sl), bf), ("ip_buf", (rows, k1.NPROJ), bf), ("acc_u", (rows, sl), bf),
             ("acc_o", (rows * H,), bf), ("lat", (rows, 3584), bf), ("ids", (rows, 16), torch.int32),
-            ("w", (rows, 16), torch.float32), ("sh", (rows, H), bf))}
+            ("w", (rows, 16), torch.float32), ("sh", (rows, H), bf), ("lg", (rows, E), torch.float32))}
         cnt = torch.zeros(lay.counters(rows, cfg, NF), dtype=torch.int32, device=dev)
         scratch = torch.zeros(pl.scratch_bytes(), dtype=torch.uint8, device=dev)
         z = torch.zeros(1, dtype=bf, device=dev)
@@ -278,7 +278,7 @@ class WideCheck:
                o["ip_buf"].data_ptr(), o["acc_u"].data_ptr(), tab.data_ptr(), core.data_ptr(), w["wo"].data_ptr(),
                w["cw_m"].data_ptr(), w["w_ln"].data_ptr(), w["wf"].data_ptr(), o["acc_o"].data_ptr(),
                w["bias"].data_ptr(), o["lat"].data_ptr(), o["ids"].data_ptr(), o["w"].data_ptr(), w["w_sd"].data_ptr(),
-               o["sh"].data_ptr(), z.data_ptr(), 0, cnt.data_ptr(), scratch.data_ptr(),
+               o["sh"].data_ptr(), z.data_ptr(), 0, o["lg"].data_ptr(), cnt.data_ptr(), scratch.data_ptr(),
                self.peers[rows].addresses.data_ptr(), self.rank, self.epoch.data_ptr(), 0,
                stream=torch.cuda.current_stream())
         torch.cuda.synchronize()
