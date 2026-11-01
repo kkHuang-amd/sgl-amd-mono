@@ -145,6 +145,8 @@ def tag_collective(c, kind, x, y, m, h):
                     c["put_words"](ags[p], (row * h + rank * sl + col) // 2, words)
 
             tag_reduce(c, m, sl, gid, nall, bcast)
+        if const_expr("late" in c):
+            c["late"]()
         tag_take(c, m, h, y, gid, nall)
 
 
@@ -215,6 +217,8 @@ def flag_collective(c, kind, x, y, m, h):
     if const_expr(kind != "rs"):
         _flag_signal(c, 1)
         _flag_wait(c, 1)
+        if const_expr("late" in c):
+            c["late"]()
         for src in range_constexpr(TP):
             for u in range(lo + tid, hi, THREADS):
                 row, q = u // q8, u % q8
@@ -225,11 +229,22 @@ def flag_collective(c, kind, x, y, m, h):
 # -------------------------------------------------------------- standalone
 
 
-def context(peers, rank, epoch, slot, m, h, fmt, tid, bid):
-    """The collective's mailbox, regions (this launch's parity half) and ids."""
+def context(peers, rank, epoch, slot, m, h, fmt, tid, bid, launches=1, parity="launch"):
+    """The collective's mailbox, regions (this launch's parity half) and ids.
+
+    A step bumps the epoch once and runs ``launches`` launches, slot 0 .. on one
+    peer buffer. "launch" parity alternates the half every launch (global launch
+    index e * launches + slot), so a rank that races into the next launch writes
+    the other half; launch n + 2 may reuse n's half because every launch has an
+    exchange in which each rank waits for every other, so no rank can reach n + 2
+    before all have left n. "epoch" (the K3 tag scheme's) shares one half within a
+    step: only for the test that shows the hazard."""
+    assert parity in ("launch", "epoch")
     offs, half = layout(m, h, fmt)
     mb = Mailbox(step_tag(epoch, slot))
-    par = fx.Int64(uniform(ld_i32(epoch, 0)) % 2) * half
+    e = uniform(ld_i32(epoch, 0))
+    bit = (e * launches + slot) % 2 if parity == "launch" else e % 2
+    par = fx.Int64(bit) * half
     bases = peer_bases(peers, TP)
     own = load_ptr64(peers, rank)
 
@@ -269,31 +284,36 @@ def _delay(tid, d):
 _BUILDS: dict = {}
 
 
-def standalone(m, h, kind, fmt, stress=False):
+def standalone(m, h, kind, fmt, stress=False, launches=1, parity="launch"):
     """One collective a launch on BLOCKS x THREADS: x is the [m, h] partial
     ("rs", "ar") or the owner's [m, h / TP] slice ("ag"); y the [m, h / TP] ("rs")
-    or the [m, h]. ``stress``: CTA b first waits delay[b] ticks."""
-    key = (m, h, kind, fmt, stress)
+    or the [m, h]. ``slot``: the launch's index in its step of ``launches``.
+    ``stress``: CTA b waits delay[b] ticks at the start and delay[BLOCKS + b]
+    before its last read of the gathered region."""
+    key = (m, h, kind, fmt, stress, launches, parity)
     if key in _BUILDS:
         return _BUILDS[key]
     assert kind in KINDS and fmt in FORMATS and h % (TP * 8) == 0
     fo = flags_offset(m, h, fmt)
     body = tag_collective if fmt == "tag" else flag_collective
 
-    @flyc.kernel(name=f"k31_coll_{kind}_{fmt}_m{m}_h{h}_s{int(stress)}", known_block_size=[THREADS, 1, 1])
-    def coll_kernel(x: Int64, y: Int64, peers: Int64, rank: Int32, epoch: Int64, delay: Int64):
+    name = f"k31_coll_{kind}_{fmt}_m{m}_h{h}_s{int(stress)}_l{launches}_{parity}"
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def coll_kernel(x: Int64, y: Int64, peers: Int64, rank: Int32, epoch: Int64, delay: Int64, slot: Int32):
         own = load_ptr64(peers, rank)
         with guard.scope(guard.Guard(epoch, own=own, peers=peers, rank=rank, npes=TP, flags_offset=fo)):
             tid, bid = fx.thread_idx.x, fx.block_idx.x
-            c = context(peers, rank, epoch, 0, m, h, fmt, tid, bid)
+            c = context(peers, rank, epoch, slot, m, h, fmt, tid, bid, launches, parity)
             if const_expr(stress):
                 _delay(tid, ld_i32(delay, bid))
+                c["late"] = lambda: _delay(tid, ld_i32(delay, BLOCKS + bid))
             body(c, kind, x, y, m, h)
 
     @flyc.jit
-    def launch(x: Int64, y: Int64, peers: Int64, rank: Int32, epoch: Int64, delay: Int64,
+    def launch(x: Int64, y: Int64, peers: Int64, rank: Int32, epoch: Int64, delay: Int64, slot: Int32,
                stream: fx.Stream = fx.Stream(None)):  # noqa: B008
-        coll_kernel(x, y, peers, rank, epoch, delay).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
+        coll_kernel(x, y, peers, rank, epoch, delay, slot).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     _BUILDS[key] = launch
     return launch

@@ -8,6 +8,10 @@ reference sums the ranks' bf16 partials in f32 in rank order, as the kernel does
 
     torchrun --nproc-per-node 8 test/kernels/kimi_k31/coll_bench.py \
         --shapes 8x7168,128x7168 --kinds ar,ag,rs --fmts tag,flag [--time] [--stress 2000 --delay 20000]
+
+``--step S`` runs the graph as steps of S launches (the epoch bumped once a step,
+slot = launch index in the step), as the layer launches of a served step do;
+``--parity epoch`` shares one buffer half within a step (shows the hazard).
 """
 
 import argparse
@@ -50,7 +54,7 @@ def run_case(args, kind, fmt, m, h, rank, dev, cpu):
 
     stress = args.stress > 0
     nl = args.launches
-    launch = coll.standalone(m, h, kind, fmt, stress)
+    launch = coll.standalone(m, h, kind, fmt, stress, args.step, args.parity)
     peers = PeerBuffer(coll.peer_bytes(m, h, fmt), cpu, rank, TP, dev)
     peers.bytes.zero_()
     epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=dev)
@@ -65,13 +69,16 @@ def run_case(args, kind, fmt, m, h, rank, dev, cpu):
     del sets
     x = torch.empty_like(xsets[0])
     y = torch.empty_like(refs[0])
-    delay = torch.zeros(nl, BLOCKS, dtype=torch.int32, device=dev)
+    delay = torch.zeros(nl, 2 * BLOCKS, dtype=torch.int32, device=dev)
     gen = torch.Generator(device=dev).manual_seed(77 + rank)
 
+    assert nl % args.step == 0
+
     def one(i):
-        epoch[0].add_(1)
+        if i % args.step == 0:
+            epoch[0].add_(1)
         launch(x[i].data_ptr(), y[i].data_ptr(), peers.addresses.data_ptr(), rank, epoch.data_ptr(),
-               delay[i].data_ptr(), stream=torch.cuda.current_stream())
+               delay[i].data_ptr(), i % args.step, stream=torch.cuda.current_stream())
 
     x.copy_(xsets[0])
     for i in range(nl):  # compile + eager check of the first set
@@ -135,6 +142,8 @@ def main():
     p.add_argument("--stress", type=int, default=0, help="replays with random CTA delays")
     p.add_argument("--delay", type=int, default=20000, help="max delay, 100 MHz ticks")
     p.add_argument("--deadline", type=float, default=10.0)
+    p.add_argument("--step", type=int, default=1, help="launches a step (one epoch bump)")
+    p.add_argument("--parity", default="launch", choices=("launch", "epoch"))
     args = p.parse_args()
 
     rank = int(os.environ["RANK"])

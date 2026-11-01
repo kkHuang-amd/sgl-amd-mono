@@ -204,14 +204,17 @@ def _reduce_flag(c, m, sl, rb, bn, y):
 _BUILDS: dict = {}
 
 
-def gemm_rs(m, n, k, bm=128, bn=128, wm=2, wn=4, ks=4, depth=DEPTH, mode="linbf", phases=3, spread=True, fmt="tag"):
+def gemm_rs(m, n, k, bm=128, bn=128, wm=2, wn=4, ks=4, depth=DEPTH, mode="linbf", phases=3, spread=True, fmt="tag",
+            launches=1, stress=False):
     """y[m, n / TP] = this rank's slice of sum over ranks of x_r @ W_r^T, one launch.
     ``acc``: ``scratch_bytes`` zeroed once; ``cnt``: ``counters`` int32 zeroed once.
     ``phases`` != 3 (timing only): 1 the GEMM, 4 + the arrival, 2 + the pushes.
     ``spread``: every K slice of a tile waits for the others and pushes 1 / ks of its
     rows (else the last arrival pushes it all). ``fmt``: "tag" pairs, or "flag"
-    plain stores + a flag a (rows, tile) piece (half the bytes; needs spread)."""
-    key = (m, n, k, bm, bn, wm, wn, ks, depth, mode, phases, spread, fmt)
+    plain stores + a flag a (rows, tile) piece (half the bytes; needs spread).
+    ``slot_i`` / ``launches``: the launch's place in its step (``coll.context``);
+    ``stress``: CTA b waits delay[b] ticks before each arrival (skews the slices)."""
+    key = (m, n, k, bm, bn, wm, wn, ks, depth, mode, phases, spread, fmt, launches, stress)
     if key in _BUILDS:
         return _BUILDS[key]
     sl = n // TP
@@ -243,11 +246,11 @@ def gemm_rs(m, n, k, bm=128, bn=128, wm=2, wn=4, ks=4, depth=DEPTH, mode="linbf"
     class Slot:
         v: fx.Array[fx.Int32, 4, 16]
 
-    name = f"k31_gemm_rs_m{m}_n{n}_k{k}_t{bm}x{bn}_w{wm}x{wn}_ks{ks}_d{depth}_{mode}_p{phases}_s{int(spread)}_{fmt}"
+    name = f"k31_gemm_rs_m{m}_n{n}_k{k}_t{bm}x{bn}_w{wm}x{wn}_ks{ks}_d{depth}_{mode}_p{phases}_s{int(spread)}_{fmt}_l{launches}_x{int(stress)}"
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def gemm_rs_kernel(x: Int64, w: Int64, y: Int64, acc: Int64, cnt: Int64, peers: Int64, rank: Int32,
-                       epoch: Int64):
+                       epoch: Int64, delay: Int64, slot_i: Int32):
         own = load_ptr64(peers, rank)
         with guard.scope(guard.Guard(epoch, own=own, peers=peers, rank=rank, npes=TP, flags_offset=fo)):
             tid, bid = fx.thread_idx.x, fx.block_idx.x
@@ -255,7 +258,7 @@ def gemm_rs(m, n, k, bm=128, bn=128, wm=2, wn=4, ks=4, depth=DEPTH, mode="linbf"
             st = alloc.allocate(Smem)
             slot = alloc.allocate(Slot).peek().v.ptr
             lds, cl = st.ab.peek(), st.c.peek().c.ptr
-            c = coll.context(peers, rank, epoch, 0, m, n, fmt, tid, bid)
+            c = coll.context(peers, rank, epoch, slot_i, m, n, fmt, tid, bid, launches)
             # a tile's K slices are consecutive tasks: they finish close together
             for task in range(bid, ntasks, BLOCKS):
                 sk = task % ks
@@ -273,6 +276,8 @@ def gemm_rs(m, n, k, bm=128, bn=128, wm=2, wn=4, ks=4, depth=DEPTH, mode="linbf"
                 mma_tile(tid, x, k, m, m0, w, k, n, n0, sk * kt, kt, bm, bn, wm, wn, lds.xs.ptr, lds.ws.ptr, emit,
                          depth, lin, cl)
                 if const_expr(phases >= 2 and spread):
+                    if const_expr(stress):
+                        coll._delay(tid, ld_i32(delay, bid))
                     _arrive_all(tid, cnt, tile, ks, slot)
                     if const_expr(phases != 4 and fmt == "flag"):
                         piece = ((m0 + sk * rb) // rb) * (sl // bn) + (n0 % sl) // bn
@@ -295,8 +300,8 @@ def gemm_rs(m, n, k, bm=128, bn=128, wm=2, wn=4, ks=4, depth=DEPTH, mode="linbf"
 
     @flyc.jit
     def launch(x: Int64, w: Int64, y: Int64, acc: Int64, cnt: Int64, peers: Int64, rank: Int32, epoch: Int64,
-               stream: fx.Stream = fx.Stream(None)):  # noqa: B008
-        gemm_rs_kernel(x, w, y, acc, cnt, peers, rank, epoch).launch(grid=(BLOCKS,), block=(THREADS,),
+               delay: Int64, slot_i: Int32, stream: fx.Stream = fx.Stream(None)):  # noqa: B008
+        gemm_rs_kernel(x, w, y, acc, cnt, peers, rank, epoch, delay, slot_i).launch(grid=(BLOCKS,), block=(THREADS,),
                                                                      stream=stream)
 
     _BUILDS[key] = launch
@@ -335,13 +340,16 @@ def _ag_wait(c, j0, nown):
     gpu.barrier()
 
 
-def ag_gemm(m, n, k, bm=128, bn=128, wm=2, wn=4, ks=4, depth=DEPTH, mode="linbf", phases=3):
+def ag_gemm(m, n, k, bm=128, bn=128, wm=2, wn=4, ks=4, depth=DEPTH, mode="linbf", phases=3, launches=1,
+            stress=False):
     """out[m, n] = AG(x slices) @ W^T in one launch: every rank pushes its x slice
     [m, k / TP] (``xs``), and a GEMM task starts once the owners of its K range
     have landed, reading x from the ag region. ``out``: bf16 [m, n] (zeroed for
     linbf, ks > 1) or f32 partials [ks, m, n] ("part"). ``cnt``: one int32, zeroed
-    once. ``phases`` 1 (timing only): the GEMM on the ag region, no push, no wait."""
-    key = (m, n, k, bm, bn, wm, wn, ks, depth, mode, phases)
+    once. ``phases`` 1 (timing only): the GEMM on the ag region, no push, no wait.
+    ``slot_i`` / ``launches``: the launch's place in its step (``coll.context``);
+    ``stress``: CTA b waits delay[b] ticks before the push, delay[BLOCKS + b] after."""
+    key = (m, n, k, bm, bn, wm, wn, ks, depth, mode, phases, launches, stress)
     if key in _AG_BUILDS:
         return _AG_BUILDS[key]
     sl = k // TP
@@ -366,18 +374,23 @@ def ag_gemm(m, n, k, bm=128, bn=128, wm=2, wn=4, ks=4, depth=DEPTH, mode="linbf"
         ab: AbLds
         c: CLds
 
-    name = f"k31_ag_gemm_m{m}_n{n}_k{k}_t{bm}x{bn}_w{wm}x{wn}_ks{ks}_d{depth}_{mode}_p{phases}"
+    name = f"k31_ag_gemm_m{m}_n{n}_k{k}_t{bm}x{bn}_w{wm}x{wn}_ks{ks}_d{depth}_{mode}_p{phases}_l{launches}_x{int(stress)}"
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
-    def ag_gemm_kernel(xs: Int64, w: Int64, out: Int64, cnt: Int64, peers: Int64, rank: Int32, epoch: Int64):
+    def ag_gemm_kernel(xs: Int64, w: Int64, out: Int64, cnt: Int64, peers: Int64, rank: Int32, epoch: Int64,
+                       delay: Int64, slot_i: Int32):
         own = load_ptr64(peers, rank)
         with guard.scope(guard.Guard(epoch, own=own, peers=peers, rank=rank, npes=TP, flags_offset=fo)):
             tid, bid = fx.thread_idx.x, fx.block_idx.x
             st = fx.SharedAllocator().allocate(Smem)
             lds, cl = st.ab.peek(), st.c.peek().c.ptr
-            c = coll.context(peers, rank, epoch, 0, m, k, "flag", tid, bid)
+            c = coll.context(peers, rank, epoch, slot_i, m, k, "flag", tid, bid, launches)
+            if const_expr(stress):
+                coll._delay(tid, ld_i32(delay, bid))
             if const_expr(phases == 3):
                 _ag_push(c, xs, m, sl, cnt)
+            if const_expr(stress):
+                coll._delay(tid, ld_i32(delay, BLOCKS + bid))
             x = c["ag_own"].value
             for task in range(bid, ntasks, BLOCKS):
                 sk = task % ks
@@ -399,8 +412,8 @@ def ag_gemm(m, n, k, bm=128, bn=128, wm=2, wn=4, ks=4, depth=DEPTH, mode="linbf"
 
     @flyc.jit
     def launch(xs: Int64, w: Int64, out: Int64, cnt: Int64, peers: Int64, rank: Int32, epoch: Int64,
-               stream: fx.Stream = fx.Stream(None)):  # noqa: B008
-        ag_gemm_kernel(xs, w, out, cnt, peers, rank, epoch).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
+               delay: Int64, slot_i: Int32, stream: fx.Stream = fx.Stream(None)):  # noqa: B008
+        ag_gemm_kernel(xs, w, out, cnt, peers, rank, epoch, delay, slot_i).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     _AG_BUILDS[key] = launch
     return launch

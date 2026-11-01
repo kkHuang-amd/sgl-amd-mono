@@ -17,7 +17,7 @@ import os
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from gemm_coll_bench import graph_us
+from gemm_coll_bench import BLOCKS, graph_us, stress_loop
 
 TP = 8
 SETS = 3
@@ -59,21 +59,30 @@ def run(args, cfg, mode, rank, dev, cpu):
             return out.view(torch.float32).view(nl, ks, m, n).sum(1)
         return out.view(nl, m, n).float()
 
-    def fused_fn(launch):
+    delay = torch.zeros(nl, 2 * BLOCKS, dtype=torch.int32, device=dev)
+    step = args.step
+    assert nl % step == 0
+
+    def fused_fn(launch, step=1):
         def fn(i):
             if mode == "linbf" and ks > 1:
                 out[i].zero_()
-            epoch[0].add_(1)
+            if i % step == 0:
+                epoch[0].add_(1)
             launch(x[i].data_ptr(), w.data_ptr(), out[i].data_ptr(), cnt.data_ptr(), pa, rank, epoch.data_ptr(),
-                   stream=torch.cuda.current_stream())
+                   delay[i].data_ptr(), i % step, stream=torch.cuda.current_stream())
 
         return fn
 
-    one = fused_fn(gemm_coll.ag_gemm(m, n, k, bm, bn, wm, wn, ks, mode=mode))
+    stress = args.stress > 0
+    one = fused_fn(gemm_coll.ag_gemm(m, n, k, bm, bn, wm, wn, ks, mode=mode, launches=step, stress=stress), step)
     for i in range(nl):
         one(i)
     torch.cuda.synchronize()
     graph, us_fused = graph_us(one, nl)
+    if stress:
+        return stress_loop(args, graph, x, xsets, None, refs, delay, rank, dev,
+                           f"m {m:3d} t{bm}x{bn} w{wm}x{wn} ks{ks} {mode:5s}", result=result)
     worst = 0.0
     for r in range(SETS * 2):
         s = r % SETS
@@ -99,7 +108,7 @@ def run(args, cfg, mode, rank, dev, cpu):
         if mode == "linbf" and ks > 1:
             out[i].zero_()
         epoch[0].add_(1)
-        ag(x[i].data_ptr(), xfull.data_ptr(), peers2.addresses.data_ptr(), rank, epoch.data_ptr(), dummy.data_ptr(),
+        ag(x[i].data_ptr(), xfull.data_ptr(), peers2.addresses.data_ptr(), rank, epoch.data_ptr(), dummy.data_ptr(), 0,
            stream=torch.cuda.current_stream())
         tile(xfull.data_ptr(), w.data_ptr(), out[i].data_ptr(), stream=torch.cuda.current_stream())
 
@@ -140,6 +149,9 @@ def main():
     p.add_argument("--n", type=int, default=6288)
     p.add_argument("--k", type=int, default=7168)
     p.add_argument("--launches", type=int, default=8)
+    p.add_argument("--stress", type=int, default=0, help="replays with random CTA delays (no timing)")
+    p.add_argument("--delay", type=int, default=5000, help="max delay, 100 MHz ticks")
+    p.add_argument("--step", type=int, default=1, help="launches a step (one epoch bump)")
     args = p.parse_args()
     rank = int(os.environ["RANK"])
     torch.cuda.set_device(rank)

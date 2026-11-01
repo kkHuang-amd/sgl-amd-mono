@@ -19,6 +19,8 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+BLOCKS = 256
+
 TP = 8
 SETS = 3
 BF = torch.bfloat16
@@ -42,6 +44,28 @@ def graph_us(fn, nl, reps=10):
     return g, e0.elapsed_time(e1) * 1000 / (reps * nl)
 
 
+def stress_loop(args, graph, x, xsets, y, refs, delay, rank, dev, label, result=None):
+    """Replays with random CTA delays and rotating inputs; every replay's outputs
+    are checked (rel L2 a launch). Returns nothing; prints the worst over ranks."""
+    gen = torch.Generator(device=dev).manual_seed(91 + rank)
+    worst = torch.zeros((), device=dev)
+    for r in range(args.stress):
+        s = r % SETS
+        x.copy_(xsets[s])
+        delay.random_(0, args.delay, generator=gen)
+        graph.replay()
+        out = result() if result else y.float()
+        err = (out - refs[s]).flatten(1).norm(dim=1) / refs[s].flatten(1).norm(dim=1)
+        worst = torch.maximum(worst, err.max())
+    torch.cuda.synchronize()
+    every = [torch.empty_like(worst) for _ in range(TP)]
+    dist.all_gather(every, worst)
+    if rank == 0:
+        e = max(v.item() for v in every)
+        print(f"stress {label}  launches {args.stress * x.shape[0]}  step {args.step}  worst rel_l2 {e:.2e}  "
+              f"{'PASS' if e < 1e-2 else 'FAIL'}", flush=True)
+
+
 def run(args, cfg, mode, rank, dev, cpu):
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
@@ -51,7 +75,8 @@ def run(args, cfg, mode, rank, dev, cpu):
     n, k, nl = args.n, args.k, args.launches
     sl = n // TP
     fmt = os.environ.get("GC_FMT", "flag")
-    fused = gemm_coll.gemm_rs(m, n, k, bm, bn, wm, wn, ks, mode=mode, fmt=fmt)
+    stress = args.stress > 0
+    fused = gemm_coll.gemm_rs(m, n, k, bm, bn, wm, wn, ks, mode=mode, fmt=fmt, launches=args.step, stress=stress)
     peers = PeerBuffer(coll.peer_bytes(m, n, fmt), cpu, rank, TP, dev)
     peers.bytes.zero_()
     epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=dev)
@@ -73,16 +98,22 @@ def run(args, cfg, mode, rank, dev, cpu):
     acc = torch.zeros(gemm_coll.scratch_bytes(m, n, ks, mode), dtype=torch.uint8, device=dev)
     cnt = torch.zeros(gemm_coll.counters(m, n, bm, bn), dtype=torch.int32, device=dev)
     pa = peers.addresses.data_ptr()
+    delay = torch.zeros(nl, 2 * BLOCKS, dtype=torch.int32, device=dev)
+    assert nl % args.step == 0
 
     def one(i):
-        epoch[0].add_(1)
+        if i % args.step == 0:
+            epoch[0].add_(1)
         fused(x[i].data_ptr(), w.data_ptr(), y[i].data_ptr(), acc.data_ptr(), cnt.data_ptr(), pa, rank,
-              epoch.data_ptr(), stream=torch.cuda.current_stream())
+              epoch.data_ptr(), delay[i].data_ptr(), i % args.step, stream=torch.cuda.current_stream())
 
     for i in range(nl):
         one(i)
     torch.cuda.synchronize()
     graph, us_fused = graph_us(one, nl)
+    if stress:
+        return stress_loop(args, graph, x, xsets, y, refs, delay, rank, dev,
+                           f"m {m:3d} t{bm}x{bn} w{wm}x{wn} ks{ks} {mode:5s} {fmt}")
     worst, det, prev = 0.0, True, {}
     for r in range(SETS * 2):
         s = r % SETS
@@ -101,7 +132,7 @@ def run(args, cfg, mode, rank, dev, cpu):
         def one_ph(i, part_launch=part_launch):
             epoch[0].add_(1)
             part_launch(x[i].data_ptr(), w.data_ptr(), y[i].data_ptr(), acc.data_ptr(), cnt.data_ptr(), pa, rank,
-                        epoch.data_ptr(), stream=torch.cuda.current_stream())
+                        epoch.data_ptr(), delay[i].data_ptr(), 0, stream=torch.cuda.current_stream())
 
         one_ph(0)
         torch.cuda.synchronize()
@@ -129,7 +160,7 @@ def run(args, cfg, mode, rank, dev, cpu):
             src = psum
             psum.copy_(out.view(torch.float32).view(ks, m, n).sum(0))
         epoch[0].add_(1)
-        rs(src.data_ptr(), y[i].data_ptr(), peers2.addresses.data_ptr(), rank, epoch.data_ptr(), dummy.data_ptr(),
+        rs(src.data_ptr(), y[i].data_ptr(), peers2.addresses.data_ptr(), rank, epoch.data_ptr(), dummy.data_ptr(), 0,
            stream=torch.cuda.current_stream())
 
     for i in range(nl):
@@ -172,6 +203,9 @@ def main():
     p.add_argument("--n", type=int, default=7168)
     p.add_argument("--k", type=int, default=1536)
     p.add_argument("--launches", type=int, default=8)
+    p.add_argument("--stress", type=int, default=0, help="replays with random CTA delays (no timing)")
+    p.add_argument("--delay", type=int, default=5000, help="max delay, 100 MHz ticks")
+    p.add_argument("--step", type=int, default=1, help="launches a step (one epoch bump)")
     args = p.parse_args()
     rank = int(os.environ["RANK"])
     torch.cuda.set_device(rank)
