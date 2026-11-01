@@ -71,6 +71,10 @@ class WideCheck:
             bias=moe.gate.e_score_correction_bias.float().contiguous(),
             w_sd=moe.shared_experts.down_proj.weight,
         )
+        prev = self.backbone.layers[layer_i - 1].mlp
+        self.prev = prev
+        self.w_up = pa.fold_up(prev.routed_expert_up_proj.weight, prev.routed_expert_norm.weight, rank)
+        self.eps_n = prev.routed_expert_norm.variance_epsilon
         self.kda_w = dict(w_fb=attn.f_b_proj.weight, conv_w=attn.qkv_conv1d.weight.squeeze(1),
                           a_log=attn.A_log.detach().reshape(-1).contiguous(), dt_bias=attn.dt_bias,
                           on_w=attn.o_norm.weight.data.to(bf).contiguous())
@@ -136,16 +140,49 @@ class WideCheck:
             if self.ours is not None and len(inp) >= 2:
                 self.ref["latent"], self.ref["topk"] = inp[0].clone(), inp[1]
         moe.experts.register_forward_pre_hook(experts_in)
-        moe.shared_experts.down_proj.register_forward_hook(grab("shared"))
-        fse = moe._forward_shared_experts
+        def wrap_shared(mod, store):
+            orig_fs = mod._forward_shared
 
-        def shared(hidden_states, *a, **k):
-            out = fse(hidden_states, *a, **k)
-            if self.ours is not None and torch.is_tensor(out):
-                self.ref["shared"] = out.clone()
-            return out
+            def fs(gate_up, shared_output, *a, **k):
+                out = orig_fs(gate_up, shared_output, *a, **k)
+                store(shared_output.clone())
+                return out
 
-        moe._forward_shared_experts = shared
+            mod._forward_shared = fs
+
+        def wrap_routed(mod, store):
+            orig_fr = mod._forward_routed
+
+            def fr(hidden_states, router_logits, routed_input, latent, *a, **k):
+                out = orig_fr(hidden_states, router_logits, routed_input, latent, *a, **k)
+                store(latent.clone())
+                return out
+
+            mod._forward_routed = fr
+
+        def wrap_fused(mod):
+            orig_ff = mod._forward_fused
+
+            def ff(hidden_states, *a, prefix_sum=None, **k):
+                self.t1_in = {"prefix": None if prefix_sum is None else prefix_sum.clone()}
+                return orig_ff(hidden_states, *a, prefix_sum=prefix_sum, **k)
+
+            mod._forward_fused = ff
+
+        def keep_t1(name):
+            def store(t):
+                if getattr(self, "t1_in", None) is not None:
+                    self.t1_in[name] = t
+            return store
+
+        def keep_ref(t):
+            if self.ours is not None:
+                self.ref["shared"] = t
+
+        wrap_shared(moe, keep_ref)
+        wrap_fused(self.prev)
+        wrap_shared(self.prev, keep_t1("sh_p"))
+        wrap_routed(self.prev, keep_t1("lat_p"))
         self.layer.register_forward_hook(lambda *_: self._compare())
 
         def keep_batch(_m, args, kwargs):
@@ -187,8 +224,12 @@ class WideCheck:
         dev, sl, bf = self.device, H // TP, torch.bfloat16
         cfg = lay.LayerCfg(*(Gemm(*(int(v) for v in c.split(":"))) for c in CFGS[width]))
         nvb, write = self.ref["nvb"], self.ref["write"]
+        t1_in, self.t1_in = getattr(self, "t1_in", None), None
+        t1 = (t1_in is not None and {"lat_p", "sh_p", "prefix"} <= set(t1_in) and t1_in["prefix"] is not None
+              and t1_in["lat_p"].shape[0] == rows)
+        assert self.eps_n == self.onorm_eps, (self.eps_n, self.onorm_eps)
         launch, pl = lay.kda_layer(rows, cfg, L, NF, nvb_a=nvb, nvb_m=nvb + int(write), write_a=write, nbk=8,
-                                   eps=self.eps, eps_n=self.onorm_eps, t1=False)
+                                   eps=self.eps, eps_n=self.onorm_eps, t1=t1)
         if rows not in self.peers:
             self.peers[rows] = PeerBuffer(pl.peer_bytes(), self.group, self.rank, TP, dev)
             self.peers[rows].bytes.zero_()
@@ -216,7 +257,13 @@ class WideCheck:
         bank_s = torch.zeros(rows, nbk, sl, dtype=bf, device=dev)
         if bank is not None:
             bank_s[:, : bank.shape[1]] = bank[..., cols]
-        mid_s = mid[:, cols].contiguous()
+        mid_s = torch.zeros(rows, sl, dtype=bf, device=dev) if t1 else mid[:, cols].contiguous()
+        if t1:
+            lat_p = t1_in["lat_p"].contiguous()
+            sh_p = t1_in["sh_p"].contiguous()
+            pre_s = t1_in["prefix"][:, cols].contiguous()
+        else:
+            lat_p = sh_p = pre_s = None
         o = {k: torch.zeros(*shape, dtype=dt, device=dev) for k, shape, dt in (
             ("pout", (rows, sl), bf), ("ip_buf", (rows, k1.NPROJ), bf), ("acc_u", (rows, sl), bf),
             ("acc_o", (rows * H,), bf), ("lat", (rows, 3584), bf), ("ids", (rows, 16), torch.int32),
@@ -225,7 +272,8 @@ class WideCheck:
         scratch = torch.zeros(pl.scratch_bytes(), dtype=torch.uint8, device=dev)
         z = torch.zeros(1, dtype=bf, device=dev)
         w = self.w
-        launch(z.data_ptr(), z.data_ptr(), z.data_ptr(), z.data_ptr(), mid_s.data_ptr(), o["pout"].data_ptr(),
+        ptr = lambda t: z.data_ptr() if t is None else t.data_ptr()  # noqa: E731
+        launch(ptr(lat_p), ptr(sh_p), self.w_up.data_ptr(), ptr(pre_s), mid_s.data_ptr(), o["pout"].data_ptr(),
                bank_s.data_ptr(), w["cw_a"].data_ptr(), w["w_in"].data_ptr(), w["w_ip"].data_ptr(),
                o["ip_buf"].data_ptr(), o["acc_u"].data_ptr(), tab.data_ptr(), core.data_ptr(), w["wo"].data_ptr(),
                w["cw_m"].data_ptr(), w["w_ln"].data_ptr(), w["wf"].data_ptr(), o["acc_o"].data_ptr(),
@@ -244,6 +292,7 @@ class WideCheck:
         at = par * half + offs["rgat"]
         logits = b[at : at + rows * E * 4].view(torch.float32).view(rows, E).clone()
         self.ours = dict(x=region("ag", H), xm=region("o_ag", H), core=core, h=o["pout"], cols=cols, logits=logits,
+                         t1=t1, mid=mid_s,
                          lat=o["lat"], ids=o["ids"], w=o["w"], sh=o["sh"], rows=rows, R=r_n, L=L)
 
     # ---------------------------------------------------------------- compare
@@ -253,7 +302,8 @@ class WideCheck:
         if ours is None:
             return
         cols = ours["cols"]
-        e = {"x": _rel(ours["x"], ref["x"]), "core": _rel(ours["core"], ref.get("core", ours["core"] * 0)),
+        e = {"mid": _rel(ours["mid"], ref["mid"][:, cols]) if ours["t1"] else -1.0,
+             "x": _rel(ours["x"], ref["x"]), "core": _rel(ours["core"], ref.get("core", ours["core"] * 0)),
              "xm": _rel(ours["xm"], ref["xm"]) if "xm" in ref else -1.0,
              "h": _rel(ours["h"], ref["h"][:, cols]) if "h" in ref else -1.0,
              "lat": _rel(ours["lat"], ref["latent"]) if "latent" in ref else -1.0,
@@ -293,10 +343,11 @@ class WideCheck:
                     if same.any():
                         e["topk_w"] = _rel(ours["w"].gather(-1, oa)[same], wts[: ours["rows"]].float().gather(-1, ob)[same])
         t = torch.tensor([e.get(k, -1.0) for k in ("x", "core", "xm", "h", "lat", "sh", "topk_rows_diff", "topk_w",
-                                                  "logits", "rule_vs_sglang", "ours_vs_rule")], device=self.device)
+                                                  "logits", "rule_vs_sglang", "ours_vs_rule", "mid")], device=self.device)
         dist.all_reduce(t, op=dist.ReduceOp.MAX)
         v = t.tolist()
-        _say(f"layer {self.i} rows {ours['rows']} (R {ours['R']} x {ours['L']}) nvb {ref['nvb']}: rel L2 x {v[0]:.2e} "
+        _say(f"layer {self.i} rows {ours['rows']} (R {ours['R']} x {ours['L']}) nvb {ref['nvb']} t1 {int(ours['t1'])}: "
+             f"rel L2 mid (T1) {v[11]:.2e} x {v[0]:.2e} "
              f"core {v[1]:.2e} x' {v[2]:.2e} h {v[3]:.2e} latent {v[4]:.2e} shared {v[5]:.2e} topk rows "
              f"differing {v[6]:.1%} (w {v[7]:.1e}; logits {v[8]:.1e}, rule on SGLang's logits vs SGLang {v[9]:.1%}, "
              f"ours vs rule on our logits {v[10]:.1%})   (-1 = hook did not fire); fired: {sorted(k for k in ref)}")
