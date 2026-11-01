@@ -260,11 +260,13 @@ def _finish(c, acc, shs, prefix, prefix_out, m, r0, rb, n0, bn, ks, pdone, piece
 
 
 @flyc.jit
-def _seam(c, row, m, rb, ct, nvb, nbk, prefix_out, bank, cw, w_in, eps, pdone, red, write, capture=False):
+def _seam(c, row, m, rb, ct, nvb, nbk, prefix_out, bank, cw, w_in, eps, pdone, red, write, capture=False,
+          wait=True):
     tid = c["tid"]
-    if tid < ct:
-        c["poll"]([(pdone, (row // rb) * ct + tid, 1)])
-    gpu.barrier()
+    if const_expr(wait):
+        if tid < ct:
+            c["poll"]([(pdone, (row // rb) * ct + tid, 1)])
+        gpu.barrier()
     rank = c["rank"]
     ags = [c["ag_of"](p) for p in range(TP)]
 

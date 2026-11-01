@@ -99,7 +99,7 @@ _BUILDS: dict = {}
 
 
 def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk=8, launches=1, eps=1e-5,
-              eps_n=1e-5, kpt=16, capture=False):
+              eps_n=1e-5, kpt=16, capture=False, t1=True):
     """Build the layer launch; returns (launch, plan). Arguments: the pre half's
     (lat_p, sh_p, w_up (``pre.fold_up``), prefix, cw_a, w_in, w_ip, ip_buf (in_proj
     merge, bf16 [m, 6288] zeroed once), acc_u (bf16 [m, 896] zeroed once)), mid
@@ -113,8 +113,9 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
     counter, zeroed once), scratch, peers, rank, epoch, slot. linbf merges, the
     front in f32 (router logits). ``capture``: DSpark's capture of the previous
     layer (the attention seam's pre-norm mixture, gathered) -> cap_out [m, H] with
-    row stride cap_ld; else cap_out is unused."""
-    key = (m, cfg.key(), L, nf, nvb_a, nvb_m, write_a, write_m, nbk, launches, eps, eps_n, kpt, capture)
+    row stride cap_ld; else cap_out is unused. ``t1=False`` (check builds): no MoE tail;
+    ``mid`` is an input (the prefix after the previous layer, written by the caller)."""
+    key = (m, cfg.key(), L, nf, nvb_a, nvb_m, write_a, write_m, nbk, launches, eps, eps_n, kpt, capture, t1)
     if key in _BUILDS:
         return _BUILDS[key]
     gu, gi, go, gf, gs = cfg.up, cfg.inp, cfg.oproj, cfg.front, cfg.sdown
@@ -184,7 +185,7 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
         red: fx.Array[fx.Float32, max(red_words(nvb_a), red_words(nvb_m)), 16]
 
     name = (f"k31_kda_layer_m{m}_{'_'.join('x'.join(map(str, g)) for g in cfg.key())}_L{L}_n{nf}_a{nvb_a}{int(write_a)}"
-            f"_m{nvb_m}{int(write_m)}of{nbk}_l{launches}_p{kpt}_c{int(capture)}")
+            f"_m{nvb_m}{int(write_m)}of{nbk}_l{launches}_p{kpt}_c{int(capture)}_t{int(t1)}")
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def layer_kernel(lat_p: Int64, sh_p: Int64, w_up: Int64, prefix: Int64, mid: Int64, prefix_out: Int64,
@@ -217,12 +218,12 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
             hmark = sreg(scratch, soffs["hmark"], "hmark")
 
             # ---- T1: MoE tail
-            for t in range(bid, m * TP, BLOCKS):
+            for t in range(bid, m * TP if t1 else 0, BLOCKS):
                 pre._push(ca, t // TP, t % TP, m, lat_p, sh_p)
-            for row in range(bid, m, BLOCKS):
+            for row in range(bid, m if t1 else 0, BLOCKS):
                 pre._lred(ca, row, m, shs)
             lagx = ca["lag_own"].value
-            for task in range(bid, n_u, BLOCKS):
+            for task in range(bid, n_u if t1 else 0, BLOCKS):
                 sk = task % gu.ks
                 tile = task // gu.ks
                 m0 = (tile // tnu) * gu.bm
@@ -243,7 +244,8 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
                             (r0 // rb_u) * ct_u + n0 // gu.bn)
             # ---- T2: attention seam
             for row in range(bid, m, BLOCKS):
-                pre._seam(ca, row, m, rb_u, ct_u, nvb_a, nbk, mid, bank, cw_a, w_in, eps, pd_a, red, write_a, capture)
+                pre._seam(ca, row, m, rb_u, ct_u, nvb_a, nbk, mid, bank, cw_a, w_in, eps, pd_a, red, write_a, capture,
+                          t1)
             # ---- T3: in_proj -> KDA
             xa = ca["ag_own"].value
             f0 = first_task(bid, max(BLOCKS - n_i, 0))

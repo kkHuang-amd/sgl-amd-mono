@@ -50,8 +50,18 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     return reasons
 
 
+def _build(model, hf_config, ctx):
+    built = k3.SPEC.build(model, hf_config, ctx)
+    # an eager check of the wide-row layer launch on this model (off unless asked)
+    from sgl_amd_mono.kimi_k31 import wide_check
+
+    wide_check.install(model)
+    return built
+
+
 SPEC = msgspec.structs.replace(
     k3.SPEC,
+    build=_build,
     name="kimi_k31_hip",
     features=k3.SPEC.features | {Feature.CONTEXT_PARALLEL},
     requires=msgspec.structs.replace(
