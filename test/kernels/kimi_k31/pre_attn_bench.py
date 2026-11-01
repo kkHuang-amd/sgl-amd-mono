@@ -75,7 +75,9 @@ def run(args, spec, mode, rank, dev, cpu):
     L = args.kda
     state_len = L + k1.CONV_W - 1 if L else 0
     launch, pl = pa.pre_attn(m, gu, gi, nin, nvb=nvb, nbk=nbk, write=write, mode=mode, launches=step, eps_n=EPS_N,
-                             eps=EPS, kda=L or None, state_len=state_len, ring=bool(L), onorm_eps=EPS_N)
+                             eps=EPS, kda=L or None, state_len=state_len, ring=bool(L), onorm_eps=EPS_N,
+                             kda_wide=bool(int(os.environ.get("PA_KDA_WIDE", "1"))),
+                             kpt=int(os.environ.get("PA_KPT", "16")))
     if rank == 0 and args.plan:
         print(pl.describe(), flush=True)
     peers = PeerBuffer(pl.peer_bytes(), cpu, rank, TP, dev)

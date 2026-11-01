@@ -36,6 +36,7 @@ from sgl_amd_mono.common.ops import ld_i32
 from sgl_amd_mono.kimi_k3.gfx950.attention import kda as k1
 from sgl_amd_mono.kimi_k31.gfx950.chain import Gemm
 from sgl_amd_mono.kimi_k31.gfx950.stages import coll
+from sgl_amd_mono.kimi_k31.gfx950.stages import kda_wide as kdaw
 from sgl_amd_mono.kimi_k31.gfx950.stages.attnres import attnres_row, red_words, scalars
 from sgl_amd_mono.kimi_k31.gfx950.stages.gemm_coll import _arrive_all, dev_emit
 from sgl_amd_mono.kimi_k31.gfx950.stages.tile import atomic_lin, bf16_emit, f32_emit
@@ -87,7 +88,7 @@ def _kda_args(tab):
     return a
 
 
-def plan(m, gu, gi, nin, nvb, kda=None):
+def plan(m, gu, gi, nin, nvb, kda=None, wide=True):
     rb = gu.bm // gu.ks
     ct = SL // gu.bn
     nb = (m + rb - 1) // rb
@@ -115,7 +116,7 @@ def plan(m, gu, gi, nin, nvb, kda=None):
         p.region("proj", m * k1.NPROJ * 8, peer=False)
         p.region("qk", m * k1.NH * 2 * k1.HD * 8, peer=False)
         p.region("onrm", m * k1.NH * k1.NVCH * 8, peer=False)
-        p.stage("kda", (m // kda) * k1.NH * k1.NVCH, waits_on=("inproj", "kda"))
+        p.stage("kda", (m // kda) * k1.NH * (1 if wide else k1.NVCH), waits_on=("inproj",) if wide else ("inproj", "kda"))
     return p.check()
 
 
@@ -284,7 +285,7 @@ _BUILDS: dict = {}
 
 
 def pre_attn(m, gu, gi, nin, nvb=0, nbk=8, write=False, mode="linbf", launches=1, eps_n=1e-5, eps=1e-5, kda=None,
-             state_len=0, ring=False, onorm_eps=1e-5, lower_bound=-5.0):
+             state_len=0, ring=False, onorm_eps=1e-5, lower_bound=-5.0, kda_wide=True, kpt=16):
     """Build the launch; returns (launch, plan). Arguments: lat_p [m, LAT] / sh_p [m, H]
     (this rank's latent / shared partials), w_up [SL, LAT] (``fold_up``), prefix /
     prefix_out [m, SL], bank [m, nbk, SL], cw f32 [H], w_in [H] (input norm), w_ip
@@ -296,14 +297,16 @@ def pre_attn(m, gu, gi, nin, nvb=0, nbk=8, write=False, mode="linbf", launches=1
     buffer [m, nin], zeroed once; ``cnt`` holds the in_proj tiles' counters after
     the up tiles') are handed to ``kimi_k3``'s KDA tasks (conv, gates, recurrence,
     gated norm; ``ring``: the ReplaySSM ring), whose core_out [m, 1536] is the
-    launch's output; ``kda_tab`` = ``kda_table(...)``."""
+    launch's output; ``kda_tab`` = ``kda_table(...)``. ``kda_wide`` (default): a task a
+    (request, head) (``stages/kda_wide.py``, ring only) instead of K1's 8 a head."""
     key = (m, gu.key(), gi.key(), nin, nvb, nbk, write, mode, launches, eps_n, eps, kda, state_len, ring, onorm_eps,
-           lower_bound)
+           lower_bound, kda_wide, kpt)
+    assert kda is None or ring or not kda_wide, "the wide KDA task runs on the ReplaySSM ring only"
     assert kda is None or (nin == k1.NPROJ and m % kda == 0 and (mode == "linbf" or gi.ks == 1)
                            and gi.bm % gi.ks == 0 and BLOCKS % gi.ks == 0)
     if key in _BUILDS:
         return _BUILDS[key]
-    pl = plan(m, gu, gi, nin, nvb, kda)
+    pl = plan(m, gu, gi, nin, nvb, kda, kda_wide)
     offs, half = pl.peer_offsets
     soffs, _ = pl.scratch_offsets
     fo = pl.flags_offset()
@@ -329,6 +332,7 @@ def pre_attn(m, gu, gi, nin, nvb=0, nbk=8, write=False, mode="linbf", launches=1
         c: fx.Array[fx.Float32, cw_words, 16]
 
     kl_n = kda or 1
+    kda_wide_lds = kdaw.lds_floats(kl_n)
 
     @fx.struct
     class KdaLds:
@@ -339,11 +343,16 @@ def pre_attn(m, gu, gi, nin, nvb=0, nbk=8, write=False, mode="linbf", launches=1
         ol: fx.Array[fx.Float32, kl_n * k1.VCH, 16]
         beta: fx.Array[fx.Float32, 16, 16]
 
+    @fx.struct
+    class KdwLds:
+        v: fx.Array[fx.Float32, kda_wide_lds, 16]
+
     @fx.union
     class Smem:
         ab: AbLds
         c: CLds
         kd: KdaLds
+        kw: KdwLds
 
     @fx.struct
     class Small:
@@ -352,7 +361,7 @@ def pre_attn(m, gu, gi, nin, nvb=0, nbk=8, write=False, mode="linbf", launches=1
         red: fx.Array[fx.Float32, red_words(nvb), 16]
 
     name = (f"k31_pre_attn_m{m}_u{'x'.join(map(str, gu.key()))}_i{'x'.join(map(str, gi.key()))}_n{nin}_v{nvb}of{nbk}"
-            f"w{int(write)}_{mode}_l{launches}_k{kda}s{state_len}r{int(ring)}")
+            f"w{int(write)}_{mode}_l{launches}_k{kda}s{state_len}r{int(ring)}w{int(kda_wide)}p{kpt}")
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def pre_attn_kernel(lat_p: Int64, sh_p: Int64, w_up: Int64, prefix: Int64, prefix_out: Int64, bank: Int64,
@@ -441,7 +450,10 @@ def pre_attn(m, gu, gi, nin, nvb=0, nbk=8, write=False, mode="linbf", launches=1
                     "ol": kd.ol.ptr, "beta": kd.beta.ptr, "proj": proj, "args": _kda_args(kda_tab),
                     "qk": sreg(scratch, soffs["qk"], "qk"), "onrm": sreg(scratch, soffs["onrm"], "onrm"),
                 })
-                k1.kda_tasks(c, False, None)
+                if const_expr(kda_wide):
+                    kdaw.kda_heads(c, st.kw.peek().v.ptr, 0, kpt)
+                else:
+                    k1.kda_tasks(c, False, None)
 
     @flyc.jit
     def launch(lat_p: Int64, sh_p: Int64, w_up: Int64, prefix: Int64, prefix_out: Int64, bank: Int64, cw: Int64,
