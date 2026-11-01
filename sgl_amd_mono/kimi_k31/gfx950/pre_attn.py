@@ -32,6 +32,8 @@ from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.ops import CM_DEV, CM_SYS, bf2_f32, bf16_pair, hw_rsq, load_ptr64, rsrc, wave_sum
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, first_task
 from sgl_amd_mono.common.sync import sreg
+from sgl_amd_mono.common.ops import ld_i32
+from sgl_amd_mono.kimi_k3.gfx950.attention import kda as k1
 from sgl_amd_mono.kimi_k31.gfx950.chain import Gemm
 from sgl_amd_mono.kimi_k31.gfx950.stages import coll
 from sgl_amd_mono.kimi_k31.gfx950.stages.attnres import attnres_row, red_words, scalars
@@ -53,7 +55,39 @@ def fold_up(w_up, w_n, rank):
     return (rows.float() * w_n.float()[None, :]).to(rows.dtype).contiguous()
 
 
-def plan(m, gu, gi, nin, nvb):
+# the KDA stage's arguments, an int64 table (``kda_table``): pointers, then strides
+KDA_PTRS = ("w_fb", "conv_w", "conv_st", "a_log", "dt_bias", "on_w", "rstate", "st_idx", "num_acc", "ring_k",
+            "ring_v", "ring_g", "ring_b", "core_out")
+KDA_INTS = ("cs_seq", "cs_dim", "cs_tok", "rs_seq", "st_stride", "rk_seq", "rv_seq", "rg_seq", "rb_seq", "ring_len")
+
+
+def kda_table(device, *, w_fb, conv_w, conv_state, a_log, dt_bias, on_w, rstate, st_idx, num_acc, core_out,
+              ring=None):
+    """The KDA stage's arguments as ``kimi_k3``'s ``kda_pre`` takes them (same
+    layouts and strides), packed for the launch's ``kda_tab``."""
+    import torch
+
+    rk, rv, rg, rb = ring if ring is not None else (None,) * 4
+    ptrs = dict(w_fb=w_fb, conv_w=conv_w, conv_st=conv_state, a_log=a_log, dt_bias=dt_bias, on_w=on_w,
+                rstate=rstate, st_idx=st_idx, num_acc=num_acc, ring_k=rk, ring_v=rv, ring_g=rg, ring_b=rb,
+                core_out=core_out)
+    ints = dict(cs_seq=conv_state.stride(0), cs_dim=conv_state.stride(1), cs_tok=conv_state.stride(2),
+                rs_seq=rstate.stride(0), st_stride=st_idx.stride(0),
+                rk_seq=rk.stride(0) if rk is not None else 0, rv_seq=rv.stride(0) if rv is not None else 0,
+                rg_seq=rg.stride(0) if rg is not None else 0, rb_seq=rb.stride(0) if rb is not None else 0,
+                ring_len=rk.shape[2] if rk is not None else 0)
+    vals = [0 if ptrs[k] is None else ptrs[k].data_ptr() for k in KDA_PTRS] + [ints[k] for k in KDA_INTS]
+    return torch.tensor(vals, dtype=torch.int64, device=device)
+
+
+def _kda_args(tab):
+    a = {k: load_ptr64(tab, i) for i, k in enumerate(KDA_PTRS)}
+    for i, k in enumerate(KDA_INTS):
+        a[k] = ld_i32(tab, 2 * (len(KDA_PTRS) + i))
+    return a
+
+
+def plan(m, gu, gi, nin, nvb, kda=None):
     rb = gu.bm // gu.ks
     ct = SL // gu.bn
     nb = (m + rb - 1) // rb
@@ -76,8 +110,30 @@ def plan(m, gu, gi, nin, nvb):
     p.stage("lred", m, waits_on=("push",), all_ranks=True)
     p.stage("up", tasks_u, waits_on=("lred", "up"), all_ranks=True)
     p.stage("seam", m, waits_on=("up", "seam"), all_ranks=True)
-    p.stage("inproj", tasks_i, waits_on=("seam",), all_ranks=True)
+    p.stage("inproj", tasks_i, waits_on=("seam", "inproj") if kda else ("seam",), all_ranks=True)
+    if kda:
+        p.region("proj", m * k1.NPROJ * 8, peer=False)
+        p.region("qk", m * k1.NH * 2 * k1.HD * 8, peer=False)
+        p.region("onrm", m * k1.NH * k1.NVCH * 8, peer=False)
+        p.stage("kda", (m // kda) * k1.NH * k1.NVCH, waits_on=("inproj", "kda"))
     return p.check()
+
+
+@flyc.jit
+def _finish_proj(c, out, m, nin, r0, rb, n0, bn, ks, proj):
+    """Rows r0 .. r0 + rb of a finished in_proj tile -> the KDA stage's tagged f32
+    pairs (two a store); zero the tile."""
+    tid = c["tid"]
+    q2 = bn // 2
+    for it in range(tid, rb * q2, THREADS):
+        row = r0 + it // q2
+        col = n0 + 2 * (it % q2)
+        if (row < m) & (col < nin):
+            w = ld_i32(out, (row * nin + col) // 2, CM_DEV)
+            lo, hi = bf2_f32(w)
+            c["put_words"](proj, row * k1.NPROJ + col, [lo.bitcast(fx.Int32), hi.bitcast(fx.Int32)])
+            if const_expr(ks > 1):
+                bo.buffer_store(fx.Int32(0), rsrc(out), (row * nin + col) // 2, cache_modifier=CM_DEV)
 
 
 @flyc.jit
@@ -227,17 +283,27 @@ def _seam(c, row, m, rb, ct, nvb, nbk, prefix_out, bank, cw, w_in, eps, pdone, r
 _BUILDS: dict = {}
 
 
-def pre_attn(m, gu, gi, nin, nvb=0, nbk=8, write=False, mode="linbf", launches=1, eps_n=1e-5, eps=1e-5):
+def pre_attn(m, gu, gi, nin, nvb=0, nbk=8, write=False, mode="linbf", launches=1, eps_n=1e-5, eps=1e-5, kda=None,
+             state_len=0, ring=False, onorm_eps=1e-5, lower_bound=-5.0):
     """Build the launch; returns (launch, plan). Arguments: lat_p [m, LAT] / sh_p [m, H]
     (this rank's latent / shared partials), w_up [SL, LAT] (``fold_up``), prefix /
     prefix_out [m, SL], bank [m, nbk, SL], cw f32 [H], w_in [H] (input norm), w_ip
     [nin, H] (in_proj), out (bf16 [m, nin], f32 [ks, m, nin] for "part"), acc bf16
     [m, SL] / cnt [up tiles] (zeroed once), scratch (``plan.scratch_bytes``), peers,
-    rank, epoch, slot. The up GEMM merges linbf (or writes at ks 1)."""
-    key = (m, gu.key(), gi.key(), nin, nvb, nbk, write, mode, launches, eps_n, eps)
+    rank, epoch, slot. The up GEMM merges linbf (or writes at ks 1).
+
+    ``kda`` = L (tokens a request): in_proj's tiles (``out`` is then their bf16 merge
+    buffer [m, nin], zeroed once; ``cnt`` holds the in_proj tiles' counters after
+    the up tiles') are handed to ``kimi_k3``'s KDA tasks (conv, gates, recurrence,
+    gated norm; ``ring``: the ReplaySSM ring), whose core_out [m, 1536] is the
+    launch's output; ``kda_tab`` = ``kda_table(...)``."""
+    key = (m, gu.key(), gi.key(), nin, nvb, nbk, write, mode, launches, eps_n, eps, kda, state_len, ring, onorm_eps,
+           lower_bound)
+    assert kda is None or (nin == k1.NPROJ and m % kda == 0 and (mode == "linbf" or gi.ks == 1)
+                           and gi.bm % gi.ks == 0 and BLOCKS % gi.ks == 0)
     if key in _BUILDS:
         return _BUILDS[key]
-    pl = plan(m, gu, gi, nin, nvb)
+    pl = plan(m, gu, gi, nin, nvb, kda)
     offs, half = pl.peer_offsets
     soffs, _ = pl.scratch_offsets
     fo = pl.flags_offset()
@@ -262,10 +328,22 @@ def pre_attn(m, gu, gi, nin, nvb=0, nbk=8, write=False, mode="linbf", launches=1
     class CLds:
         c: fx.Array[fx.Float32, cw_words, 16]
 
+    kl_n = kda or 1
+
+    @fx.struct
+    class KdaLds:
+        fa: fx.Array[fx.Float32, kl_n * k1.HD, 16]
+        qkl: fx.Array[fx.Float32, kl_n * 2 * k1.HD, 16]
+        decay: fx.Array[fx.Float32, kl_n * k1.HD, 16]
+        vloc: fx.Array[fx.Float32, kl_n * k1.VCH, 16]
+        ol: fx.Array[fx.Float32, kl_n * k1.VCH, 16]
+        beta: fx.Array[fx.Float32, 16, 16]
+
     @fx.union
     class Smem:
         ab: AbLds
         c: CLds
+        kd: KdaLds
 
     @fx.struct
     class Small:
@@ -274,12 +352,12 @@ def pre_attn(m, gu, gi, nin, nvb=0, nbk=8, write=False, mode="linbf", launches=1
         red: fx.Array[fx.Float32, red_words(nvb), 16]
 
     name = (f"k31_pre_attn_m{m}_u{'x'.join(map(str, gu.key()))}_i{'x'.join(map(str, gi.key()))}_n{nin}_v{nvb}of{nbk}"
-            f"w{int(write)}_{mode}_l{launches}")
+            f"w{int(write)}_{mode}_l{launches}_k{kda}s{state_len}r{int(ring)}")
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def pre_attn_kernel(lat_p: Int64, sh_p: Int64, w_up: Int64, prefix: Int64, prefix_out: Int64, bank: Int64,
                         cw: Int64, w_in: Int64, w_ip: Int64, out: Int64, acc: Int64, cnt: Int64, scratch: Int64,
-                        peers: Int64, rank: Int32, epoch: Int64, slot_i: Int32):
+                        peers: Int64, rank: Int32, epoch: Int64, slot_i: Int32, kda_tab: Int64):
         own = load_ptr64(peers, rank)
         with guard.scope(guard.Guard(epoch, own=own, peers=peers, rank=rank, npes=TP, flags_offset=fo)):
             tid, bid = fx.thread_idx.x, fx.block_idx.x
@@ -330,6 +408,7 @@ def pre_attn(m, gu, gi, nin, nvb=0, nbk=8, write=False, mode="linbf", launches=1
             for row in range(bid, m, BLOCKS):
                 _seam(c, row, m, rb, ct, nvb, nbk, prefix_out, bank, cw, w_in, eps, pdone, red, write)
             # inproj
+            proj = sreg(scratch, soffs["proj"], "proj") if kda is not None else None
             x = c["ag_own"].value
             f0 = first_task(bid, max(BLOCKS - n_i, 0))
             for task in range(f0, n_i, BLOCKS):
@@ -345,15 +424,32 @@ def pre_attn(m, gu, gi, nin, nvb=0, nbk=8, write=False, mode="linbf", launches=1
                     emit = f32_emit(out + fx.Int64(sk) * (m * nin * 4), nin, n0, m, nin)
                 else:
                     lin = atomic_lin(out, nin, n0, m, nin, True)
+                if const_expr(kda is not None and gi.ks == 1):
+                    emit = dev_emit(out, nin, n0, m, nin, False)
                 mma_tile(tid, x, H, m, m0, w_ip, H, nin, n0, sk * kti, kti, gi.bm, gi.bn, gi.wm, gi.wn, lds.xs.ptr,
                          lds.ws.ptr, emit, DEPTH, lin, cl)
+                if const_expr(kda is not None):
+                    _arrive_all(tid, cnt + fx.Int64(4 * tmu * tnu), tile, gi.ks, slot)
+                    rbi = gi.bm // gi.ks
+                    _finish_proj(c, out, m, nin, m0 + sk * rbi, rbi, n0, gi.bn, gi.ks, proj)
+            if const_expr(kda is not None):
+                kd = st.kd.peek()
+                c.update({
+                    "S": m, "L": kda, "SL": state_len, "lane": tid % 64, "wave": tid // 64, "kda0": 0,
+                    "lb": lower_bound, "onorm_eps": onorm_eps, "ring": ring, "xp": 0, "on": False, "tls": None,
+                    "red": red, "fa": kd.fa.ptr, "qkl": kd.qkl.ptr, "decay": kd.decay.ptr, "vloc": kd.vloc.ptr,
+                    "ol": kd.ol.ptr, "beta": kd.beta.ptr, "proj": proj, "args": _kda_args(kda_tab),
+                    "qk": sreg(scratch, soffs["qk"], "qk"), "onrm": sreg(scratch, soffs["onrm"], "onrm"),
+                })
+                k1.kda_tasks(c, False, None)
 
     @flyc.jit
     def launch(lat_p: Int64, sh_p: Int64, w_up: Int64, prefix: Int64, prefix_out: Int64, bank: Int64, cw: Int64,
                w_in: Int64, w_ip: Int64, out: Int64, acc: Int64, cnt: Int64, scratch: Int64, peers: Int64,
-               rank: Int32, epoch: Int64, slot_i: Int32, stream: fx.Stream = fx.Stream(None)):  # noqa: B008
+               rank: Int32, epoch: Int64, slot_i: Int32, kda_tab: Int64,
+               stream: fx.Stream = fx.Stream(None)):  # noqa: B008
         pre_attn_kernel(lat_p, sh_p, w_up, prefix, prefix_out, bank, cw, w_in, w_ip, out, acc, cnt, scratch, peers,
-                        rank, epoch, slot_i).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
+                        rank, epoch, slot_i, kda_tab).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     _BUILDS[key] = (launch, pl)
     return launch, pl
