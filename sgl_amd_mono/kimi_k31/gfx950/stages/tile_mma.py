@@ -61,10 +61,10 @@ def _shuffle(tid, lane, wave, acc, cl, bm, bn, tm, tn, wy, wx, m0, lin):
             add(m0 + row, col, [fx.ptr_load(p)])
 
 
-def _loads(tid, xr, ldx, m, m0, wr, ldw, n, n0, k0, bm, bn):
+def _loads(tid, xr, ldx, m, m0, wr, ldw, n, n0, k0, bm, bn, xcm=0):
     """One K step's pieces: x rows m0 .. + bm, W rows n0 .. + bn (clamped)."""
     out = []
-    for rows, base, r, ld, lim, cm in ((bm, m0, xr, ldx, m, 0), (bn, n0, wr, ldw, n, CM_NT)):
+    for rows, base, r, ld, lim, cm in ((bm, m0, xr, ldx, m, xcm), (bn, n0, wr, ldw, n, CM_NT)):
         tot = rows * PIECES
         for i in range_constexpr((tot + THREADS - 1) // THREADS):
             e = fx.min(tid + THREADS * i, tot - 1) if tot % THREADS else tid + THREADS * i
@@ -94,12 +94,13 @@ def _frag(lds, buf, rows, row, kk, lane):
 
 
 def mma_tile(tid, x, ldx, m, m0, w, ldw, n, n0, k0, kt, bm, bn, wm, wn, xs, ws, emit, depth=DEPTH,
-             lin=None, cl=None):
+             lin=None, cl=None, xcm=0):
     """One task: K columns k0 .. k0 + kt of the [bm, bn] tile at (m0, n0);
     ``emit(row, col, v, live)`` gets 4 output columns n0 + col .. of token
     row ``row`` (absolute; the emit masks row >= m and columns >= n). With ``lin``
     (``tile.atomic_lin``) the tile is shuffled through the f32 LDS ``cl`` (aliasing
-    xs / ws) into lane-contiguous adds instead."""
+    xs / ws) into lane-contiguous adds instead. ``xcm``: x's load cache policy
+    (CM_DEV when another XCD's CTA wrote x in this launch)."""
     assert wm * wn == WAVES and kt % BK == 0
     lane, wave = tid % 64, tid // 64
     tm, tn = bm // wm, bn // wn
@@ -111,7 +112,7 @@ def mma_tile(tid, x, ldx, m, m0, w, ldw, n, n0, k0, kt, bm, bn, wm, wn, xs, ws, 
     acc = [[fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(nt)] for _ in range(mt)]
 
     def loads(j):
-        return _loads(tid, xr, ldx, m, m0, wr, ldw, n, n0, k0 + j * BK, bm, bn)
+        return _loads(tid, xr, ldx, m, m0, wr, ldw, n, n0, k0 + j * BK, bm, bn, xcm)
 
     pend = [loads(j) for j in range(min(depth, steps))]
     rocdl.sched_barrier(0)

@@ -36,12 +36,13 @@ def red_words(nvb):
 
 
 @flyc.jit
-def attnres_row(c, row, m, sl, nvb, nbk, prefix, bank, cw, w_o, eps_s, eps_o, red, emit, write):
+def attnres_row(c, row, m, sl, nvb, nbk, prefix, bank, cw, w_o, eps_s, eps_o, red, emit, write, bank_cm=0):
     """One row: ``prefix`` [m, sl] (device scope, just written), ``bank`` [m, nbk, sl]
     (snapshots 0 .. nvb - 1), ``cw`` f32 [H], ``w_o`` bf16 [H]; ``c["xs_of"]`` /
     ``c["xs_own"]`` the scalar exchange region [src][m][V]. ``emit(q, live, vec)``
     gets the 8 normalized bf16 columns 8 q .. of the slice; with ``write`` the
-    prefix becomes bank row nvb."""
+    prefix becomes bank row nvb (device scope: a later seam of the launch may read
+    it); ``bank_cm`` CM_DEV when an earlier seam of this launch wrote the bank."""
     tid = c["tid"]
     lane, wave = tid % 64, tid // 64
     rank = c["rank"]
@@ -54,7 +55,8 @@ def attnres_row(c, row, m, sl, nvb, nbk, prefix, bank, cw, w_o, eps_s, eps_o, re
     live = (lane < upw) & ((wave * upw + lane) < q8)
     xs = []
     for r in range_constexpr(nvb):
-        v = fx.Vector(bo.buffer_load(rsrc(bank), ((row * nbk + r) * sl + 8 * q) // 2, vec_width=4, dtype=T.i32))
+        v = fx.Vector(bo.buffer_load(rsrc(bank), ((row * nbk + r) * sl + 8 * q) // 2, vec_width=4, dtype=T.i32,
+                                     cache_modifier=bank_cm))
         xs.append([x for e in range(4) for x in bf2_f32(v[e])])
     pv = fx.Vector(bo.buffer_load(rsrc(prefix), (row * sl + 8 * q) // 2, vec_width=4, dtype=T.i32,
                                   cache_modifier=CM_DEV))
@@ -130,4 +132,4 @@ def attnres_row(c, row, m, sl, nvb, nbk, prefix, bank, cw, w_o, eps_s, eps_o, re
     emit(q, live, vec)
     if const_expr(write):
         if live:
-            bo.buffer_store(pv, rsrc(bank), ((row * nbk + nvb) * sl + 8 * q) // 2)
+            bo.buffer_store(pv, rsrc(bank), ((row * nbk + nvb) * sl + 8 * q) // 2, cache_modifier=CM_DEV)

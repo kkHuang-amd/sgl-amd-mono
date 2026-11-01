@@ -19,10 +19,10 @@ norm    wave j = token j: the head's 128 outputs, gated RMSNorm -> core_out.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from sgl_amd_mono.common.ops import butterfly, hw_exp2, hw_rsq, ld_i32, mfma_bf16, rsrc, uniform
+from sgl_amd_mono.common.ops import CM_DEV, butterfly, hw_exp2, hw_rsq, ld_i32, mfma_bf16, rsrc, uniform
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, first_task
 from sgl_amd_mono.kimi_k3.gfx950.attention.kda import (
     BETA_0,
@@ -209,7 +209,14 @@ def kda_head(c, req, h, lds, kpt=KPT):
             for u, x in ((0, x0), (1, x1)):
                 e = lane + 64 * u
                 y = x * rr_ * ld_bf(a["on_w"], e) * sigmoid(f32_of(g2[u][0]))
-                bo.buffer_store(y.to(fx.BFloat16), rsrc(a["core_out"]), (req * L + j) * PROJ + h * HD + e)
+                bo.buffer_store(y.to(fx.BFloat16), rsrc(a["core_out"]), (req * L + j) * PROJ + h * HD + e,
+                                cache_modifier=CM_DEV)
+    if const_expr("kdone" in c):
+        # o_proj in the same launch reads this head's core_out (possibly on another XCD)
+        rocdl.s_waitcnt(vmcnt=0)
+        gpu.barrier()
+        if tid == 0:
+            c["put"](c["kdone"], req * NH + h, fx.Int32(1))
     gpu.barrier()
 
 
