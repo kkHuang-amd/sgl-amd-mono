@@ -25,12 +25,18 @@ TP = 8
 SETS = 3
 BF = torch.bfloat16
 H, LAT, KO = 7168, 3584, 1536
-CFGS = {  # m -> (up, in_proj, o_proj, front): bm:bn:wm:wn:ks
-    16: ("16:128:1:8:8", "16:128:1:8:4", "16:128:1:8:4", "16:128:1:8:8"),
-    32: ("32:128:2:4:8", "32:128:2:4:4", "32:128:2:4:2", "32:128:2:4:8"),
-    128: ("128:32:4:2:8", "128:128:2:4:4", "64:64:2:4:1", "128:128:2:4:8"),
-    384: ("128:32:4:2:4", "192:128:4:2:2", "192:64:4:2:1", "128:128:2:4:4"),
+CFGS = {  # m -> (up, in_proj, o_proj, front, shared down): bm:bn:wm:wn:ks
+    16: ("16:128:1:8:8", "16:128:1:8:4", "16:128:1:8:4", "16:128:1:8:8", "16:128:1:8:1"),
+    32: ("32:128:2:4:8", "32:128:2:4:4", "32:128:2:4:2", "32:128:2:4:8", "32:128:2:4:1"),
+    128: ("128:32:4:2:8", "128:128:2:4:4", "64:64:2:4:1", "128:128:2:4:8", "64:64:2:4:1"),
+    384: ("128:32:4:2:4", "192:128:4:2:2", "192:64:4:2:1", "128:128:2:4:4", "128:64:2:4:1"),
 }
+E, TOPK, SI = 896, 16, 768
+
+
+def situ(g, u):
+    g, u = g.float(), u.float()
+    return ((2.0 * torch.tanh(g * 0.25)) * (1.0 + torch.tanh(g * 0.5)) * (25.0 * torch.tanh(u * 0.04))).to(BF)
 
 
 def rel(a, b):
@@ -74,6 +80,8 @@ def run(args, m, rank, dev, cpu):
     w_ip = (torch.randn(k1.NPROJ, H, generator=g, device=dev) / H**0.5).to(BF)
     wo = (torch.randn(H, KO, generator=g, device=dev) / KO**0.5).to(BF)
     wf = (torch.randn(nf, H, generator=g, device=dev) / H**0.5).to(BF)
+    w_sd = (torch.randn(H, SI, generator=g, device=dev) / SI**0.5).to(BF)
+    bias = (torch.randn(E, generator=gs, device=dev) * 0.05).contiguous()
     w_up_r = pa.fold_up(w_up, w_n, rank)
     # KDA state (ring): conv state per launch (written), committed state shared (read only)
     r_n = m // L
@@ -124,56 +132,97 @@ def run(args, m, rank, dev, cpu):
             bk2[:, :, nva] = mid
         xm = attn_res_ref(h, bk2, nvm, ln["sm"], wp["m"], ln["post"])
         front = xm.float() @ wf.float().T
+        logits = [torch.empty_like(front[..., :112]) for _ in range(TP)]
+        dist.all_gather(logits, front[..., :112].contiguous())
+        logits = torch.cat(logits, dim=-1)
+        sc_ = torch.sigmoid(logits)
+        ids = torch.topk(sc_ + bias, TOPK, dim=-1).indices
+        wts = sc_.gather(-1, ids)
+        wts = wts / wts.sum(-1, keepdim=True)
+        lats = [torch.empty_like(front[..., 112:560]) for _ in range(TP)]
+        dist.all_gather(lats, front[..., 112:560].contiguous())
+        latent = torch.cat(lats, dim=-1).to(BF)
+        gu_ = front[..., 560:].to(BF)
+        shp = situ(gu_[..., :SI], gu_[..., SI:]).float() @ w_sd.float().T
         sets.append(dict(lat_p=lat_p, sh_p=sh_p, prefix=prefix[..., cols].contiguous(),
                          bank=bk.view(nl, m, nbk, TP, sl)[:, :, :, rank].contiguous(),
-                         ref=dict(mid=mid[..., cols], h=h[..., cols], core=cr, front=front)))
+                         ref=dict(mid=mid[..., cols], h=h[..., cols], core=cr, latent=latent, sh=shp),
+                         ids=ids.sort(-1).values, wts=wts.gather(-1, ids.sort(-1).indices)))
     cur = {k: sets[0][k].clone() for k in ("lat_p", "sh_p", "prefix", "bank")}
     mid = torch.zeros(nl, m, sl, dtype=BF, device=dev)
     pout = torch.zeros(nl, m, sl, dtype=BF, device=dev)
     ip_buf = torch.zeros(nl, m, k1.NPROJ, dtype=BF, device=dev)
     acc_u = torch.zeros(nl, m, sl, dtype=BF, device=dev)
     acc_o = torch.zeros(nl, m * H * 2, dtype=torch.uint8, device=dev)
-    out = torch.zeros(nl, m, nf, dtype=BF, device=dev)
+    lat_out = torch.zeros(nl, m, 3584, dtype=BF, device=dev)
+    tk_ids = torch.zeros(nl, m, TOPK, dtype=torch.int32, device=dev)
+    tk_w = torch.zeros(nl, m, TOPK, device=dev)
+    sh_out = torch.zeros(nl, m, H, dtype=BF, device=dev)
     cnt = torch.zeros(lay.counters(m, cfg, nf), dtype=torch.int32, device=dev)
     scratch = torch.zeros(pl.scratch_bytes(), dtype=torch.uint8, device=dev)
     pa_ = peers.addresses.data_ptr()
     assert nl % step == 0
 
     def one(i):
-        if cfg.front.ks > 1:
-            out[i].zero_()
         if i % step == 0:
             epoch[0].add_(1)
         launch(cur["lat_p"][i].data_ptr(), cur["sh_p"][i].data_ptr(), w_up_r.data_ptr(), cur["prefix"][i].data_ptr(),
                mid[i].data_ptr(), pout[i].data_ptr(), cur["bank"][i].data_ptr(), cw_a.data_ptr(), ln["in"].data_ptr(),
                w_ip.data_ptr(), ip_buf[i].data_ptr(), acc_u[i].data_ptr(), tabs[i].data_ptr(), core[i].data_ptr(),
-               wo.data_ptr(), cw_m.data_ptr(), ln["post"].data_ptr(), wf.data_ptr(), out[i].data_ptr(),
-               acc_o[i].data_ptr(), cnt.data_ptr(), scratch.data_ptr(), pa_, rank, epoch.data_ptr(), i % step,
+               wo.data_ptr(), cw_m.data_ptr(), ln["post"].data_ptr(), wf.data_ptr(), acc_o[i].data_ptr(),
+               bias.data_ptr(), lat_out[i].data_ptr(), tk_ids[i].data_ptr(), tk_w[i].data_ptr(), w_sd.data_ptr(),
+               sh_out[i].data_ptr(), cnt.data_ptr(), scratch.data_ptr(), pa_, rank, epoch.data_ptr(), i % step,
                stream=torch.cuda.current_stream())
 
     for i in range(nl):
         one(i)
     torch.cuda.synchronize()
     graph, us = graph_us(one, nl)
-    worst = dict(mid=0.0, h=0.0, core=0.0, front=0.0)
+    worst = dict(mid=0.0, h=0.0, core=0.0, latent=0.0, sh=0.0, w=0.0, w_own=0.0)
+    id_bad, id_rows, own_bad = 0, 0, 0
     for r in range(max(args.reps_check, SETS)):
         s = sets[r % SETS]
         for k in cur:
             cur[k].copy_(s[k])
         conv.copy_(conv0.unsqueeze(0).expand_as(conv))
         graph.replay()
-        for k, got in (("mid", mid), ("h", pout), ("core", core), ("front", out)):
+        for k, got in (("mid", mid), ("h", pout), ("core", core), ("latent", lat_out), ("sh", sh_out)):
             worst[k] = max(worst[k], rel(got, s["ref"][k]))
+        got_ids, order = tk_ids.long().sort(-1)
+        same = (got_ids == s["ids"]).all(-1)
+        id_bad += int((~same).sum())
+        id_rows += same.numel()
+        if same.any():
+            worst["w"] = max(worst["w"], rel(tk_w.gather(-1, order)[same], s["wts"][same]))
+        # the routing alone: the last launch's own gathered logits (its half of the peer buffer)
+        offs, half = pl.peer_offsets
+        par = (int(epoch[0]) * step + (nl - 1) % step) % 2
+        o = par * half + offs["rgat"]
+        lg = peers.bytes[o : o + m * E * 4].view(torch.float32).view(m, E)
+        sc_ = torch.sigmoid(lg)
+        own_ids = torch.topk(sc_ + bias, TOPK, dim=-1).indices
+        own_w = sc_.gather(-1, own_ids)
+        own_w = own_w / own_w.sum(-1, keepdim=True)
+        oi, oo = own_ids.sort(-1)
+        gi_, go_ = tk_ids[-1].long().sort(-1)
+        own_bad += int((~(gi_ == oi).all(-1)).sum())
+        worst["w_own"] = max(worst["w_own"], rel(tk_w[-1].gather(-1, go_), own_w.gather(-1, oo)))
     torch.cuda.synchronize()
 
-    stats = torch.tensor([worst["mid"], worst["h"], worst["core"], worst["front"], us], device=dev)
+    stats = torch.tensor([worst["mid"], worst["h"], worst["core"], worst["latent"], worst["sh"], worst["w"],
+                          id_bad / max(id_rows, 1), us, float(own_bad), worst["w_own"]], device=dev)
     every = [torch.empty_like(stats) for _ in range(TP)]
     dist.all_gather(every, stats)
     if rank == 0:
         e = torch.stack(every).max(0).values.tolist()
-        ok = e[0] < 1e-2 and e[1] < 1e-2 and e[2] < 3e-2 and e[3] < 3e-2
+        # end to end a top-16 flips where the 16th / 17th keys are closer than the
+        # upstream rounding; the routing itself must match on its own logits exactly
+        ok = (e[0] < 1e-2 and e[1] < 1e-2 and e[2] < 3e-2 and e[3] < 3e-2 and e[4] < 3e-2 and e[5] < 1e-3
+              and e[8] == 0 and e[9] < 1e-5)
         print(f"layer m {m:3d} L {L} nvb a{nva}{'w' if wa else ''} m{nvm}  rel_l2 mid {e[0]:.2e} h {e[1]:.2e} core "
-              f"{e[2]:.2e} front {e[3]:.2e}  us: layer {e[4]:6.1f}  {'PASS' if ok else 'FAIL'}", flush=True)
+              f"{e[2]:.2e} latent {e[3]:.2e} shared {e[4]:.2e} topk_w {e[5]:.1e} topk rows differing {e[6]:.2%} "
+              f"(own logits: {int(e[8])} rows, w {e[9]:.1e})  "
+              f"us: layer {e[7]:6.1f}  {'PASS' if ok else 'FAIL'}", flush=True)
     torch.cuda.synchronize()
     dist.barrier()
     peers.close()

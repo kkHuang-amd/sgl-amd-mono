@@ -27,6 +27,7 @@ from sgl_amd_mono.kimi_k31.gfx950 import chain as post
 from sgl_amd_mono.kimi_k31.gfx950 import pre_attn as pre
 from sgl_amd_mono.kimi_k31.gfx950.stages import coll
 from sgl_amd_mono.kimi_k31.gfx950.stages import kda_wide as kdaw
+from sgl_amd_mono.kimi_k31.gfx950.stages import moe_front as mf
 from sgl_amd_mono.kimi_k31.gfx950.stages.attnres import red_words
 from sgl_amd_mono.kimi_k31.gfx950.stages.gemm_coll import _arrive_all, _push_band_flag, dev_emit
 from sgl_amd_mono.kimi_k31.gfx950.stages.tile import atomic_lin, bf16_emit, f32_emit
@@ -38,13 +39,13 @@ KO = post.KO
 
 
 class LayerCfg:
-    """GEMM configs of the four tile GEMMs: latent up, in_proj, o_proj, MoE front."""
+    """GEMM configs of the five tile GEMMs: latent up, in_proj, o_proj, MoE front, shared down."""
 
-    def __init__(self, up, inp, oproj, front):
-        self.up, self.inp, self.oproj, self.front = up, inp, oproj, front
+    def __init__(self, up, inp, oproj, front, sdown):
+        self.up, self.inp, self.oproj, self.front, self.sdown = up, inp, oproj, front, sdown
 
     def key(self):
-        return tuple(g.key() for g in (self.up, self.inp, self.oproj, self.front))
+        return tuple(g.key() for g in (self.up, self.inp, self.oproj, self.front, self.sdown))
 
 
 def plan(m, cfg, L, nvb_a, nvb_m, nf):
@@ -63,6 +64,20 @@ def plan(m, cfg, L, nvb_a, nvb_m, nf):
         waits = tuple(w for w in s.waits_on) + (("kda",) if s.name == "oproj" else ())
         p.stage(s.name if s.name != "seam" else "mseam", s.tasks, tuple(w if w != "seam" else "mseam" for w in waits),
                 s.all_ranks)
+    gf, gs = cfg.front, cfg.sdown
+    nbf = (m + gf.bm // gf.ks - 1) // (gf.bm // gf.ks)
+    tnf = (nf + gf.bn - 1) // gf.bn
+    p.region("rgat", m * mf.E * 4)
+    p.region("lgat", m * mf.LAT * 2)
+    p.region("fgf", TP * nbf * mf.gathered_tiles(gf.bn) * 8)
+    p.region("fbuf", m * nf * 4, peer=False)
+    p.region("sgu", m * 2 * mf.SI * 2, peer=False)
+    p.region("smark", nbf * tnf * 8, peer=False)
+    p.region("hbuf", m * mf.SI * 2, peer=False)
+    p.region("hmark", m * 8, peer=False)
+    p.stage("route", m, waits_on=("front",), all_ranks=True)
+    p.stage("situ", m, waits_on=("front",))
+    p.stage("sdown", ((m + gs.bm - 1) // gs.bm) * (H // gs.bn) * gs.ks, waits_on=("situ",))
     return p.check(), pp, po
 
 
@@ -87,13 +102,17 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
     (the prefix after the MoE tail, [m, 896]), kda_tab (``pre.kda_table``; its
     core_out is the o_proj input ``core``), the post half's (wo, cw_m, w_ln, wf,
     out (MoE front output), acc_o (o_proj merge, zeroed once)), prefix_out (after
-    the attention add), bank, cnt (every tile counter, zeroed once), scratch,
-    peers, rank, epoch, slot. linbf merges throughout."""
+    the attention add), bank, the T6 tail's (bias f32 [896] (e_score_correction_bias),
+    lat_out bf16 [m, 3584] + topk_ids int32 / topk_w f32 [m, 16] (the routed
+    experts' input), w_sd [H, 768] (shared down rows of this rank), sh_out bf16
+    [m, H] (the shared partial the next layer's MoE tail reads)), cnt (every tile
+    counter, zeroed once), scratch, peers, rank, epoch, slot. linbf merges, the
+    front in f32 (router logits)."""
     key = (m, cfg.key(), L, nf, nvb_a, nvb_m, write_a, write_m, nbk, launches, eps, eps_n, kpt)
     if key in _BUILDS:
         return _BUILDS[key]
-    gu, gi, go, gf = cfg.up, cfg.inp, cfg.oproj, cfg.front
-    assert m % L == 0 and (not write_a or nvb_m <= nvb_a + 1) and (not write_m or nvb_m < nbk)
+    gu, gi, go, gf, gs = cfg.up, cfg.inp, cfg.oproj, cfg.front, cfg.sdown
+    assert nf == mf.NF and gf.ks > 1 and gs.ks == 1 and m % L == 0 and (not write_a or nvb_m <= nvb_a + 1) and (not write_m or nvb_m < nbk)
     # the up and in_proj finishes read and zero linbf tiles
     assert gu.ks > 1 and gi.ks > 1
     pl, pp, po = plan(m, cfg, L, nvb_a, nvb_m, nf)
@@ -121,7 +140,12 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
     n_o, n_f = tmo * tno * go.ks, tmf * tnf * gf.ks
     cnt_i = tmu * tnu
     cnt_o = cnt_i + tmi * tni
-    gems = (gu, gi, go, gf)
+    cnt_f = cnt_o + tmo * tno
+    rbf = gf.bm // gf.ks
+    nbf = (m + rbf - 1) // rbf
+    tns, tms = H // gs.bn, (m + gs.bm - 1) // gs.bm
+    n_s = tms * tns
+    gems = (gu, gi, go, gf, gs)
     bmx, bnx = max(g.bm for g in gems), max(g.bn for g in gems)
     cwords = max(g.bm * (g.bn + 4) for g in gems)
     kwl = kdaw.lds_floats(L)
@@ -157,8 +181,9 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def layer_kernel(lat_p: Int64, sh_p: Int64, w_up: Int64, prefix: Int64, mid: Int64, prefix_out: Int64,
                      bank: Int64, cw_a: Int64, w_in: Int64, w_ip: Int64, ip_buf: Int64, acc_u: Int64, kda_tab: Int64,
-                     core: Int64, wo: Int64, cw_m: Int64, w_ln: Int64, wf: Int64, out: Int64, acc_o: Int64,
-                     cnt: Int64, scratch: Int64, peers: Int64, rank: Int32, epoch: Int64, slot_i: Int32):
+                     core: Int64, wo: Int64, cw_m: Int64, w_ln: Int64, wf: Int64, acc_o: Int64, bias: Int64,
+                     lat_out: Int64, topk_ids: Int64, topk_w: Int64, w_sd: Int64, sh_out: Int64, cnt: Int64,
+                     scratch: Int64, peers: Int64, rank: Int32, epoch: Int64, slot_i: Int32):
         own = load_ptr64(peers, rank)
         with guard.scope(guard.Guard(epoch, own=own, peers=peers, rank=rank, npes=TP, flags_offset=fo)):
             tid, bid = fx.thread_idx.x, fx.block_idx.x
@@ -174,6 +199,13 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
             pd_m = sreg(scratch, soffs["o_pdone"], "o_pdone")
             proj = sreg(scratch, soffs["proj"], "proj")
             kdone = sreg(scratch, soffs["kdone"], "kdone")
+            tail_offs = {k: offs[k] for k in ("rgat", "lgat", "fgf")}
+            cf = coll.region_context(peers, rank, epoch, slot_i, tail_offs, half, tid, bid, launches)
+            fbuf = scratch + fx.Int64(soffs["fbuf"])
+            sgu = scratch + fx.Int64(soffs["sgu"])
+            hbuf = scratch + fx.Int64(soffs["hbuf"])
+            smark = sreg(scratch, soffs["smark"], "smark")
+            hmark = sreg(scratch, soffs["hmark"], "hmark")
 
             # ---- T1: MoE tail
             for t in range(bid, m * TP, BLOCKS):
@@ -251,18 +283,35 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
                 n0 = (tile % tnf) * gf.bn
                 post._front_wait(co, m0, gf.bm, m, (sk * ktf) // SL, nown_f, False, None, False)
                 mma_tile(tid, xm, H, m, m0, wf, H, nf, n0, sk * ktf, ktf, gf.bm, gf.bn, gf.wm, gf.wn, lds.xs.ptr,
-                         lds.ws.ptr, bf16_emit(out, nf, n0, m, nf) if gf.ks == 1 else None, DEPTH,
-                         None if gf.ks == 1 else atomic_lin(out, nf, n0, m, nf, True), cl)
+                         lds.ws.ptr, None, DEPTH, atomic_lin(fbuf, nf, n0, m, nf, False), cl)
+                _arrive_all(tid, cnt + fx.Int64(4 * cnt_f), tile, gf.ks, slot)
+                r0 = m0 + sk * rbf
+                mf.finish_front(cf, fbuf, sgu, m, r0, rbf, n0, gf.bn, r0 // rbf, n0 // gf.bn, nbf, smark, tnf)
+            # ---- T6 tail: routing + latent for the experts, shared SiTU + down
+            for row in range(bid, m, BLOCKS):
+                mf.route_row(cf, row, m, rbf, nbf, gf.bn, bias, lat_out, topk_ids, topk_w)
+            for row in range(first_task(bid, max(BLOCKS - m, 0)), m, BLOCKS):
+                mf.situ_row(cf, row, m, rbf, tnf, gf.bn, sgu, smark, hbuf, hmark)
+            for task in range(bid, n_s, BLOCKS):
+                m0 = (task // tns) * gs.bm
+                n0 = (task % tns) * gs.bn
+                rows = fx.min(m0 + gs.bm, m) - m0
+                if tid < rows:
+                    cf["poll"]([(hmark, m0 + tid, 1)])
+                gpu.barrier()
+                mma_tile(tid, hbuf, mf.SI, m, m0, w_sd, mf.SI, H, n0, 0, mf.SI, gs.bm, gs.bn, gs.wm, gs.wn,
+                         lds.xs.ptr, lds.ws.ptr, bf16_emit(sh_out, H, n0, m, H), DEPTH, None, cl, CM_DEV)
 
     @flyc.jit
     def launch(lat_p: Int64, sh_p: Int64, w_up: Int64, prefix: Int64, mid: Int64, prefix_out: Int64, bank: Int64,
                cw_a: Int64, w_in: Int64, w_ip: Int64, ip_buf: Int64, acc_u: Int64, kda_tab: Int64, core: Int64,
-               wo: Int64, cw_m: Int64, w_ln: Int64, wf: Int64, out: Int64, acc_o: Int64, cnt: Int64, scratch: Int64,
+               wo: Int64, cw_m: Int64, w_ln: Int64, wf: Int64, acc_o: Int64, bias: Int64, lat_out: Int64,
+               topk_ids: Int64, topk_w: Int64, w_sd: Int64, sh_out: Int64, cnt: Int64, scratch: Int64,
                peers: Int64, rank: Int32, epoch: Int64, slot_i: Int32,
                stream: fx.Stream = fx.Stream(None)):  # noqa: B008
         layer_kernel(lat_p, sh_p, w_up, prefix, mid, prefix_out, bank, cw_a, w_in, w_ip, ip_buf, acc_u, kda_tab, core,
-                     wo, cw_m, w_ln, wf, out, acc_o, cnt, scratch, peers, rank, epoch,
-                     slot_i).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
+                     wo, cw_m, w_ln, wf, acc_o, bias, lat_out, topk_ids, topk_w, w_sd, sh_out, cnt, scratch, peers,
+                     rank, epoch, slot_i).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     _BUILDS[key] = (launch, pl)
     return launch, pl
@@ -270,6 +319,6 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
 
 def counters(m, cfg, nf):
     """int32 tile counters a layer build uses (up, in_proj, o_proj tiles)."""
-    gu, gi, go = cfg.up, cfg.inp, cfg.oproj
+    gu, gi, go, gf = cfg.up, cfg.inp, cfg.oproj, cfg.front
     return (((m + gu.bm - 1) // gu.bm) * (SL // gu.bn) + ((m + gi.bm - 1) // gi.bm) * ((k1.NPROJ + gi.bn - 1) // gi.bn)
-            + ((m + go.bm - 1) // go.bm) * (H // go.bn))
+            + ((m + go.bm - 1) // go.bm) * (H // go.bn) + ((m + gf.bm - 1) // gf.bm) * ((nf + gf.bn - 1) // gf.bn))

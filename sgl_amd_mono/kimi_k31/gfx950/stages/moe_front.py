@@ -1,0 +1,177 @@
+# SPDX-License-Identifier: Apache-2.0
+"""The MoE front's tail inside the layer launch: what the routed experts and the
+next layer's MoE tail need from the front GEMM.
+
+A rank's front GEMM rows (``chain``'s front, merged in f32 here) are its 112
+router experts | 448 latent-down rows | 768 shared gate + 768 shared up. Its
+finished tiles go three ways:
+
+router  f32 logits -> every rank's gather region [m, 896] (expert e of rank r at
+        112 r + e)
+latent  bf16 -> every rank's gather region [m, 3584]
+shared  bf16 gate / up -> local scratch
+
+then, a row a task: ``route_row`` copies the gathered latent into the experts'
+input and picks the top 16 (SGLang's noaux_tc: rank by sigmoid(logit) + bias,
+weights sigmoid(logit) renormalized); ``situ_row`` applies SiTU to the shared
+gate / up (bf16, as the shared MLP rounds), and the shared down GEMM follows.
+"""
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr.typing import T
+
+from sgl_amd_mono.common.ops import CM_DEV, CM_SYS, bf2_f32, bf16_pair, hw_exp2, hw_rcp, rsrc, xshfl
+from sgl_amd_mono.common.plan import THREADS
+from sgl_amd_mono.kimi_k3.gfx950.attention.kda import ld_f32
+
+TP = 8
+E, E_R = 896, 112  # experts, a rank's
+LAT, L_R = 3584, 448
+SI = 768  # shared intermediate a rank (2 shared experts x 3072 / TP)
+R0, L0, S0 = 0, E_R, E_R + L_R  # column starts in a rank's front rows
+NF = E_R + L_R + 2 * SI  # 2096
+TOPK = 16
+LOG2E = 1.4426950408889634
+
+
+def gathered_tiles(bn):
+    """Front tiles holding router / latent columns (0 .. S0)."""
+    return (S0 + bn - 1) // bn
+
+
+@flyc.jit
+def finish_front(c, fbuf, sgu, m, r0, rb, n0, bn, band, t, nbf, smark, tnf):
+    """Rows r0 .. r0 + rb of finished front tile t (columns n0 ..): router / latent
+    columns to every rank, shared columns to local scratch; zero the tile; flag
+    (this rank, band, t) on every rank and / or mark (band, t) locally."""
+    tid = c["tid"]
+    rank = c["rank"]
+    q4 = bn // 4
+    rgs = [c["rgat_of"](p) for p in range(TP)]
+    lgs = [c["lgat_of"](p) for p in range(TP)]
+    for it in range(tid, rb * q4, THREADS):
+        row = r0 + it // q4
+        col = n0 + 4 * (it % q4)
+        if (row < m) & (col < NF):
+            v = fx.Vector(bo.buffer_load(rsrc(fbuf), row * NF + col, vec_width=4, dtype=T.f32, cache_modifier=CM_DEV))
+            bo.buffer_store(fx.Vector.filled(4, 0.0, fx.Float32), rsrc(fbuf), row * NF + col, cache_modifier=CM_DEV)
+            words = fx.Vector.from_elements([bf16_pair(v[0], v[1]).bitcast(fx.Int32),
+                                             bf16_pair(v[2], v[3]).bitcast(fx.Int32)], fx.Int32)
+            if col < L0:
+                for p in range_constexpr(TP):
+                    bo.buffer_store(v, rsrc(rgs[p].value), row * E + rank * E_R + col, cache_modifier=CM_SYS)
+            if (col >= L0) & (col < S0):
+                for p in range_constexpr(TP):
+                    bo.buffer_store(words, rsrc(lgs[p].value), (row * LAT + rank * L_R + col - L0) // 2,
+                                    cache_modifier=CM_SYS)
+            if col >= S0:
+                bo.buffer_store(words, rsrc(sgu), (row * 2 * SI + col - S0) // 2, cache_modifier=CM_DEV)
+    rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+    if n0 < S0:
+        for p in range_constexpr(TP):
+            if tid == p:
+                c["put"](c["fgf_of"](p), (rank * nbf + band) * gathered_tiles(bn) + t, fx.Int32(1))
+    if (n0 + bn > S0) & (tid == 0):
+        c["put"](smark, band * tnf + t, fx.Int32(1))
+
+
+def _sigmoid(x):
+    return hw_rcp(1.0 + hw_exp2(x * (-LOG2E)))
+
+
+@flyc.jit
+def route_row(c, row, m, rbf, nbf, bn, bias, lat_out, topk_ids, topk_w):
+    """The row's gathered latent -> the experts' input; top-16 of the gathered logits."""
+    tid = c["tid"]
+    lane, wave = tid % 64, tid // 64
+    nt = gathered_tiles(bn)
+    band = row // rbf
+    if tid < TP * nt:
+        c["poll"]([(c["fgf_own"], ((tid // nt) * nbf + band) * nt + tid % nt, 1)])
+    gpu.barrier()
+    lg = rsrc(c["lgat_own"].value)
+    for u in range(tid, LAT // 8, THREADS):
+        v = fx.Vector(bo.buffer_load(lg, (row * LAT + 8 * u) // 2, vec_width=4, dtype=T.i32, cache_modifier=CM_SYS))
+        bo.buffer_store(v, rsrc(lat_out), (row * LAT + 8 * u) // 2)
+    if wave == 0:
+        per = E // 64  # 14 experts a lane
+        sc, key = [], []
+        for i in range_constexpr(per):
+            e = lane * per + i
+            s = _sigmoid(ld_f32(c["rgat_own"].value, row * E + e))
+            sc.append(s)
+            key.append(s + ld_f32(bias, e))
+        taken = fx.Int32(0)  # a lane's taken experts, a bit each
+        ids, ws = [], []
+        for k in range_constexpr(TOPK):
+            best, bi, bs = fx.Float32(-3.0e38), fx.Int32(E), fx.Float32(0.0)
+            for i in range_constexpr(per):
+                free = ((taken >> i) & 1) == 0
+                better = free & (key[i] > best)
+                best = better.select(key[i], best)
+                bi = better.select(fx.Int32(lane * per + i), bi)
+                bs = better.select(sc[i], bs)
+            # wave argmax (ties: the lower expert)
+            for off in (32, 16, 8, 4, 2, 1):
+                ob = xshfl(best, off)
+                oi = xshfl(bi, off)
+                os_ = xshfl(bs, off)
+                take = (ob > best) | ((ob == best) & (oi < bi))
+                best = take.select(ob, best)
+                bi = take.select(oi, bi)
+                bs = take.select(os_, bs)
+            mine = (bi // per) == lane
+            taken = mine.select(taken | (fx.Int32(1) << (bi % per)), taken)
+            ids.append(bi)
+            ws.append(bs)
+        tot = ws[0]
+        for k in range_constexpr(1, TOPK):
+            tot = tot + ws[k]
+        inv = hw_rcp(tot)
+        if lane < TOPK:
+            sel_i, sel_w = ids[0], ws[0]
+            for k in range_constexpr(1, TOPK):
+                sel_i = (lane == k).select(ids[k], sel_i)
+                sel_w = (lane == k).select(ws[k], sel_w)
+            bo.buffer_store(sel_i, rsrc(topk_ids), row * TOPK + lane)
+            bo.buffer_store(sel_w * inv, rsrc(topk_w), row * TOPK + lane)
+    gpu.barrier()
+
+
+def _situ(g, u):
+    # SiTU(g, u) = 2 tanh(g / 4) (1 + tanh(g / 2)) x 25 tanh(u / 25)  (beta 4, linear beta 25)
+    def tanh(x):
+        e2 = hw_exp2(x * (2.0 * LOG2E))
+        return (e2 - 1.0) * hw_rcp(e2 + 1.0)
+
+    return (2.0 * tanh(g * 0.25)) * (1.0 + tanh(g * 0.5)) * (25.0 * tanh(u * 0.04))
+
+
+@flyc.jit
+def situ_row(c, row, m, rbf, tnf, bn, sgu, smark, hbuf, hmark):
+    """SiTU of the row's shared gate / up (bf16 in, bf16 out) -> hbuf; mark the row."""
+    tid = c["tid"]
+    t0 = S0 // bn
+    band = row // rbf
+    if tid < tnf - t0:
+        c["poll"]([(smark, band * tnf + t0 + tid, 1)])
+    gpu.barrier()
+    for u in range(tid, SI // 4, THREADS):
+        gv = fx.Vector(bo.buffer_load(rsrc(sgu), (row * 2 * SI + 4 * u) // 2, vec_width=2, dtype=T.i32,
+                                      cache_modifier=CM_DEV))
+        uv = fx.Vector(bo.buffer_load(rsrc(sgu), (row * 2 * SI + SI + 4 * u) // 2, vec_width=2, dtype=T.i32,
+                                      cache_modifier=CM_DEV))
+        gs = [x for w in (gv[0], gv[1]) for x in bf2_f32(w)]
+        us = [x for w in (uv[0], uv[1]) for x in bf2_f32(w)]
+        h = [_situ(gs[e], us[e]) for e in range(4)]
+        words = fx.Vector.from_elements([bf16_pair(h[0], h[1]).bitcast(fx.Int32), bf16_pair(h[2], h[3]).bitcast(fx.Int32)],
+                                        fx.Int32)
+        bo.buffer_store(words, rsrc(hbuf), (row * SI + 4 * u) // 2, cache_modifier=CM_DEV)
+    rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+    if tid == 0:
+        c["put"](hmark, row, fx.Int32(1))
