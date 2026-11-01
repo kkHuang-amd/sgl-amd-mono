@@ -39,6 +39,19 @@ def situ(g, u):
     return ((2.0 * torch.tanh(g * 0.25)) * (1.0 + torch.tanh(g * 0.5)) * (25.0 * torch.tanh(u * 0.04))).to(BF)
 
 
+def mixed_ref(prefix, bank, nvb, w_s, w_p):
+    """SGLang's ``aggregate_stream`` (the pre-norm mixture DSpark captures)."""
+    if nvb == 0:
+        return prefix
+    rows = torch.cat([bank[..., :nvb, :], prefix.unsqueeze(-2)], dim=-2)
+    normed = F.rms_norm(rows.float(), (H,), w_s.float(), EPS).to(BF)
+    probs = torch.softmax((normed.float() @ w_p.float()).to(BF).float(), dim=-1)
+    return (probs.unsqueeze(-1) * rows.float()).sum(dim=-2).to(BF)
+
+
+NCAP, CAP_SLOT = 5, 2  # DSpark's 5 captured layers; this launch's block of the packed buffer
+
+
 def rel(a, b):
     e = ((a.float() - b.float()).norm() / b.float().norm()).item()
     return e if e == e else float("inf")
@@ -57,8 +70,9 @@ def run(args, m, rank, dev, cpu):
     sl = H // TP
     cols = slice(rank * sl, (rank + 1) * sl)
     cfg = lay.LayerCfg(*(Gemm(*(int(v) for v in c.split(":"))) for c in CFGS[m]))
+    cap = args.capture
     launch, pl = lay.kda_layer(m, cfg, L, nf, nvb_a=nva, nvb_m=nvm, write_a=wa, nbk=nbk, launches=step, eps=EPS,
-                               eps_n=1e-5)
+                               eps_n=1e-5, capture=cap)
     if rank == 0 and args.plan:
         print(pl.describe(), flush=True)
     peers = PeerBuffer(pl.peer_bytes(), cpu, rank, TP, dev)
@@ -146,7 +160,8 @@ def run(args, m, rank, dev, cpu):
         shp = situ(gu_[..., :SI], gu_[..., SI:]).float() @ w_sd.float().T
         sets.append(dict(lat_p=lat_p, sh_p=sh_p, prefix=prefix[..., cols].contiguous(),
                          bank=bk.view(nl, m, nbk, TP, sl)[:, :, :, rank].contiguous(),
-                         ref=dict(mid=mid[..., cols], h=h[..., cols], core=cr, latent=latent, sh=shp),
+                         ref=dict(mid=mid[..., cols], h=h[..., cols], core=cr, latent=latent, sh=shp,
+                                  cap=mixed_ref(mid, bk, nva, ln["sa"], wp["a"])),
                          ids=ids.sort(-1).values, wts=wts.gather(-1, ids.sort(-1).indices)))
     cur = {k: sets[0][k].clone() for k in ("lat_p", "sh_p", "prefix", "bank")}
     mid = torch.zeros(nl, m, sl, dtype=BF, device=dev)
@@ -158,6 +173,8 @@ def run(args, m, rank, dev, cpu):
     tk_ids = torch.zeros(nl, m, TOPK, dtype=torch.int32, device=dev)
     tk_w = torch.zeros(nl, m, TOPK, device=dev)
     sh_out = torch.zeros(nl, m, H, dtype=BF, device=dev)
+    aux = torch.zeros(nl, m, NCAP * H, dtype=BF, device=dev)
+    cap_view = aux[..., CAP_SLOT * H : (CAP_SLOT + 1) * H]
     cnt = torch.zeros(lay.counters(m, cfg, nf), dtype=torch.int32, device=dev)
     scratch = torch.zeros(pl.scratch_bytes(), dtype=torch.uint8, device=dev)
     pa_ = peers.addresses.data_ptr()
@@ -171,14 +188,14 @@ def run(args, m, rank, dev, cpu):
                w_ip.data_ptr(), ip_buf[i].data_ptr(), acc_u[i].data_ptr(), tabs[i].data_ptr(), core[i].data_ptr(),
                wo.data_ptr(), cw_m.data_ptr(), ln["post"].data_ptr(), wf.data_ptr(), acc_o[i].data_ptr(),
                bias.data_ptr(), lat_out[i].data_ptr(), tk_ids[i].data_ptr(), tk_w[i].data_ptr(), w_sd.data_ptr(),
-               sh_out[i].data_ptr(), cnt.data_ptr(), scratch.data_ptr(), pa_, rank, epoch.data_ptr(), i % step,
+               sh_out[i].data_ptr(), cap_view[i].data_ptr(), NCAP * H, cnt.data_ptr(), scratch.data_ptr(), pa_, rank, epoch.data_ptr(), i % step,
                stream=torch.cuda.current_stream())
 
     for i in range(nl):
         one(i)
     torch.cuda.synchronize()
     graph, us = graph_us(one, nl)
-    worst = dict(mid=0.0, h=0.0, core=0.0, latent=0.0, sh=0.0, w=0.0, w_own=0.0)
+    worst = dict(mid=0.0, h=0.0, core=0.0, latent=0.0, sh=0.0, w=0.0, w_own=0.0, cap=0.0)
     id_bad, id_rows, own_bad = 0, 0, 0
     for r in range(max(args.reps_check, SETS)):
         s = sets[r % SETS]
@@ -188,6 +205,10 @@ def run(args, m, rank, dev, cpu):
         graph.replay()
         for k, got in (("mid", mid), ("h", pout), ("core", core), ("latent", lat_out), ("sh", sh_out)):
             worst[k] = max(worst[k], rel(got, s["ref"][k]))
+        if cap:
+            worst["cap"] = max(worst["cap"], rel(cap_view, s["ref"]["cap"]))
+            others = torch.cat([aux[..., : CAP_SLOT * H], aux[..., (CAP_SLOT + 1) * H :]], dim=-1)
+            worst["cap"] = max(worst["cap"], float(others.abs().max().item() > 0) * 9.0)  # wrote outside its block
         got_ids, order = tk_ids.long().sort(-1)
         same = (got_ids == s["ids"]).all(-1)
         id_bad += int((~same).sum())
@@ -210,7 +231,7 @@ def run(args, m, rank, dev, cpu):
     torch.cuda.synchronize()
 
     stats = torch.tensor([worst["mid"], worst["h"], worst["core"], worst["latent"], worst["sh"], worst["w"],
-                          id_bad / max(id_rows, 1), us, float(own_bad), worst["w_own"]], device=dev)
+                          id_bad / max(id_rows, 1), us, float(own_bad), worst["w_own"], worst["cap"]], device=dev)
     every = [torch.empty_like(stats) for _ in range(TP)]
     dist.all_gather(every, stats)
     if rank == 0:
@@ -218,10 +239,10 @@ def run(args, m, rank, dev, cpu):
         # end to end a top-16 flips where the 16th / 17th keys are closer than the
         # upstream rounding; the routing itself must match on its own logits exactly
         ok = (e[0] < 1e-2 and e[1] < 1e-2 and e[2] < 3e-2 and e[3] < 3e-2 and e[4] < 3e-2 and e[5] < 1e-3
-              and e[8] == 0 and e[9] < 1e-5)
+              and e[8] == 0 and e[9] < 1e-5 and e[10] < 1e-2)
         print(f"layer m {m:3d} L {L} nvb a{nva}{'w' if wa else ''} m{nvm}  rel_l2 mid {e[0]:.2e} h {e[1]:.2e} core "
               f"{e[2]:.2e} latent {e[3]:.2e} shared {e[4]:.2e} topk_w {e[5]:.1e} topk rows differing {e[6]:.2%} "
-              f"(own logits: {int(e[8])} rows, w {e[9]:.1e})  "
+              f"(own logits: {int(e[8])} rows, w {e[9]:.1e}){f' capture {e[10]:.2e}' if cap else ''}  "
               f"us: layer {e[7]:6.1f}  {'PASS' if ok else 'FAIL'}", flush=True)
     torch.cuda.synchronize()
     dist.barrier()
@@ -242,6 +263,7 @@ def main():
     p.add_argument("--step", type=int, default=4)
     p.add_argument("--reps-check", type=int, default=6)
     p.add_argument("--plan", action="store_true")
+    p.add_argument("--capture", action="store_true", help="DSpark capture of the previous layer")
     args = p.parse_args()
     rank = int(os.environ["RANK"])
     torch.cuda.set_device(rank)

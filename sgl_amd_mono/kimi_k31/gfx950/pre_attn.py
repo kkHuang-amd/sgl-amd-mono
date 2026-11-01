@@ -260,7 +260,7 @@ def _finish(c, acc, shs, prefix, prefix_out, m, r0, rb, n0, bn, ks, pdone, piece
 
 
 @flyc.jit
-def _seam(c, row, m, rb, ct, nvb, nbk, prefix_out, bank, cw, w_in, eps, pdone, red, write):
+def _seam(c, row, m, rb, ct, nvb, nbk, prefix_out, bank, cw, w_in, eps, pdone, red, write, capture=False):
     tid = c["tid"]
     if tid < ct:
         c["poll"]([(pdone, (row // rb) * ct + tid, 1)])
@@ -273,12 +273,38 @@ def _seam(c, row, m, rb, ct, nvb, nbk, prefix_out, bank, cw, w_in, eps, pdone, r
             for p in range_constexpr(TP):
                 bo.buffer_store(vec, rsrc(ags[p].value), (row * H + rank * SL + 8 * q) // 2, cache_modifier=CM_SYS)
 
-    attnres_row(c, row, m, SL, nvb, nbk, prefix_out, bank, cw, w_in, eps, eps, red, emit, write)
+    emit_mixed = None
+    if const_expr(capture):
+        caps = [c["cap_of"](p) for p in range(TP)]
+
+        def emit_mixed(q, live, vec):
+            if live:
+                for p in range_constexpr(TP):
+                    bo.buffer_store(vec, rsrc(caps[p].value), (row * H + rank * SL + 8 * q) // 2,
+                                    cache_modifier=CM_SYS)
+
+    attnres_row(c, row, m, SL, nvb, nbk, prefix_out, bank, cw, w_in, eps, eps, red, emit, write, 0, emit_mixed)
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
     for p in range_constexpr(TP):
         if tid == p:
             c["put"](c["agf_of"](p), rank * m + row, fx.Int32(1))
+            if const_expr(capture):
+                c["put"](c["capf_of"](p), rank * m + row, fx.Int32(1))
+
+
+@flyc.jit
+def capture_row(c, row, m, cap_out, cap_ld):
+    """The row's gathered pre-norm mixture -> the DSpark capture slot (row stride
+    ``cap_ld`` elements, e.g. a column block of the packed aux buffer)."""
+    tid = c["tid"]
+    if tid < TP:
+        c["poll"]([(c["capf_own"], tid * m + row, 1)])
+    gpu.barrier()
+    for u in range(tid, H // 8, THREADS):
+        v = fx.Vector(bo.buffer_load(rsrc(c["cap_own"].value), (row * H + 8 * u) // 2, vec_width=4, dtype=T.i32,
+                                     cache_modifier=CM_SYS))
+        bo.buffer_store(v, rsrc(cap_out), (row * cap_ld + 8 * u) // 2)
 
 
 _BUILDS: dict = {}

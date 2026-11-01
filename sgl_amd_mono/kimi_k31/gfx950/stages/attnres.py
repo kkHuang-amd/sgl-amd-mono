@@ -36,13 +36,16 @@ def red_words(nvb):
 
 
 @flyc.jit
-def attnres_row(c, row, m, sl, nvb, nbk, prefix, bank, cw, w_o, eps_s, eps_o, red, emit, write, bank_cm=0):
+def attnres_row(c, row, m, sl, nvb, nbk, prefix, bank, cw, w_o, eps_s, eps_o, red, emit, write, bank_cm=0,
+                emit_mixed=None):
     """One row: ``prefix`` [m, sl] (device scope, just written), ``bank`` [m, nbk, sl]
     (snapshots 0 .. nvb - 1), ``cw`` f32 [H], ``w_o`` bf16 [H]; ``c["xs_of"]`` /
     ``c["xs_own"]`` the scalar exchange region [src][m][V]. ``emit(q, live, vec)``
     gets the 8 normalized bf16 columns 8 q .. of the slice; with ``write`` the
     prefix becomes bank row nvb (device scope: a later seam of the launch may read
-    it); ``bank_cm`` CM_DEV when an earlier seam of this launch wrote the bank."""
+    it); ``bank_cm`` CM_DEV when an earlier seam of this launch wrote the bank.
+    ``emit_mixed(q, live, vec)``: the pre-norm mixture (bf16), SGLang's
+    ``aggregate_stream`` -- what DSpark captures after the previous layer."""
     tid = c["tid"]
     lane, wave = tid % 64, tid // 64
     rank = c["rank"]
@@ -121,12 +124,16 @@ def attnres_row(c, row, m, sl, nvb, nbk, prefix, bank, cw, w_o, eps_s, eps_o, re
     inv_o = hw_rsq(ssm * (1.0 / h) + eps_o)
     wv = fx.Vector(bo.buffer_load(rsrc(w_o), (rank * sl + 8 * q) // 2, vec_width=4, dtype=T.i32))
     ws = [x for e in range(4) for x in bf2_f32(wv[e])]
-    out = []
+    out, mix = [], []
     for e in range_constexpr(8):
         mixed = probs[0] * xs[0][e]
         for r in range_constexpr(1, r_n):
             mixed = mixed + probs[r] * xs[r][e]
-        out.append(bf16_round(mixed) * inv_o * ws[e])
+        mix.append(bf16_round(mixed))
+        out.append(mix[-1] * inv_o * ws[e])
+    if const_expr(emit_mixed is not None):
+        emit_mixed(q, live, fx.Vector.from_elements(
+            [bf16_pair(mix[2 * k], mix[2 * k + 1]).bitcast(fx.Int32) for k in range(4)], fx.Int32))
     vec = fx.Vector.from_elements([bf16_pair(out[2 * k], out[2 * k + 1]).bitcast(fx.Int32) for k in range(4)],
                                   fx.Int32)
     emit(q, live, vec)
