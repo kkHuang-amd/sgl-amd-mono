@@ -1,0 +1,157 @@
+# SPDX-License-Identifier: Apache-2.0
+"""The post-attention chain launch (``kimi_k31/gfx950/chain.py``) at TP8: check and time.
+
+o_proj -> RS + residual -> RMSNorm (sum of squares exchanged) -> AG -> MoE front,
+one launch. Checks the new residual slice and the front output against an f32
+reference on rotating inputs; times it against the standard path (F.linear ->
+RCCL all-reduce -> add -> F.rms_norm -> F.linear), graph-replayed.
+
+    torchrun --nproc-per-node 8 test/kernels/kimi_k31/chain_bench.py \
+        --cfgs 16/16:128:1:8:4/16:128:1:8:8,128/64:64:2:4:1/128:128:2:4:8 [--plan]
+"""
+
+import argparse
+import os
+
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from gemm_coll_bench import BLOCKS, graph_us, stress_loop
+
+TP = 8
+SETS = 3
+BF = torch.bfloat16
+H, KO, EPS = 7168, 1536, 1e-6
+
+
+def run(args, spec, mode, rank, dev, cpu):
+    from sgl_amd_mono.common import guard
+    from sgl_amd_mono.common.peer import PeerBuffer
+    from sgl_amd_mono.kimi_k31.gfx950 import chain
+
+    ms, so, sf = spec.split("/")
+    m = int(ms)
+    go = chain.Gemm(*(int(v) for v in so.split(":")))
+    gf = chain.Gemm(*(int(v) for v in sf.split(":")))
+    nf, nl, step = args.nf, args.launches, args.step
+    sl = H // TP
+    launch, pl = chain.post_attn(m, go, gf, nf, mode=mode, launches=step, eps=EPS)
+    if rank == 0 and args.plan:
+        print(pl.describe(), flush=True)
+    peers = PeerBuffer(pl.peer_bytes(), cpu, rank, TP, dev)
+    peers.bytes.zero_()
+    epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=dev)
+    ticks = guard.deadline_ticks(10.0)
+    lo = ticks & 0xFFFFFFFF
+    epoch[guard.GUARD_DEADLINE] = lo - (1 << 32) if lo >= 1 << 31 else lo
+    epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
+
+    g = torch.Generator(device=dev).manual_seed(5 + rank)
+    wo = (torch.randn(H, KO, generator=g, device=dev) / KO**0.5).to(BF)
+    wf = (torch.randn(nf, H, generator=g, device=dev) / H**0.5).to(BF)
+    gs = torch.Generator(device=dev).manual_seed(11)
+    w_ln = (1.0 + 0.1 * torch.randn(H, generator=gs, device=dev)).to(BF)
+    asets, rsets, refs = [], [], []
+    for s in range(SETS):
+        a = torch.randn(nl, m, KO, generator=g, device=dev).to(BF)
+        res = torch.randn(nl, m, H, generator=torch.Generator(device=dev).manual_seed(200 + s), device=dev).to(BF)
+        y = torch.einsum("lmk,nk->lmn", a.float(), wo.float())
+        dist.all_reduce(y)
+        h = (y + res.float()).to(BF)
+        xn = F.rms_norm(h.float(), (H,), w_ln.float(), EPS).to(BF)
+        refs.append((h[..., rank * sl : (rank + 1) * sl].float(), torch.einsum("lmk,nk->lmn", xn.float(), wf.float())))
+        asets.append(a)
+        rsets.append(res)
+    a = asets[0].clone()
+    res_full = rsets[0].clone()
+    res = res_full[..., rank * sl : (rank + 1) * sl].contiguous()
+    res_out = torch.zeros(nl, m, sl, dtype=BF, device=dev)
+    fpart = mode == "part" and gf.ks > 1
+    out = torch.zeros(nl, (gf.ks if fpart else 1) * m * nf * (2 if fpart else 1), dtype=BF, device=dev)
+    opart = mode == "part" and go.ks > 1
+    acc = torch.zeros((go.ks * m * H * 4) if opart else m * H * 2, dtype=torch.uint8, device=dev)
+    cnt = torch.zeros(((m + go.bm - 1) // go.bm) * (H // go.bn), dtype=torch.int32, device=dev)
+    scratch = torch.zeros(pl.scratch_bytes(), dtype=torch.uint8, device=dev)
+    pa = peers.addresses.data_ptr()
+    assert nl % step == 0
+
+    def front():
+        if fpart:
+            return out.view(torch.float32).view(nl, gf.ks, m, nf).sum(1)
+        return out.view(nl, m, nf).float()
+
+    def one(i):
+        if mode == "linbf" and gf.ks > 1:
+            out[i].zero_()
+        if i % step == 0:
+            epoch[0].add_(1)
+        launch(a[i].data_ptr(), wo.data_ptr(), res[i].data_ptr(), res_out[i].data_ptr(), w_ln.data_ptr(),
+               wf.data_ptr(), out[i].data_ptr(), acc.data_ptr(), cnt.data_ptr(), scratch.data_ptr(), pa, rank,
+               epoch.data_ptr(), i % step, stream=torch.cuda.current_stream())
+
+    for i in range(nl):
+        one(i)
+    torch.cuda.synchronize()
+    graph, us_fused = graph_us(one, nl)
+    worst_h, worst_f = 0.0, 0.0
+    for r in range(max(args.reps_check, SETS)):
+        s = r % SETS
+        a.copy_(asets[s])
+        res.copy_(rsets[s][..., rank * sl : (rank + 1) * sl])
+        graph.replay()
+        eh = ((res_out.float() - refs[s][0]).norm() / refs[s][0].norm()).item()
+        ef = ((front() - refs[s][1]).norm() / refs[s][1].norm()).item()
+        worst_h, worst_f = max(worst_h, eh), max(worst_f, ef)
+    torch.cuda.synchronize()
+
+    o = torch.empty(m, H, dtype=BF, device=dev)
+    yo = torch.empty(m, nf, dtype=BF, device=dev)
+
+    def std(i):
+        o.copy_(F.linear(a[i], wo))
+        dist.all_reduce(o)
+        hh = o + res_full[i]
+        yo.copy_(F.linear(F.rms_norm(hh, (H,), w_ln, EPS), wf))
+
+    for i in range(nl):
+        std(i)
+    torch.cuda.synchronize()
+    _, us_std = graph_us(std, nl)
+
+    stats = torch.tensor([worst_h, worst_f, us_fused, us_std], device=dev)
+    every = [torch.empty_like(stats) for _ in range(TP)]
+    dist.all_gather(every, stats)
+    if rank == 0:
+        e = torch.stack(every).max(0).values.tolist()
+        ok = e[0] < 1e-2 and e[1] < 1e-2
+        print(f"m {m:3d} o t{go.bm}x{go.bn} ks{go.ks} f t{gf.bm}x{gf.bn} ks{gf.ks} {mode:5s}  rel_l2 residual "
+              f"{e[0]:.2e} front {e[1]:.2e}  us: chain {e[2]:6.1f} | standard {e[3]:6.1f}  "
+              f"{'PASS' if ok else 'FAIL'}", flush=True)
+    peers.close()
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--cfgs", default="16/16:128:1:8:4/16:128:1:8:8,32/32:128:2:4:2/32:128:2:4:8,"
+                   "128/64:64:2:4:1/128:128:2:4:8,384/192:64:4:2:1/128:128:2:4:4",
+                   help="m/o_proj bm:bn:wm:wn:ks/front bm:bn:wm:wn:ks,...")
+    p.add_argument("--modes", default="linbf")
+    p.add_argument("--nf", type=int, default=2096, help="front rows a rank: 112 router + 448 latent + 1536 sgu")
+    p.add_argument("--launches", type=int, default=8)
+    p.add_argument("--step", type=int, default=4)
+    p.add_argument("--reps-check", type=int, default=6)
+    p.add_argument("--plan", action="store_true")
+    args = p.parse_args()
+    rank = int(os.environ["RANK"])
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl")
+    cpu = dist.new_group(backend="gloo")
+    dev = torch.device("cuda", rank)
+    for spec in args.cfgs.split(","):
+        for mode in args.modes.split(","):
+            run(args, spec, mode, rank, dev, cpu)
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()

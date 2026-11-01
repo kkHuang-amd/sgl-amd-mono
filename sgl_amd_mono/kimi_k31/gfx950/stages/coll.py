@@ -239,8 +239,14 @@ def context(peers, rank, epoch, slot, m, h, fmt, tid, bid, launches=1, parity="l
     exchange in which each rank waits for every other, so no rank can reach n + 2
     before all have left n. "epoch" (the K3 tag scheme's) shares one half within a
     step: only for the test that shows the hazard."""
-    assert parity in ("launch", "epoch")
     offs, half = layout(m, h, fmt)
+    return region_context(peers, rank, epoch, slot, offs, half, tid, bid, launches, parity)
+
+
+def region_context(peers, rank, epoch, slot, offs, half, tid, bid, launches=1, parity="launch"):
+    """``context`` for any named peer regions (``offs``: name -> offset in a half):
+    ``<name>_of(p)`` is rank p's region, ``<name>_own`` this rank's."""
+    assert parity in ("launch", "epoch")
     mb = Mailbox(step_tag(epoch, slot))
     e = uniform(ld_i32(epoch, 0))
     bit = (e * launches + slot) % 2 if parity == "launch" else e % 2
@@ -255,20 +261,18 @@ def context(peers, rank, epoch, slot, m, h, fmt, tid, bid, launches=1, parity="l
 
         return of
 
-    return {
+    c = {
         "tid": tid,
         "bid": bid,
         "rank": rank,
         "put": mb.put,
         "put_words": mb.put_words,
         "poll": mb.poll,
-        "rs_of": region("rs"),
-        "ag_of": region("ag"),
-        "fl_of": region("fl"),
-        "rs_own": shift(preg(own, offs["rs"], "rs"), par),
-        "ag_own": shift(preg(own, offs["ag"], "ag"), par),
-        "fl_own": shift(preg(own, offs["fl"], "fl"), par),
     }
+    for name in offs:
+        c[f"{name}_of"] = region(name)
+        c[f"{name}_own"] = shift(preg(own, offs[name], name), par)
+    return c
 
 
 @flyc.jit

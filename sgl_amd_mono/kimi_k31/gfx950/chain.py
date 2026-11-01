@@ -1,0 +1,295 @@
+# SPDX-License-Identifier: Apache-2.0
+"""The post-attention chain of a wide-row layer launch, one launch (T4 -> T5 -> T6).
+
+Stages (``plan.Plan``), every CTA walking them in order, joined by words only:
+
+oproj  o_proj tiles (x the local attention output, K = 1536), K slices merged in
+       scratch; each slice pushes its rows of the finished tile to the column
+       owner (plain stores + a piece flag; ``gemm_coll``).
+rsred  the owner sums a piece's TP sources in rank order, adds the residual,
+       stores the new residual slice and marks the piece in local scratch.
+seam   a row a task (remote stores need many CTAs): waits for its band's pieces,
+       the 8 waves split the slice, its sum of squares is exchanged with every
+       rank (tagged f32), RMSNorm with the full-row mean, the normalized slice
+       pushed to every rank's gather region, then (this rank, row) flagged.
+front  MoE-front tiles (router + latent down + shared gate_up rows, K = 7168),
+       a task waiting for the (row, owner) flags of its rows and K range and
+       reading x' from the gather region.
+"""
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr.typing import Int32, Int64, T
+
+from sgl_amd_mono.common import guard
+from sgl_amd_mono.common.ops import CM_DEV, CM_SYS, bf2_f32, bf16_pair, hw_rsq, load_ptr64, rsrc, wave_sum
+from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES
+from sgl_amd_mono.common.sync import sreg
+from sgl_amd_mono.kimi_k31.gfx950.stages import coll
+from sgl_amd_mono.kimi_k31.gfx950.stages.gemm_coll import _arrive_all, _push_band_flag, dev_emit
+from sgl_amd_mono.kimi_k31.gfx950.stages.tile import atomic_lin, bf16_emit, f32_emit
+from sgl_amd_mono.kimi_k31.gfx950.stages.tile_mma import DEPTH, RW, mma_tile
+from sgl_amd_mono.kimi_k31.plan import Plan
+
+TP = coll.TP
+H = 7168
+KO = 1536  # o_proj K a rank (KDA heads x head dim / TP)
+
+
+class Gemm:
+    """A tile GEMM's build config: bm, bn, wm x wn waves, ks K slices."""
+
+    def __init__(self, bm, bn, wm, wn, ks):
+        self.bm, self.bn, self.wm, self.wn, self.ks = bm, bn, wm, wn, ks
+
+    def key(self):
+        return (self.bm, self.bn, self.wm, self.wn, self.ks)
+
+
+def plan(m, go, gf, nf):
+    """Regions and stages of a chain build (``go`` the o_proj config, ``gf`` the
+    front's, ``nf`` the front's output rows a rank)."""
+    sl = H // TP
+    rb = go.bm // go.ks
+    ct = sl // go.bn
+    nb = (m + rb - 1) // rb
+    assert sl % go.bn == 0 and go.bm % go.ks == 0 and nb * ct <= BLOCKS and BLOCKS % go.ks == 0
+    p = Plan()
+    p.region("rs", TP * m * sl * 2)
+    p.region("fl", TP * BLOCKS * 8)
+    p.region("ss", TP * m * 8)
+    p.region("ag", m * H * 2)
+    p.region("agf", TP * m * 8)
+    p.region("pdone", nb * ct * 8, peer=False)
+    tasks_o = ((m + go.bm - 1) // go.bm) * (H // go.bn) * go.ks
+    tasks_f = ((m + gf.bm - 1) // gf.bm) * ((nf + gf.bn - 1) // gf.bn) * gf.ks
+    p.stage("oproj", tasks_o, waits_on=("oproj",))
+    p.stage("rsred", nb * ct, waits_on=("oproj",), all_ranks=True)
+    p.stage("seam", m, waits_on=("rsred", "seam"), all_ranks=True)
+    p.stage("front", tasks_f, waits_on=("seam",), all_ranks=True)
+    return p.check()
+
+
+@flyc.jit
+def _rs_piece(c, piece, m, sl, rb, bn, res, res_out, pdone):
+    """Sum piece ``piece``'s TP sources in rank order, add the residual, store the
+    new residual (device scope: the seam's CTA reads it), mark the piece."""
+    tid = c["tid"]
+    q8 = bn // 8
+    ct = sl // bn
+    if tid < TP:
+        c["poll"]([(c["fl_own"], tid * BLOCKS + piece, 1)])
+    gpu.barrier()
+    band, cj = piece // ct, piece % ct
+    r_res, r_out, r_rs = rsrc(res), rsrc(res_out), rsrc(c["rs_own"].value)
+    for u in range(tid, rb * q8, THREADS):
+        row = band * rb + u // q8
+        col = cj * bn + 8 * (u % q8)
+        if row < m:
+            got = [fx.Vector(bo.buffer_load(r_rs, (src * m * sl + row * sl + col) // 2, vec_width=4, dtype=T.i32,
+                                            cache_modifier=CM_SYS)) for src in range(TP)]
+            rv = fx.Vector(bo.buffer_load(r_res, (row * sl + col) // 2, vec_width=4, dtype=T.i32))
+            acc = None
+            for src in range_constexpr(TP):
+                cur = [v for e in range(4) for v in bf2_f32(got[src][e])]
+                acc = cur if acc is None else [a + b for a, b in zip(acc, cur)]
+            r = [v for e in range(4) for v in bf2_f32(rv[e])]
+            acc = [a + b for a, b in zip(acc, r)]
+            words = [bf16_pair(acc[2 * j], acc[2 * j + 1]).bitcast(fx.Int32) for j in range(4)]
+            bo.buffer_store(fx.Vector.from_elements(words, fx.Int32), r_out, (row * sl + col) // 2,
+                            cache_modifier=CM_DEV)
+    rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+    if tid == 0:
+        c["put"](pdone, piece, fx.Int32(1))
+
+
+@flyc.jit
+def _seam_row(c, row, m, sl, rb, ct, res_out, w_ln, eps, pdone, red):
+    """RMSNorm of one row over the full hidden: the 8 waves split the owner's
+    columns, the slice's sum of squares is exchanged with every rank (tagged f32),
+    the normalized columns go to every rank's gather region, then the row flag."""
+    tid = c["tid"]
+    lane, wave = tid % 64, tid // 64
+    band = row // rb
+    if tid < ct:
+        c["poll"]([(pdone, band * ct + tid, 1)])
+    gpu.barrier()
+    q8 = sl // 8
+    upw = (q8 + WAVES - 1) // WAVES
+    q = fx.min(wave * upw + lane, q8 - 1)
+    live = (lane < upw) & ((wave * upw + lane) < q8)
+    v = fx.Vector(bo.buffer_load(rsrc(res_out), (row * sl + 8 * q) // 2, vec_width=4, dtype=T.i32,
+                                 cache_modifier=CM_DEV))
+    fs = [x for e in range(4) for x in bf2_f32(v[e])]
+    part = fs[0] * fs[0]
+    for x in fs[1:]:
+        part = part + x * x
+    ss = wave_sum(live.select(part, fx.Float32(0.0)))
+    if lane == 0:
+        fx.ptr_store(ss, red + wave)
+    gpu.barrier()
+    rank = c["rank"]
+    if tid < TP:
+        mine = fx.ptr_load(red)
+        for w in range_constexpr(1, WAVES):
+            mine = mine + fx.ptr_load(red + w)
+        for p in range_constexpr(TP):
+            if tid == p:
+                c["put"](c["ss_of"](p), rank * m + row, mine)
+        got = c["poll"]([(c["ss_own"], tid * m + row, 1)])
+        fx.ptr_store(got[0][0].bitcast(fx.Float32), red + WAVES + tid)
+    gpu.barrier()
+    total = fx.ptr_load(red + WAVES)
+    for src in range_constexpr(1, TP):
+        total = total + fx.ptr_load(red + WAVES + src)
+    inv = hw_rsq(total * (1.0 / (TP * sl)) + eps)
+    wv = fx.Vector(bo.buffer_load(rsrc(w_ln), (rank * sl + 8 * q) // 2, vec_width=4, dtype=T.i32))
+    ws = [x for e in range(4) for x in bf2_f32(wv[e])]
+    xs = [fs[e] * inv * ws[e] for e in range(8)]
+    vec = fx.Vector.from_elements([bf16_pair(xs[2 * j], xs[2 * j + 1]).bitcast(fx.Int32) for j in range(4)],
+                                  fx.Int32)
+    if live:
+        for p in range_constexpr(TP):
+            bo.buffer_store(vec, rsrc(c["ag_of"](p).value), (row * TP * sl + rank * sl + 8 * q) // 2,
+                            cache_modifier=CM_SYS)
+    rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+    for p in range_constexpr(TP):
+        if tid == p:
+            c["put"](c["agf_of"](p), rank * m + row, fx.Int32(1))
+
+
+@flyc.jit
+def _front_wait(c, m0, bm, m, j0, nown):
+    """Wait for the (row, owner) flags of rows m0 .. m0 + bm and owners j0 .. j0 + nown."""
+    rows = fx.min(m0 + bm, m) - m0
+    for i in range(c["tid"], rows * nown, THREADS):
+        c["poll"]([(c["agf_own"], (j0 + i % nown) * m + m0 + i // nown, 1)])
+    gpu.barrier()
+
+
+_BUILDS: dict = {}
+
+
+def post_attn(m, go, gf, nf, mode="linbf", launches=1, eps=1e-6):
+    """Build the chain launch; returns (launch, plan). Arguments: a [m, KO] bf16, wo
+    [H, KO], res / res_out [m, H / TP] (this rank's residual columns), w_ln [H], wf
+    [nf, H], out (the front's output: bf16 [m, nf], f32 [ks, m, nf] for "part"),
+    acc / cnt (o_proj merge scratch and counters, zeroed once), scratch
+    (``plan.scratch_bytes``, zeroed once), peers, rank, epoch, slot."""
+    key = (m, go.key(), gf.key(), nf, mode, launches, eps)
+    if key in _BUILDS:
+        return _BUILDS[key]
+    pl = plan(m, go, gf, nf)
+    offs, half = pl.peer_offsets
+    soffs, _ = pl.scratch_offsets
+    fo = pl.flags_offset()
+    sl = H // TP
+    rb = go.bm // go.ks
+    ct = sl // go.bn
+    nb = (m + rb - 1) // rb
+    kto, ktf = KO // go.ks, H // gf.ks
+    assert kto % 64 == 0 and ktf % 64 == 0 and (ktf % sl == 0 or sl % ktf == 0)
+    nown = max(ktf // sl, 1)
+    tno, tmo = H // go.bn, (m + go.bm - 1) // go.bm
+    tnf, tmf = (nf + gf.bn - 1) // gf.bn, (m + gf.bm - 1) // gf.bm
+    n_o, n_f = tmo * tno * go.ks, tmf * tnf * gf.ks
+    bmx, bnx = max(go.bm, gf.bm), max(go.bn, gf.bn)
+    cw = max(go.bm * (go.bn + 4), gf.bm * (gf.bn + 4))
+    opart = mode == "part" and go.ks > 1
+    fpart = mode == "part" and gf.ks > 1
+
+    @fx.struct
+    class AbLds:
+        xs: fx.Array[fx.Int32, 2 * bmx * RW, 16]
+        ws: fx.Array[fx.Int32, 2 * bnx * RW, 16]
+
+    @fx.struct
+    class CLds:
+        c: fx.Array[fx.Float32, cw, 16]
+
+    @fx.union
+    class Smem:
+        ab: AbLds
+        c: CLds
+
+    @fx.struct
+    class Slot:
+        v: fx.Array[fx.Int32, 4, 16]
+
+    @fx.struct
+    class Red:
+        v: fx.Array[fx.Float32, WAVES + TP, 16]
+
+    name = (f"k31_post_attn_m{m}_o{'x'.join(map(str, go.key()))}_f{'x'.join(map(str, gf.key()))}_n{nf}_{mode}"
+            f"_l{launches}")
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def post_attn_kernel(a: Int64, wo: Int64, res: Int64, res_out: Int64, w_ln: Int64, wf: Int64, out: Int64,
+                         acc: Int64, cnt: Int64, scratch: Int64, peers: Int64, rank: Int32, epoch: Int64,
+                         slot_i: Int32):
+        own = load_ptr64(peers, rank)
+        with guard.scope(guard.Guard(epoch, own=own, peers=peers, rank=rank, npes=TP, flags_offset=fo)):
+            tid, bid = fx.thread_idx.x, fx.block_idx.x
+            alloc = fx.SharedAllocator()
+            st = alloc.allocate(Smem)
+            slot = alloc.allocate(Slot).peek().v.ptr
+            red = alloc.allocate(Red).peek().v.ptr
+            lds, cl = st.ab.peek(), st.c.peek().c.ptr
+            c = coll.region_context(peers, rank, epoch, slot_i, offs, half, tid, bid, launches)
+            pdone = sreg(scratch, soffs["pdone"], "pdone")
+
+            # oproj
+            for task in range(bid, n_o, BLOCKS):
+                sk = task % go.ks
+                tile = task // go.ks
+                m0 = (tile // tno) * go.bm
+                n0 = (tile % tno) * go.bn
+                lin, emit = None, None
+                if const_expr(go.ks == 1):
+                    emit = dev_emit(acc, H, n0, m, H, False)
+                elif const_expr(opart):
+                    emit = dev_emit(acc + fx.Int64(sk) * (m * H * 4), H, n0, m, H, True)
+                else:
+                    lin = atomic_lin(acc, H, n0, m, H, True)
+                mma_tile(tid, a, KO, m, m0, wo, KO, H, n0, sk * kto, kto, go.bm, go.bn, go.wm, go.wn, lds.xs.ptr,
+                         lds.ws.ptr, emit, DEPTH, lin, cl)
+                _arrive_all(tid, cnt, tile, go.ks, slot)
+                piece = ((m0 + sk * rb) // rb) * ct + (n0 % sl) // go.bn
+                _push_band_flag(c, acc, m, H, m0 + sk * rb, rb, n0, go.bn, go.ks, mode, sl, piece)
+            # rsred
+            for piece in range(bid, nb * ct, BLOCKS):
+                _rs_piece(c, piece, m, sl, rb, go.bn, res, res_out, pdone)
+            # seam
+            for row in range(bid, m, BLOCKS):
+                _seam_row(c, row, m, sl, rb, ct, res_out, w_ln, eps, pdone, red)
+            # front
+            x = c["ag_own"].value
+            for task in range(bid, n_f, BLOCKS):
+                sk = task % gf.ks
+                tile = task // gf.ks
+                m0 = (tile // tnf) * gf.bm
+                n0 = (tile % tnf) * gf.bn
+                _front_wait(c, m0, gf.bm, m, (sk * ktf) // sl, nown)
+                lin, emit = None, None
+                if const_expr(gf.ks == 1):
+                    emit = bf16_emit(out, nf, n0, m, nf)
+                elif const_expr(fpart):
+                    emit = f32_emit(out + fx.Int64(sk) * (m * nf * 4), nf, n0, m, nf)
+                else:
+                    lin = atomic_lin(out, nf, n0, m, nf, True)
+                mma_tile(tid, x, H, m, m0, wf, H, nf, n0, sk * ktf, ktf, gf.bm, gf.bn, gf.wm, gf.wn, lds.xs.ptr,
+                         lds.ws.ptr, emit, DEPTH, lin, cl)
+
+    @flyc.jit
+    def launch(a: Int64, wo: Int64, res: Int64, res_out: Int64, w_ln: Int64, wf: Int64, out: Int64, acc: Int64,
+               cnt: Int64, scratch: Int64, peers: Int64, rank: Int32, epoch: Int64, slot_i: Int32,
+               stream: fx.Stream = fx.Stream(None)):  # noqa: B008
+        post_attn_kernel(a, wo, res, res_out, w_ln, wf, out, acc, cnt, scratch, peers, rank, epoch,
+                         slot_i).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
+
+    _BUILDS[key] = (launch, pl)
+    return launch, pl
