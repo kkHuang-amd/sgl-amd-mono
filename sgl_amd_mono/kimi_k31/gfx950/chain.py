@@ -9,9 +9,9 @@ oproj  o_proj tiles (x the local attention output, K = 1536), K slices merged in
 rsred  the owner sums a piece's TP sources in rank order, adds the residual,
        stores the new residual slice and marks the piece in local scratch.
 seam   a row a task (remote stores need many CTAs): waits for its band's pieces,
-       the 8 waves split the slice, its sum of squares is exchanged with every
-       rank (tagged f32), RMSNorm with the full-row mean, the normalized slice
-       pushed to every rank's gather region, then (this rank, row) flagged.
+       then the MLP AttnRes seam over the bank's nvb snapshots and the new prefix
+       (``stages/attnres.py``, one scalar round with every rank), the normalized
+       slice pushed to every rank's gather region, then (this rank, row) flagged.
 front  MoE-front tiles (router + latent down + shared gate_up rows, K = 7168),
        a task waiting for the (row, owner) flags of its rows and K range and
        reading x' from the gather region.
@@ -24,11 +24,12 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common import guard
-from sgl_amd_mono.common.ops import CM_DEV, CM_SYS, bf2_f32, bf16_pair, hw_rsq, load_ptr64, rsrc, wave_sum
+from sgl_amd_mono.common.ops import CM_DEV, CM_SYS, bf2_f32, bf16_pair, load_ptr64, rsrc
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, first_task
 from sgl_amd_mono.common.sync import sreg
 from sgl_amd_mono.kimi_k3.gfx950.stamps import stamp, stamp_begin, stamp_flush
 from sgl_amd_mono.kimi_k31.gfx950.stages import coll
+from sgl_amd_mono.kimi_k31.gfx950.stages.attnres import attnres_row, red_words, scalars
 from sgl_amd_mono.kimi_k31.gfx950.stages.gemm_coll import _arrive_all, _push_band_flag, dev_emit
 from sgl_amd_mono.kimi_k31.gfx950.stages.tile import atomic_lin, bf16_emit, f32_emit
 from sgl_amd_mono.kimi_k31.gfx950.stages.tile_mma import DEPTH, RW, mma_tile
@@ -38,7 +39,7 @@ TP = coll.TP
 H = 7168
 KO = 1536  # o_proj K a rank (KDA heads x head dim / TP)
 # timeline marks (a CTA's first task in a stage marks its wait; the stage's end its last task)
-MARKS = ("start", "oproj mma1", "oproj end", "rsred in1", "rsred end", "seam piece1", "seam ss1", "seam end",
+MARKS = ("start", "oproj mma1", "oproj end", "rsred in1", "rsred end", "seam piece1", "seam pushed1", "seam end",
          "front in1", "front end")
 TL_POINTS = len(MARKS)
 
@@ -53,7 +54,7 @@ class Gemm:
         return (self.bm, self.bn, self.wm, self.wn, self.ks)
 
 
-def plan(m, go, gf, nf):
+def plan(m, go, gf, nf, nvb=0):
     """Regions and stages of a chain build (``go`` the o_proj config, ``gf`` the
     front's, ``nf`` the front's output rows a rank)."""
     sl = H // TP
@@ -64,7 +65,7 @@ def plan(m, go, gf, nf):
     p = Plan()
     p.region("rs", TP * m * sl * 2)
     p.region("fl", TP * BLOCKS * 8)
-    p.region("ss", TP * m * 8)
+    p.region("xs", TP * m * scalars(nvb) * 8)
     p.region("ag", m * H * 2)
     p.region("agf", TP * m * 8)
     p.region("pdone", nb * ct * 8, peer=False)
@@ -114,58 +115,28 @@ def _rs_piece(c, piece, m, sl, rb, bn, res, res_out, pdone, tl_on, tls, first):
 
 
 @flyc.jit
-def _seam_row(c, row, m, sl, rb, ct, res_out, w_ln, eps, pdone, red, tl_on, tls, first):
-    """RMSNorm of one row over the full hidden: the 8 waves split the owner's
-    columns, the slice's sum of squares is exchanged with every rank (tagged f32),
-    the normalized columns go to every rank's gather region, then the row flag."""
+def _seam_row(c, row, m, sl, rb, ct, nvb, nbk, res_out, bank, cw, w_o, eps, pdone, red, write, tl_on, tls, first):
+    """The MLP AttnRes seam of one row (``attnres.attnres_row``) once its band's
+    pieces are in; the normalized slice goes to every rank's gather region, then
+    (this rank, row) is flagged on every rank."""
     tid = c["tid"]
-    lane, wave = tid % 64, tid // 64
-    band = row // rb
     if tid < ct:
-        c["poll"]([(pdone, band * ct + tid, 1)])
+        c["poll"]([(pdone, (row // rb) * ct + tid, 1)])
     gpu.barrier()
     if first:
         stamp(tl_on, tls, tid, 5)
-    q8 = sl // 8
-    upw = (q8 + WAVES - 1) // WAVES
-    q = fx.min(wave * upw + lane, q8 - 1)
-    live = (lane < upw) & ((wave * upw + lane) < q8)
-    v = fx.Vector(bo.buffer_load(rsrc(res_out), (row * sl + 8 * q) // 2, vec_width=4, dtype=T.i32,
-                                 cache_modifier=CM_DEV))
-    fs = [x for e in range(4) for x in bf2_f32(v[e])]
-    part = fs[0] * fs[0]
-    for x in fs[1:]:
-        part = part + x * x
-    ss = wave_sum(live.select(part, fx.Float32(0.0)))
-    if lane == 0:
-        fx.ptr_store(ss, red + wave)
-    gpu.barrier()
     rank = c["rank"]
-    if tid < TP:
-        mine = fx.ptr_load(red)
-        for w in range_constexpr(1, WAVES):
-            mine = mine + fx.ptr_load(red + w)
-        for p in range_constexpr(TP):
-            if tid == p:
-                c["put"](c["ss_of"](p), rank * m + row, mine)
-        got = c["poll"]([(c["ss_own"], tid * m + row, 1)])
-        fx.ptr_store(got[0][0].bitcast(fx.Float32), red + WAVES + tid)
-    gpu.barrier()
+    ags = [c["ag_of"](p) for p in range(TP)]
+
+    def emit(q, live, vec):
+        if live:
+            for p in range_constexpr(TP):
+                bo.buffer_store(vec, rsrc(ags[p].value), (row * TP * sl + rank * sl + 8 * q) // 2,
+                                cache_modifier=CM_SYS)
+
+    attnres_row(c, row, m, sl, nvb, nbk, res_out, bank, cw, w_o, eps, eps, red, emit, write)
     if first:
         stamp(tl_on, tls, tid, 6)
-    total = fx.ptr_load(red + WAVES)
-    for src in range_constexpr(1, TP):
-        total = total + fx.ptr_load(red + WAVES + src)
-    inv = hw_rsq(total * (1.0 / (TP * sl)) + eps)
-    wv = fx.Vector(bo.buffer_load(rsrc(w_ln), (rank * sl + 8 * q) // 2, vec_width=4, dtype=T.i32))
-    ws = [x for e in range(4) for x in bf2_f32(wv[e])]
-    xs = [fs[e] * inv * ws[e] for e in range(8)]
-    vec = fx.Vector.from_elements([bf16_pair(xs[2 * j], xs[2 * j + 1]).bitcast(fx.Int32) for j in range(4)],
-                                  fx.Int32)
-    if live:
-        for p in range_constexpr(TP):
-            bo.buffer_store(vec, rsrc(c["ag_of"](p).value), (row * TP * sl + rank * sl + 8 * q) // 2,
-                            cache_modifier=CM_SYS)
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
     for p in range_constexpr(TP):
@@ -207,9 +178,12 @@ _BUILDS: dict = {}
 
 
 def post_attn(m, go, gf, nf, mode="linbf", launches=1, eps=1e-6, timeline=False, front_top=True, prefetch=False,
-              x_probe=False):
+              x_probe=False, nvb=0, nbk=8, write=False):
     """Build the chain launch; returns (launch, plan). Arguments: a [m, KO] bf16, wo
-    [H, KO], res / res_out [m, H / TP] (this rank's residual columns), w_ln [H], wf
+    [H, KO], res / res_out [m, H / TP] (this rank's prefix columns before / after the add),
+    bank [m, nbk, H / TP] (this rank's columns of the snapshots; ``write``: row nvb
+    := the new prefix), cw f32 [H] (score_norm x score_proj weights), w_ln [H] (the
+    post-attention norm), wf
     [nf, H], out (the front's output: bf16 [m, nf], f32 [ks, m, nf] for "part"),
     acc / cnt (o_proj merge scratch and counters, zeroed once), scratch
     (``plan.scratch_bytes``, zeroed once), peers, rank, epoch, slot, tl (``timeline``:
@@ -218,10 +192,11 @@ def post_attn(m, go, gf, nf, mode="linbf", launches=1, eps=1e-6, timeline=False,
     ``prefetch``: a front CTA reads its first tile's W into L2 before its wait.
     ``x_probe`` (timing only, wrong results): the front reads x from the cached local
     ``acc`` instead of the uncached gather region."""
-    key = (m, go.key(), gf.key(), nf, mode, launches, eps, timeline, front_top, prefetch, x_probe)
+    key = (m, go.key(), gf.key(), nf, mode, launches, eps, timeline, front_top, prefetch, x_probe, nvb, nbk, write)
     if key in _BUILDS:
         return _BUILDS[key]
-    pl = plan(m, go, gf, nf)
+    assert nvb < nbk or (nvb == nbk and not write)
+    pl = plan(m, go, gf, nf, nvb)
     offs, half = pl.peer_offsets
     soffs, _ = pl.scratch_offsets
     fo = pl.flags_offset()
@@ -260,17 +235,18 @@ def post_attn(m, go, gf, nf, mode="linbf", launches=1, eps=1e-6, timeline=False,
 
     @fx.struct
     class Red:
-        v: fx.Array[fx.Float32, WAVES + TP, 16]
+        v: fx.Array[fx.Float32, red_words(nvb), 16]
 
     @fx.struct
     class Tls:
         v: fx.Array[fx.Int64, TL_POINTS, 16]
 
     name = (f"k31_post_attn_m{m}_o{'x'.join(map(str, go.key()))}_f{'x'.join(map(str, gf.key()))}_n{nf}_{mode}"
-            f"_l{launches}_t{int(timeline)}_ft{int(front_top)}_pf{int(prefetch)}_xp{int(x_probe)}")
+            f"_l{launches}_t{int(timeline)}_ft{int(front_top)}_pf{int(prefetch)}_xp{int(x_probe)}_v{nvb}of{nbk}w{int(write)}")
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
-    def post_attn_kernel(a: Int64, wo: Int64, res: Int64, res_out: Int64, w_ln: Int64, wf: Int64, out: Int64,
+    def post_attn_kernel(a: Int64, wo: Int64, res: Int64, res_out: Int64, bank: Int64, cw: Int64, w_ln: Int64,
+                         wf: Int64, out: Int64,
                          acc: Int64, cnt: Int64, scratch: Int64, peers: Int64, rank: Int32, epoch: Int64,
                          slot_i: Int32, tl: Int64):
         own = load_ptr64(peers, rank)
@@ -313,7 +289,8 @@ def post_attn(m, go, gf, nf, mode="linbf", launches=1, eps=1e-6, timeline=False,
                 stamp(timeline, tls, tid, 4)
             # seam
             for row in range(bid, m, BLOCKS):
-                _seam_row(c, row, m, sl, rb, ct, res_out, w_ln, eps, pdone, red, timeline, tls, row == bid)
+                _seam_row(c, row, m, sl, rb, ct, nvb, nbk, res_out, bank, cw, w_ln, eps, pdone, red, write, timeline,
+                          tls, row == bid)
                 stamp(timeline, tls, tid, 7)
             # front
             x = acc if x_probe else c["ag_own"].value
@@ -342,10 +319,11 @@ def post_attn(m, go, gf, nf, mode="linbf", launches=1, eps=1e-6, timeline=False,
             stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
 
     @flyc.jit
-    def launch(a: Int64, wo: Int64, res: Int64, res_out: Int64, w_ln: Int64, wf: Int64, out: Int64, acc: Int64,
+    def launch(a: Int64, wo: Int64, res: Int64, res_out: Int64, bank: Int64, cw: Int64, w_ln: Int64, wf: Int64,
+               out: Int64, acc: Int64,
                cnt: Int64, scratch: Int64, peers: Int64, rank: Int32, epoch: Int64, slot_i: Int32, tl: Int64,
                stream: fx.Stream = fx.Stream(None)):  # noqa: B008
-        post_attn_kernel(a, wo, res, res_out, w_ln, wf, out, acc, cnt, scratch, peers, rank, epoch,
+        post_attn_kernel(a, wo, res, res_out, bank, cw, w_ln, wf, out, acc, cnt, scratch, peers, rank, epoch,
                          slot_i, tl).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     _BUILDS[key] = (launch, pl)
