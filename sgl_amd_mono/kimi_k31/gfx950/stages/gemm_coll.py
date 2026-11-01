@@ -301,3 +301,109 @@ def gemm_rs(m, n, k, bm=128, bn=128, wm=2, wn=4, ks=4, depth=DEPTH, mode="linbf"
 
     _BUILDS[key] = launch
     return launch
+
+
+@flyc.jit
+def _ag_push(c, xs, m, sl, cnt):
+    """Push this rank's x slice [m, sl] to every rank's ag region [m, TP sl] (plain
+    16 B stores; CTA group j feeds rank j); the last CTA to finish flags every rank."""
+    grp = BLOCKS // TP
+    j = c["bid"] // grp
+    dst = c["ag_of"](j)
+    q8 = sl // 8
+    h = TP * sl
+    r_x = rsrc(xs)
+    for u in range((c["bid"] % grp) * THREADS + c["tid"], m * q8, grp * THREADS):
+        row, q = u // q8, u % q8
+        v = fx.Vector(bo.buffer_load(r_x, (row * sl + 8 * q) // 2, vec_width=4, dtype=T.i32))
+        bo.buffer_store(v, rsrc(dst.value), (row * h + c["rank"] * sl + 8 * q) // 2, cache_modifier=CM_SYS)
+    rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+    if c["tid"] == 0:
+        ptr = fx.inttoptr(fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4), cnt)
+        old = fx.llvm.atomic_add(ptr, fx.Int32(1), syncscope="agent")
+        if (old + 1) % BLOCKS == 0:
+            for p in range_constexpr(TP):
+                c["put"](c["fl_of"](p), c["rank"], fx.Int32(1))
+
+
+@flyc.jit
+def _ag_wait(c, j0, nown):
+    """Wait for the flags of owners j0 .. j0 + nown (their slices have landed here)."""
+    if c["tid"] < nown:
+        c["poll"]([(c["fl_own"], j0 + c["tid"], 1)])
+    gpu.barrier()
+
+
+def ag_gemm(m, n, k, bm=128, bn=128, wm=2, wn=4, ks=4, depth=DEPTH, mode="linbf", phases=3):
+    """out[m, n] = AG(x slices) @ W^T in one launch: every rank pushes its x slice
+    [m, k / TP] (``xs``), and a GEMM task starts once the owners of its K range
+    have landed, reading x from the ag region. ``out``: bf16 [m, n] (zeroed for
+    linbf, ks > 1) or f32 partials [ks, m, n] ("part"). ``cnt``: one int32, zeroed
+    once. ``phases`` 1 (timing only): the GEMM on the ag region, no push, no wait."""
+    key = (m, n, k, bm, bn, wm, wn, ks, depth, mode, phases)
+    if key in _AG_BUILDS:
+        return _AG_BUILDS[key]
+    sl = k // TP
+    kt = k // ks
+    assert mode in MODES and k % ks == 0 and kt % 64 == 0 and (kt % sl == 0 or sl % kt == 0)
+    nown = max(kt // sl, 1)
+    tn, tm = (n + bn - 1) // bn, (m + bm - 1) // bm
+    ntasks = tm * tn * ks
+    fo = coll.flags_offset(m, k, "flag")
+
+    @fx.struct
+    class AbLds:
+        xs: fx.Array[fx.Int32, 2 * bm * RW, 16]
+        ws: fx.Array[fx.Int32, 2 * bn * RW, 16]
+
+    @fx.struct
+    class CLds:
+        c: fx.Array[fx.Float32, bm * (bn + 4), 16]
+
+    @fx.union
+    class Smem:
+        ab: AbLds
+        c: CLds
+
+    name = f"k31_ag_gemm_m{m}_n{n}_k{k}_t{bm}x{bn}_w{wm}x{wn}_ks{ks}_d{depth}_{mode}_p{phases}"
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def ag_gemm_kernel(xs: Int64, w: Int64, out: Int64, cnt: Int64, peers: Int64, rank: Int32, epoch: Int64):
+        own = load_ptr64(peers, rank)
+        with guard.scope(guard.Guard(epoch, own=own, peers=peers, rank=rank, npes=TP, flags_offset=fo)):
+            tid, bid = fx.thread_idx.x, fx.block_idx.x
+            st = fx.SharedAllocator().allocate(Smem)
+            lds, cl = st.ab.peek(), st.c.peek().c.ptr
+            c = coll.context(peers, rank, epoch, 0, m, k, "flag", tid, bid)
+            if const_expr(phases == 3):
+                _ag_push(c, xs, m, sl, cnt)
+            x = c["ag_own"].value
+            for task in range(bid, ntasks, BLOCKS):
+                sk = task % ks
+                tile = task // ks
+                m0 = (tile // tn) * bm
+                n0 = (tile % tn) * bn
+                if const_expr(phases == 3):
+                    _ag_wait(c, (sk * kt) // sl, nown)
+                lin = None
+                emit = None
+                if const_expr(ks == 1):
+                    emit = dev_emit(out, n, n0, m, n, False)
+                elif const_expr(mode == "part"):
+                    emit = dev_emit(out + fx.Int64(sk) * (m * n * 4), n, n0, m, n, True)
+                else:
+                    lin = atomic_lin(out, n, n0, m, n, True)
+                mma_tile(tid, x, k, m, m0, w, k, n, n0, sk * kt, kt, bm, bn, wm, wn, lds.xs.ptr, lds.ws.ptr, emit,
+                         depth, lin, cl)
+
+    @flyc.jit
+    def launch(xs: Int64, w: Int64, out: Int64, cnt: Int64, peers: Int64, rank: Int32, epoch: Int64,
+               stream: fx.Stream = fx.Stream(None)):  # noqa: B008
+        ag_gemm_kernel(xs, w, out, cnt, peers, rank, epoch).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
+
+    _AG_BUILDS[key] = launch
+    return launch
+
+
+_AG_BUILDS: dict = {}
