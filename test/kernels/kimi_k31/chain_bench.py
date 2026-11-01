@@ -24,6 +24,42 @@ BF = torch.bfloat16
 H, KO, EPS = 7168, 1536, 1e-6
 
 
+def timeline(args, chain, m, go, gf, nf, mode, step, one, tl, nl, rank, knobs):
+    """One marked launch (the last of a step) behind warm launches, in a graph; per
+    mark over every rank's CTAs that reach it: first / median / last, us from that
+    rank's earliest CTA start."""
+    tlaunch, _ = chain.post_attn(m, go, gf, nf, mode=mode, launches=step, eps=EPS, timeline=True, **knobs)
+    one(step - 1, tlaunch)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        for i in range(step - 1):
+            one(i)
+        tl.zero_()
+        one(step - 1, tlaunch)
+    for _ in range(5):
+        g.replay()
+    torch.cuda.synchronize()
+    every = [torch.empty_like(tl) for _ in range(TP)]
+    dist.all_gather(every, tl)
+    if rank != 0:
+        return
+    t = torch.stack(every).cpu()  # [rank, cta, mark]
+    # the GPUs' clocks are not aligned: each rank's marks from its own earliest start
+    t0 = torch.stack([t[r, :, 0][t[r, :, 0] > 0].min() for r in range(TP)]).view(TP, 1, 1)
+    t = torch.where(t > 0, t - t0 + 1, torch.zeros_like(t))
+    t0 = 1
+    print(f"timeline m {m}: mark  CTAs  first  median  last (us)", flush=True)
+    for k, name in enumerate(chain.MARKS):
+        v = t[..., k]
+        v = v[v > 0]
+        if v.numel():
+            r = (v - t0).double() / 100.0
+            print(f"  {k:2d} {name:12s} {v.numel():5d} {r.min():7.1f} {r.median():7.1f} {r.max():7.1f}", flush=True)
+    ends = [(t[r, :, 9][t[r, :, 9] > 0].max() - t0).item() / 100.0 for r in range(TP)]
+    print("  front end by rank: " + " ".join(f"{e:5.1f}" for e in ends), flush=True)
+
+
 def run(args, spec, mode, rank, dev, cpu):
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
@@ -35,7 +71,9 @@ def run(args, spec, mode, rank, dev, cpu):
     gf = chain.Gemm(*(int(v) for v in sf.split(":")))
     nf, nl, step = args.nf, args.launches, args.step
     sl = H // TP
-    launch, pl = chain.post_attn(m, go, gf, nf, mode=mode, launches=step, eps=EPS)
+    knobs = dict(front_top=bool(int(os.environ.get("CH_TOP", "1"))), prefetch=bool(int(os.environ.get("CH_PF", "0"))),
+                 x_probe=bool(int(os.environ.get("CH_XPROBE", "0"))))
+    launch, pl = chain.post_attn(m, go, gf, nf, mode=mode, launches=step, eps=EPS, **knobs)
     if rank == 0 and args.plan:
         print(pl.describe(), flush=True)
     peers = PeerBuffer(pl.peer_bytes(), cpu, rank, TP, dev)
@@ -80,14 +118,16 @@ def run(args, spec, mode, rank, dev, cpu):
             return out.view(torch.float32).view(nl, gf.ks, m, nf).sum(1)
         return out.view(nl, m, nf).float()
 
-    def one(i):
+    tl = torch.zeros(BLOCKS, chain.TL_POINTS, dtype=torch.int64, device=dev)
+
+    def one(i, launch=launch):
         if mode == "linbf" and gf.ks > 1:
             out[i].zero_()
         if i % step == 0:
             epoch[0].add_(1)
         launch(a[i].data_ptr(), wo.data_ptr(), res[i].data_ptr(), res_out[i].data_ptr(), w_ln.data_ptr(),
                wf.data_ptr(), out[i].data_ptr(), acc.data_ptr(), cnt.data_ptr(), scratch.data_ptr(), pa, rank,
-               epoch.data_ptr(), i % step, stream=torch.cuda.current_stream())
+               epoch.data_ptr(), i % step, tl.data_ptr(), stream=torch.cuda.current_stream())
 
     for i in range(nl):
         one(i)
@@ -118,13 +158,16 @@ def run(args, spec, mode, rank, dev, cpu):
     torch.cuda.synchronize()
     _, us_std = graph_us(std, nl)
 
+    if args.timeline:
+        timeline(args, chain, m, go, gf, nf, mode, step, one, tl, nl, rank, knobs)
+
     stats = torch.tensor([worst_h, worst_f, us_fused, us_std], device=dev)
     every = [torch.empty_like(stats) for _ in range(TP)]
     dist.all_gather(every, stats)
     if rank == 0:
         e = torch.stack(every).max(0).values.tolist()
         ok = e[0] < 1e-2 and e[1] < 1e-2
-        print(f"m {m:3d} o t{go.bm}x{go.bn} ks{go.ks} f t{gf.bm}x{gf.bn} ks{gf.ks} {mode:5s}  rel_l2 residual "
+        print(f"top{int(knobs['front_top'])} pf{int(knobs['prefetch'])} m {m:3d} o t{go.bm}x{go.bn} ks{go.ks} f t{gf.bm}x{gf.bn} ks{gf.ks} {mode:5s}  rel_l2 residual "
               f"{e[0]:.2e} front {e[1]:.2e}  us: chain {e[2]:6.1f} | standard {e[3]:6.1f}  "
               f"{'PASS' if ok else 'FAIL'}", flush=True)
     peers.close()
@@ -141,6 +184,7 @@ def main():
     p.add_argument("--step", type=int, default=4)
     p.add_argument("--reps-check", type=int, default=6)
     p.add_argument("--plan", action="store_true")
+    p.add_argument("--timeline", action="store_true")
     args = p.parse_args()
     rank = int(os.environ["RANK"])
     torch.cuda.set_device(rank)
