@@ -83,6 +83,11 @@ def _sigmoid(x):
     return hw_rcp(1.0 + hw_exp2(x * (-LOG2E)))
 
 
+def _ld_sys(r, i):
+    """One f32 of a peer region other ranks wrote (system scope: no stale cached line)."""
+    return fx.Float32(bo.buffer_load(r, i, vec_width=1, dtype=T.f32, cache_modifier=CM_SYS))
+
+
 @flyc.jit
 def route_row(c, row, m, rbf, nbf, bn, bias, lat_out, topk_ids, topk_w, logits_out=None):
     """The row's gathered latent -> the experts' input; top-16 of the gathered logits
@@ -95,18 +100,19 @@ def route_row(c, row, m, rbf, nbf, bn, bias, lat_out, topk_ids, topk_w, logits_o
         c["poll"]([(c["fgf_own"], ((tid // nt) * nbf + band) * nt + tid % nt, 1)])
     gpu.barrier()
     lg = rsrc(c["lgat_own"].value)
+    rg = rsrc(c["rgat_own"].value)
     for u in range(tid, LAT // 8, THREADS):
         v = fx.Vector(bo.buffer_load(lg, (row * LAT + 8 * u) // 2, vec_width=4, dtype=T.i32, cache_modifier=CM_SYS))
         bo.buffer_store(v, rsrc(lat_out), (row * LAT + 8 * u) // 2)
     if const_expr(logits_out is not None):
         for e in range(tid, E, THREADS):
-            bo.buffer_store(ld_f32(c["rgat_own"].value, row * E + e), rsrc(logits_out), row * E + e)
+            bo.buffer_store(_ld_sys(rg, row * E + e), rsrc(logits_out), row * E + e)
     if wave == 0:
         per = E // 64  # 14 experts a lane
         sc, key = [], []
         for i in range_constexpr(per):
             e = lane * per + i
-            s = _sigmoid(ld_f32(c["rgat_own"].value, row * E + e))
+            s = _sigmoid(_ld_sys(rg, row * E + e))
             sc.append(s)
             key.append(s + ld_f32(bias, e))
         taken = fx.Int32(0)  # a lane's taken experts, a bit each
