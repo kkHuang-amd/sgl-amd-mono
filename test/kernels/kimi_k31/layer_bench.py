@@ -69,10 +69,12 @@ def run(args, m, rank, dev, cpu):
     nva, nvm, wa = args.nvb_a, args.nvb_m, args.write_a
     sl = H // TP
     cols = slice(rank * sl, (rank + 1) * sl)
-    cfg = lay.LayerCfg(*(Gemm(*(int(v) for v in c.split(":"))) for c in CFGS[m]))
+    from sgl_amd_mono.kimi_k31.wide import CFGS as SERVE_CFGS
+
+    cfg = lay.LayerCfg(*(Gemm(*(int(v) for v in c.split(":"))) for c in CFGS.get(m) or SERVE_CFGS[m]))
     cap = args.capture
     launch, pl = lay.kda_layer(m, cfg, L, nf, nvb_a=nva, nvb_m=nvm, write_a=wa, nbk=nbk, launches=step, eps=EPS,
-                               eps_n=1e-5, capture=cap)
+                               eps_n=1e-5, capture=cap, t1=not args.no_t1, restart=args.restart)
     if rank == 0 and args.plan:
         print(pl.describe(), flush=True)
     peers = PeerBuffer(pl.peer_bytes(), cpu, rank, TP, dev)
@@ -227,8 +229,21 @@ def run(args, m, rank, dev, cpu):
         own_w = own_w / own_w.sum(-1, keepdim=True)
         oi, oo = own_ids.sort(-1)
         gi_, go_ = tk_ids[-1].long().sort(-1)
-        own_bad += int((~(gi_ == oi).all(-1)).sum())
-        worst["w_own"] = max(worst["w_own"], rel(tk_w[-1].gather(-1, go_), own_w.gather(-1, oo)))
+        # a row differs only by a swap of keys closer than the kernel sigmoid's error (v_exp + v_rcp, ~1-3 ulp
+        # off torch.sigmoid) is a near-tie, not a routing error
+        key_ = sc_ + bias
+        for r_ in (~(gi_ == oi).all(-1)).nonzero().flatten().tolist():
+            k_got = key_[r_, gi_[r_]].sort().values
+            k_ref = key_[r_, oi[r_]].sort().values
+            own_bad += int(float((k_got - k_ref).abs().max()) >= 1e-6)
+        same_own = (gi_ == oi).all(-1)
+        if same_own.any():
+            worst["w_own"] = max(worst["w_own"],
+                                 rel(tk_w[-1].gather(-1, go_)[same_own], own_w.gather(-1, oo)[same_own]))
+        # a peer must not start the next replay (whose pushes land in this rank's buffer)
+        # before this rank has read the logits it checks
+        torch.cuda.synchronize()
+        dist.barrier(group=cpu)
     torch.cuda.synchronize()
 
     stats = torch.tensor([worst["mid"], worst["h"], worst["core"], worst["latent"], worst["sh"], worst["w"],
@@ -265,7 +280,13 @@ def main():
     p.add_argument("--reps-check", type=int, default=6)
     p.add_argument("--plan", action="store_true")
     p.add_argument("--capture", action="store_true", help="DSpark capture of the previous layer")
+    p.add_argument("--no-t1", action="store_true", help="no MoE tail (a run's first layer)")
+    p.add_argument("--restart", action="store_true", help="block-write layer: the prefix restarts (reference unchanged)")
     args = p.parse_args()
+    if os.environ.get("SGLANG_AMD_MONO_ROCM_LLVM"):
+        from sgl_amd_mono.common import rocm_codegen
+
+        rocm_codegen.install(os.environ["SGLANG_AMD_MONO_ROCM_LLVM"])
     rank = int(os.environ["RANK"])
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl")
