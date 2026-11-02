@@ -143,7 +143,7 @@ def run(args, m, rank, dev, cpu):
                           for i in range(nl)])
         y = torch.einsum("lmk,nk->lmn", cr.float(), wo.float())
         dist.all_reduce(y)
-        h = (y + mid.float()).to(BF)
+        h = (y if args.restart else y + mid.float()).to(BF)
         bk2 = bk.clone()
         if wa:
             bk2[:, :, nva] = mid
@@ -258,7 +258,10 @@ def run(args, m, rank, dev, cpu):
         e = torch.stack(every).max(0).values.tolist()
         # end to end a top-16 flips where the 16th / 17th keys are closer than the
         # upstream rounding; the routing itself must match on its own logits exactly
-        ok = (e[0] < 1e-2 and e[1] < 1e-2 and e[2] < 3e-2 and e[3] < 3e-2 and e[4] < 3e-2 and e[5] < 1e-3
+        # restart: h is the attention output alone (no prefix), so it carries core's error undiluted
+        rs = args.restart
+        ok = (e[0] < 1e-2 and e[1] < (3e-2 if rs else 1e-2) and e[2] < 3e-2 and e[3] < 3e-2 and e[4] < 3e-2
+              and e[5] < (2e-3 if rs else 1e-3)
               and e[8] == 0 and e[9] < 1e-5 and e[10] < 1e-2
               and e[11] < 1e-2)
         print(f"layer m {m:3d} L {L} nvb a{nva}{'w' if wa else ''} m{nvm}  rel_l2 mid {e[0]:.2e} h {e[1]:.2e} core "
@@ -286,7 +289,7 @@ def main():
     p.add_argument("--plan", action="store_true")
     p.add_argument("--capture", action="store_true", help="DSpark capture of the previous layer")
     p.add_argument("--no-t1", action="store_true", help="no MoE tail (a run's first layer)")
-    p.add_argument("--restart", action="store_true", help="block-write layer: the prefix restarts (reference unchanged)")
+    p.add_argument("--restart", action="store_true", help="block-write layer: the prefix restarts at the attention output")
     args = p.parse_args()
     if os.environ.get("SGLANG_AMD_MONO_ROCM_LLVM"):
         from sgl_amd_mono.common import rocm_codegen

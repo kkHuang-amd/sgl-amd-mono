@@ -6,15 +6,18 @@ A step walks the layers as SGLang's backbone does, except for every run of cover
 layers (KDA attention + latent MoE: all but layer 0, which has a dense MLP, and the
 DSA layers), which go launch by launch:
 
-    enter    the stream after the previous (standard) layer, folded to the full
-             prefix, and the bank -> this rank's column slices
+    enter    after a DSA layer (MoE on the merged front): SGLang runs that layer up
+             to its MoE's TP partials and the first launch runs its tail (t1 on);
+             else the stream after the previous layer, folded to the full prefix.
+             The bank -> this rank's column slices
     layer i  launch i (MoE tail of i - 1 unless it starts the run; restart on a
              block-write layer; DSpark capture of i - 1 when asked; reads the conv
              state from SGLang's cache by slot and writes the verify windows for
              SGLang's accept) -> a written bank row gathered into SGLang's bank
              -> SGLang's routed experts on the launch's latent and router logits
-    leave    the last layer's MoE tail on SGLang (``_column_split_tail``) from the
-             gathered prefix -> the stream the next standard layer reads
+    leave    the last layer's MoE tail on SGLang (``_column_split_tail``), this rank's
+             prefix columns added into its shared columns before the tail's all-reduce
+             -> the stream the next standard layer reads
 
 The column-sharded state lives only inside a run, so the standard layers see exactly
 what they see today. Rows are padded to a bucket (padded requests have no KDA
@@ -64,14 +67,14 @@ class _Layer:
     """A covered layer's weights as the launch reads them (views where SGLang's
     layout already fits; the front rows and the folded up projection are copies)."""
 
-    def __init__(self, backbone, i, rank, covered):
+    def __init__(self, backbone, i, rank, tails):
         from sgl_amd_mono.kimi_k31.gfx950 import pre_attn as pa
 
         bf = torch.bfloat16
         layer = backbone.layers[i]
         attn, moe = layer.self_attn, layer.mlp
         self.i, self.layer, self.moe = i, layer, moe
-        self.t1 = (i - 1) in covered  # the previous layer's MoE tail runs in this launch
+        self.t1 = (i - 1) in tails  # the previous layer's MoE tail runs in this launch
         self.write = bool(layer.is_block_write_layer)
         self.nvb = layer.prev_valid_blocks
         r = rank
@@ -106,6 +109,20 @@ def _is_covered(layer) -> bool:
     return hasattr(layer.self_attn, "qkv_conv1d") and isinstance(layer.mlp, KimiK3MoE)
 
 
+def _tail_fusable(layer) -> bool:
+    """A standard layer (DSA) whose MoE tail the next run's first launch can take:
+    a stream-writing latent MoE on the merged front."""
+    from sglang.srt.models.kimi_k3 import KimiK3MoE
+
+    mlp = layer.mlp
+    return (isinstance(mlp, KimiK3MoE) and layer._ffn_writes_stream and mlp._eligible_for_fused_front
+            and not getattr(layer, "_sp_moe", False) and not getattr(mlp, "_use_mega_moe", False))
+
+
+def _check_steps() -> int:
+    return int(os.environ.get("SGLANG_AMD_MONO_K31_WIDE_ENTRY_CHECK", "0"))
+
+
 class Wide:
     def __init__(self, model, rank, group, device):
         from sgl_amd_mono.common import guard
@@ -115,7 +132,14 @@ class Wide:
         self.rank, self.group, self.device = rank, group, device
         idx = [i for i in range(bb.start_layer, bb.end_layer) if _is_covered(bb.layers[i])]
         cov = set(idx)
-        self.layers = {i: _Layer(bb, i, rank, cov) for i in idx}
+        # standard layers whose MoE tail runs in the next run's first launch (t1 on):
+        # SGLang runs them up to the routed / shared partials only
+        self.entry = set()
+        if os.environ.get("SGLANG_AMD_MONO_K31_WIDE_ENTRY_T1", "1") == "1":
+            self.entry = {i - 1 for i in idx if (i - 1) not in cov and i - 1 >= bb.start_layer
+                          and _tail_fusable(bb.layers[i - 1])}
+        self.layers = {i: _Layer(bb, i, rank, cov | self.entry) for i in idx}
+        self.check_left = _check_steps()
         self.slots = {i: n for n, i in enumerate(idx)}  # a launch's slot in the step
         caps = set(bb.dspark_layers_to_capture or ())
         self.peers, self.bufs, self.half = {}, {}, {}
@@ -131,7 +155,8 @@ class Wide:
         self.cols = slice(rank * SL, (rank + 1) * SL)
         self.kda_ready = False
         _say(f"{len(idx)} covered layers ({idx[0]} .. {idx[-1]}), captures {sorted(caps)}, "
-             f"block-write {[i for i in idx if self.layers[i].write]}")
+             f"block-write {[i for i in idx if self.layers[i].write]}, tails into a run's first launch "
+             f"{sorted(self.entry)}")
 
     # ------------------------------------------------------------ per bucket
     def _cfg(self, b):
@@ -292,6 +317,34 @@ class Wide:
         return tab
 
     # ------------------------------------------------------------ the step
+    def _tail_front(self, layer, hidden, positions, fb, zero_allocator, bufs, rows, ping):
+        """A standard layer whose MoE tail the next launch takes: SGLang's layer up to
+        the MoE's TP partials (routed latent -> lat_p, shared -> sh) and this rank's
+        columns of the prefix the tail adds (-> pout), the next launch's T1 inputs."""
+        from sglang.srt.layers.layer_boundary.residual.batch import written_residual
+
+        h = layer.attn_boundary.prepare(hidden, fb, capture_gathered=None)
+        h = layer._run_self_attn(h, positions, fb, zero_allocator)
+        h = layer.attn_boundary.finish(h, fb)
+        x = layer.ffn_boundary.prepare(h, fb)
+        prefix = written_residual(fb)
+        assert x.shape == (rows, H) and prefix is not None and prefix.shape == (rows, H), (x.shape, prefix)
+        moe = layer.mlp
+        gate_up, logits, routed = moe._fused_front(x)
+        moe._forward_shared(gate_up, bufs["sh"][ping][:rows])
+        moe._forward_routed(x, logits, routed, bufs["lat_p"][ping][:rows])
+        bufs["pout"][ping][:rows] = prefix[:, self.cols]
+        return x, prefix
+
+    def _rel(self, got, ref):
+        """rel L2 over the TP group of tensors each rank holds a part of."""
+        import torch.distributed as dist
+        from sglang.srt.distributed import get_tp_group
+
+        t = torch.stack([(got.float() - ref.float()).square().sum(), ref.float().square().sum()])
+        dist.all_reduce(t, group=get_tp_group().device_group)
+        return (t[0] / t[1]).sqrt().item()
+
     def backbone(self, built, input_ids, fb, input_embeds):
         from sglang.srt.distributed import tensor_model_parallel_all_gather
         from sglang.srt.layers.layer_boundary.residual.batch import final_norm, fold, set_written, start
@@ -318,9 +371,19 @@ class Wide:
         ks = self._kda_step(fb, R, L, bufs)
         self.epoch[0].add_(1)
         cols = self.cols
+        check = self.check_left > 0 and not torch.cuda.is_current_stream_capturing()
+        self.check_left -= int(check)
         i = m.start_layer
         ping = 0
+        ref_mid = None
         while i < m.end_layer:
+            if i in self.entry:
+                x, prefix = self._tail_front(m.layers[i], hidden, built._positions, fb, zero_allocator, bufs, rows,
+                                             ping)
+                if check:  # SGLang's whole MoE on the same input, this rank's columns
+                    ref_mid = m.layers[i].mlp(x, prefix_sum=prefix)[:, cols].clone()
+                i += 1
+                continue
             if i not in self.layers:
                 hidden = m.layers[i](positions=built._positions, hidden_states=hidden, forward_batch=fb,
                                      zero_allocator=zero_allocator, capture_gathered=None)
@@ -330,8 +393,9 @@ class Wide:
                 continue
             # a run of covered layers
             res = m.attn_bank.require()
-            full = fold(hidden, fb)
-            bufs["mid"][:rows] = full[:, cols]
+            if not self.layers[i].t1:  # else its first launch runs the previous layer's MoE tail
+                full = fold(hidden, fb)
+                bufs["mid"][:rows] = full[:, cols]
             bufs["bank"][:rows] = res.block_residual[:rows, :, cols]
             run = []
             while i in self.layers:
@@ -340,12 +404,16 @@ class Wide:
             for n, li in enumerate(run):
                 pk = self.layers[li]
                 v = self._variant(pk, b, L, captures)
-                assert v["t1"] == (n > 0)
+                assert v["t1"] == (n > 0 or (li - 1) in self.entry)
                 assert res.num_valid_blocks == pk.nvb, (li, res.num_valid_blocks, pk.nvb)
                 tab = self._kda_table(pk, ks, b, bufs)
                 cur = 1 - ping
                 self._build_launch(pk, b, L, v, cfg)(*self._launch_args(pk, b, bufs, tab, ping, self.slots[li]),
                                                      stream=torch.cuda.current_stream())
+                if n == 0 and ref_mid is not None:
+                    e = self._rel(bufs["mid"][:rows], ref_mid)
+                    _say(f"entry check layer {li - 1} -> {li} rows {rows}: mid rel {e:.2e}")
+                    ref_mid = None
                 if v["capture"]:
                     aux.append(bufs["cap"][:rows].clone())
                 if pk.write:
@@ -353,11 +421,19 @@ class Wide:
                 lat_p = bufs["lat_p"][cur]
                 pk.moe._forward_routed(bufs["lat"][:rows], bufs["logits"][:rows], bufs["lat"][:rows], lat_p[:rows])
                 ping = cur
-            # leave: the last layer's MoE tail on SGLang, from the gathered prefix
+            # leave: the last layer's MoE tail on SGLang; this rank's prefix columns ride
+            # in its columns of the shared partial sum, so the tail's all-reduce carries them
+            # (in place: the next run's first launch, t1 off, does not read sh)
             last = self.layers[run[-1]]
-            prefix = tensor_model_parallel_all_gather(bufs["pout"][ping][:rows].contiguous(), dim=-1)
-            stream = last.moe._column_split_tail(bufs["lat_p"][ping][:rows], bufs["sh"][ping][:rows].clone(), prefix,
-                                                 cols=cols)
+            sh = bufs["sh"][ping][:rows]
+            if check:  # the gathered-prefix tail
+                full = tensor_model_parallel_all_gather(bufs["pout"][ping][:rows].contiguous(), dim=-1)
+                ref = last.moe._column_split_tail(bufs["lat_p"][ping][:rows].clone(), sh.clone(), full, cols=cols)
+            sh[:, cols] += bufs["pout"][ping][:rows]
+            stream = last.moe._column_split_tail(bufs["lat_p"][ping][:rows], sh, None, cols=cols)
+            if check:
+                _say(f"exit check layer {run[-1]} rows {rows}: stream rel "
+                     f"{((stream.float() - ref.float()).norm() / ref.float().norm()).item():.2e}")
             hidden = set_written(stream, fb)
             if run[-1] in captures:
                 aux.append(m._dspark_capture_stream(run[-1], hidden, fb))
