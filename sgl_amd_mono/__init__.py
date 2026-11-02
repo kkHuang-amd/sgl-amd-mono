@@ -9,6 +9,8 @@ their forwards (``<model>/spec.py``, ``<model>/draft.py``) and its kernels per I
 entry point in ``pyproject.toml``), which registers each spec.
 """
 
+import os
+
 __version__ = "0.1.0.dev0"
 
 # the backend name every spec registers under
@@ -54,3 +56,11 @@ def register_specs() -> None:
         register(
             backend=BACKEND, architecture=architecture, path=path, model_type=model_type
         )
+
+    # SGLANG_AMD_MONO_ROCM_LLVM=<llvm prefix, e.g. /opt/rocm/llvm>: compile this
+    # package's kernels with that LLVM instead of FlyDSL's bundled one (common/rocm_codegen.py)
+    llvm_dir = os.environ.get("SGLANG_AMD_MONO_ROCM_LLVM")
+    if llvm_dir:
+        from sgl_amd_mono.common import rocm_codegen
+
+        rocm_codegen.install(llvm_dir)
