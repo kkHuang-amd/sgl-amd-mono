@@ -18,7 +18,6 @@ declines K1 and runs SGLang's attention before the layer launch.
 
 from __future__ import annotations
 
-import os
 
 import msgspec
 
@@ -63,25 +62,14 @@ class _K31Built(k3._Built):
         self._shim = k3._LanguageModelShim(self)
 
     def _backbone(self, input_ids, forward_batch, input_embeds):
-        seen = self.__dict__.setdefault("_seen_rows", set())
-        if self._plan.key.rows not in seen:
-            seen.add(self._plan.key.rows)
-            wide._say(f"routed: {self._plan.key}")
         if self._plan.key.rows > wide.NARROW:
-            if not self.__dict__.get("_said_wide"):
-                self._said_wide = True
-                wide._say(f"wide backbone: rows {self._plan.key.rows}")
             try:
-                out = self._wide.backbone(self, input_ids, forward_batch, input_embeds)
+                return self._wide.backbone(self, input_ids, forward_batch, input_embeds)
             except BaseException as e:  # surface it: the caller's handling must not hide a wide-path failure
                 import traceback
 
                 wide._say(f"wide backbone raised {type(e).__name__}: {e}\n{traceback.format_exc()[-2000:]}")
                 raise
-            if not self.__dict__.get("_said_wide_done"):
-                self._said_wide_done = True
-                wide._say("wide backbone returned")
-            return out
         return super()._backbone(input_ids, forward_batch, input_embeds)
 
 
@@ -98,8 +86,7 @@ def _build(model, hf_config, ctx):
         p = get_parallel()
         device = k3._backbone(model).layers[0].input_layernorm.weight.device
         w = wide.Wide(model, p.tp_rank, p.tp_group.cpu_group, device)
-        buckets = os.environ.get("SGLANG_AMD_MONO_K31_WIDE_BUCKETS")
-        w.warmup(buckets=tuple(int(x) for x in buckets.split(",")) if buckets else None)
+        w.warmup(buckets=wide.buckets())
         built = _K31Built(built, w)
     return built
 

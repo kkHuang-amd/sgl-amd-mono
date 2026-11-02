@@ -42,8 +42,15 @@ def enabled() -> bool:
     return os.environ.get("SGLANG_AMD_MONO_K31_WIDE") == "1"
 
 
+def buckets() -> tuple:
+    env = os.environ.get("SGLANG_AMD_MONO_K31_WIDE_BUCKETS")
+    return tuple(sorted(int(x) for x in env.split(","))) if env else BUCKETS
+
+
 def wide_widths(tokens: int = 8, max_reqs: int = 48) -> tuple:
-    return tuple(tokens * r for r in range(2, max_reqs + 1))
+    # only widths a warmed bucket holds: a graph capture must not meet a cold one
+    top = min(max_reqs, buckets()[-1] // tokens)
+    return tuple(tokens * r for r in range(2, top + 1))
 
 
 def _say(msg):
@@ -112,6 +119,8 @@ class Wide:
         self.slots = {i: n for n, i in enumerate(idx)}  # a launch's slot in the step
         caps = set(bb.dspark_layers_to_capture or ())
         self.peers, self.bufs, self.half = {}, {}, {}
+        self.buckets = buckets()
+        self.tabs = {}  # (bucket, layer) -> KDA table: every pointer in it is fixed once built
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
         # long enough for a capture variant's first compile on one rank while the
         # others already wait (every other variant is compiled by warmup())
@@ -169,7 +178,9 @@ class Wide:
             z(b, LAT)], sh=[z(b, H), z(b, H)], ids=z(b, 16, dt=torch.int32), w=z(b, 16, dt=torch.float32),
             logits=z(b, E, dt=torch.float32), cap=z(b, H), core=z(b, k1.PROJ), ip_buf=z(b, k1.NPROJ),
             acc_u=z(b, SL), acc_o=z(b * H), cnt=torch.zeros(lay.counters(b, cfg, NF), dtype=torch.int32, device=dev),
-            scratch=torch.zeros(scratch, dtype=torch.uint8, device=dev))
+            scratch=torch.zeros(scratch, dtype=torch.uint8, device=dev),
+            st_idx=torch.full((b // L, L), -1, dtype=torch.int32, device=dev),
+            num_acc=torch.ones(b // L, dtype=torch.int32, device=dev))
         self.bufs[b] = bufs
         _say(f"bucket {b}: peer {need / 1e6:.1f} MB, scratch {scratch / 1e6:.1f} MB")
         return bufs
@@ -233,8 +244,9 @@ class Wide:
         _say(f"warmup: {n} launches compiled and run in {time.time() - t0:.0f} s")
 
     # ------------------------------------------------------------ KDA state
-    def _kda_step(self, fb, R, L, b):
-        """The step's KDA state (K1's prepare, for R requests)."""
+    def _kda_step(self, fb, R, L, bufs):
+        """The step's KDA state (K1's prepare, for R requests). Device work only:
+        a graph replays it."""
         from sglang.srt.layers.attention.linear.utils import select_verify_intermediate_state_indices
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
@@ -250,19 +262,25 @@ class Wide:
         slots = meta.mamba_cache_indices[:R]
         vrows = select_verify_intermediate_state_indices(backend.verify_intermediate_state_indices,
                                                          fb.req_pool_indices, slots >= 0, pool.size)[:R]
-        st_idx = torch.full((b // L, L), -1, dtype=torch.int32, device=self.device)
+        st_idx = bufs["st_idx"]
+        st_idx.fill_(-1)
         st_idx[:R] = slots.to(torch.int32).view(R, 1)
-        return dict(cache=cache, slots=slots.long(), vrows=vrows.long(), st_idx=st_idx,
-                    num_acc=torch.ones(b // L, dtype=torch.int32, device=self.device))
+        return dict(cache=cache, slots=slots.long(), vrows=vrows.long(), st_idx=st_idx, num_acc=bufs["num_acc"])
 
-    def _kda_table(self, pk, ks, core):
+    def _kda_table(self, pk, ks, b, core):
         from sgl_amd_mono.kimi_k31.gfx950 import pre_attn as pa
 
         c, i = ks["cache"], pk.mamba_idx
         self.stage[ks["slots"], :, :3] = c.conv[0][i][ks["slots"]].mT
-        ring = (c.replayssm_rawk[i], c.replayssm_rawv[i], c.replayssm_g[i], c.replayssm_beta[i])
-        return pa.kda_table(self.device, **pk.kda_w, conv_state=self.stage, rstate=c.temporal[i],
-                            st_idx=ks["st_idx"], num_acc=ks["num_acc"], core_out=core, ring=ring)
+        tab = self.tabs.get((b, pk.i))
+        if tab is None:
+            # a host-to-device copy: the eager warmup forwards before a capture build it
+            assert not torch.cuda.is_current_stream_capturing(), f"KDA table ({b}, {pk.i}) first built in a capture"
+            ring = (c.replayssm_rawk[i], c.replayssm_rawv[i], c.replayssm_g[i], c.replayssm_beta[i])
+            tab = self.tabs[(b, pk.i)] = pa.kda_table(self.device, **pk.kda_w, conv_state=self.stage,
+                                                      rstate=c.temporal[i], st_idx=ks["st_idx"],
+                                                      num_acc=ks["num_acc"], core_out=core, ring=ring)
+        return tab
 
     def _kda_finish(self, pk, ks, L):
         """The conv inputs this step convolved, a window a token, to SGLang's accept
@@ -288,7 +306,7 @@ class Wide:
             self._said = True
             _say(f"first wide step: rows {rows}, L {L}")
         R = rows // L
-        b = next(x for x in BUCKETS if x >= rows)
+        b = next(x for x in self.buckets if x >= rows)
         captures = set(m.dspark_layers_to_capture or ())
         bufs = self._ensure(b, L, captures)
         cfg = bufs["cfg"]
@@ -297,8 +315,8 @@ class Wide:
                                        device=hidden.device)
         m.attn_bank.open(hidden, _cdiv(m.end_layer, m.config.attn_res_block_size), None)
         aux = AuxHiddenStateList()
-        ks = self._kda_step(fb, R, L, b)
-        self.epoch[0] += 1
+        ks = self._kda_step(fb, R, L, bufs)
+        self.epoch[0].add_(1)
         cols = self.cols
         i = m.start_layer
         ping = 0
@@ -324,7 +342,7 @@ class Wide:
                 v = self._variant(pk, b, L, captures)
                 assert v["t1"] == (n > 0)
                 assert res.num_valid_blocks == pk.nvb, (li, res.num_valid_blocks, pk.nvb)
-                tab = self._kda_table(pk, ks, bufs["core"])
+                tab = self._kda_table(pk, ks, b, bufs["core"])
                 cur = 1 - ping
                 self._build_launch(pk, b, L, v, cfg)(*self._launch_args(pk, b, bufs, tab, ping, self.slots[li]),
                                                      stream=torch.cuda.current_stream())
