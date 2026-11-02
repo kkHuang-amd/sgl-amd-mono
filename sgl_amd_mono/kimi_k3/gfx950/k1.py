@@ -41,7 +41,7 @@ from typing import Any, Optional
 import msgspec
 import torch
 
-from sgl_amd_mono.kimi_k3 import MAX_ROWS
+from sgl_amd_mono.kimi_k3 import MAX_BLOCKS, MAX_ROWS
 from sgl_amd_mono.kimi_k3.gfx950.stages.dims import HIDDEN
 
 logger = logging.getLogger(__name__)
@@ -243,14 +243,19 @@ def build_batch(packed_layers, device) -> Optional[K1Batch]:
 
 
 def scratch_bytes(rows: int) -> int:
-    """What one K1 launch needs, for the runner's shared scratch."""
+    """What one K1 launch needs, for the runner's shared scratch.
+
+    The layout grows with the layer's bank depth, so it is sized for the
+    deepest layer a launch is built for: a deeper layer's tail would land in
+    whatever the allocator placed after the scratch.
+    """
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda
 
     return kda.scratch_bytes(
         kda.KdaPreBuild(
             tokens=rows,
             qlen=rows,
-            nblocks=1,
+            nblocks=MAX_BLOCKS,
             delta=False,
             state_len=rows + kda.CONV_W - 1,
         )
@@ -289,6 +294,11 @@ def warmup(runner, packed: K1Layer, prefix, blocks) -> None:
     """
     from sgl_amd_mono.kimi_k3.gfx950.attention import kda
 
+    need = kda.scratch_bytes(packed.key)
+    assert need <= runner.scratch.numel(), (
+        f"K1 layer {packed.i} needs {need} B of scratch, the runner has "
+        f"{runner.scratch.numel()}"
+    )
     rows, device = packed.key.qlen, runner.device
     ring, slots = None, rows
     if packed.key.ring:
