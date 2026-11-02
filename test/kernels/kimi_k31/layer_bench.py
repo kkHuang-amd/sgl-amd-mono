@@ -19,7 +19,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from chain_bench import EPS, attn_res_ref
 from gemm_coll_bench import graph_us
-from pre_attn_bench import kda_ref
+from pre_attn_bench import kda_ref, win_bufs, win_ref
 
 TP = 8
 SETS = 3
@@ -117,9 +117,10 @@ def run(args, m, rank, dev, cpu):
     ring = (torch.zeros(m, k1.NH, 16, k1.HD, dtype=BF, device=dev), torch.zeros(m, k1.NH, 16, k1.HD, dtype=BF, device=dev),
             torch.zeros(m, k1.NH, 16, k1.HD, device=dev), torch.zeros(m, k1.NH, 16, device=dev))
     core = torch.zeros(nl, m, k1.PROJ, dtype=BF, device=dev)
+    conv_win, win_row = win_bufs(nl, r_n, L, k1, dev)
     tabs = torch.stack([pa.kda_table(dev, w_fb=w_fb, conv_w=conv_w, conv_state=conv[i], a_log=a_log, dt_bias=dt_bias,
                                      on_w=on_w, rstate=rstate, st_idx=st_idx, num_acc=num_acc, core_out=core[i],
-                                     ring=ring) for i in range(nl)])
+                                     conv_win=conv_win[i], win_row=win_row, ring=ring) for i in range(nl)])
     sc, s0 = st_idx[:, 0].tolist(), [int(st_idx[r, int(num_acc[r]) - 1]) for r in range(r_n)]
     ai = (num_acc - 1).tolist()
 
@@ -163,6 +164,7 @@ def run(args, m, rank, dev, cpu):
         sets.append(dict(lat_p=lat_p, sh_p=sh_p, prefix=prefix[..., cols].contiguous(),
                          bank=bk.view(nl, m, nbk, TP, sl)[:, :, :, rank].contiguous(),
                          ref=dict(mid=mid[..., cols], h=h[..., cols], core=cr, latent=latent, sh=shp,
+                                  win=torch.stack([win_ref(ip[i], conv0, sc, ai, k1, L) for i in range(nl)]),
                                   cap=mixed_ref(mid, bk, nva, ln["sa"], wp["a"])),
                          ids=ids.sort(-1).values, wts=wts.gather(-1, ids.sort(-1).indices)))
     cur = {k: sets[0][k].clone() for k in ("lat_p", "sh_p", "prefix", "bank")}
@@ -198,7 +200,7 @@ def run(args, m, rank, dev, cpu):
         one(i)
     torch.cuda.synchronize()
     graph, us = graph_us(one, nl)
-    worst = dict(mid=0.0, h=0.0, core=0.0, latent=0.0, sh=0.0, w=0.0, w_own=0.0, cap=0.0)
+    worst = dict(mid=0.0, h=0.0, core=0.0, latent=0.0, sh=0.0, w=0.0, w_own=0.0, cap=0.0, win=0.0)
     id_bad, id_rows, own_bad = 0, 0, 0
     for r in range(max(args.reps_check, SETS)):
         s = sets[r % SETS]
@@ -208,6 +210,8 @@ def run(args, m, rank, dev, cpu):
         graph.replay()
         for k, got in (("mid", mid), ("h", pout), ("core", core), ("latent", lat_out), ("sh", sh_out)):
             worst[k] = max(worst[k], rel(got, s["ref"][k]))
+        worst["win"] = max(worst["win"], rel(conv_win[:, win_row.long()], s["ref"]["win"]),
+                           float(conv_win[:, -1].count_nonzero().item() > 0) * 9.0)  # the unused row
         if cap:
             worst["cap"] = max(worst["cap"], rel(cap_view, s["ref"]["cap"]))
             others = torch.cat([aux[..., : CAP_SLOT * H], aux[..., (CAP_SLOT + 1) * H :]], dim=-1)
@@ -247,7 +251,7 @@ def run(args, m, rank, dev, cpu):
     torch.cuda.synchronize()
 
     stats = torch.tensor([worst["mid"], worst["h"], worst["core"], worst["latent"], worst["sh"], worst["w"],
-                          id_bad / max(id_rows, 1), us, float(own_bad), worst["w_own"], worst["cap"]], device=dev)
+                          id_bad / max(id_rows, 1), us, float(own_bad), worst["w_own"], worst["cap"], worst["win"]], device=dev)
     every = [torch.empty_like(stats) for _ in range(TP)]
     dist.all_gather(every, stats)
     if rank == 0:
@@ -255,9 +259,10 @@ def run(args, m, rank, dev, cpu):
         # end to end a top-16 flips where the 16th / 17th keys are closer than the
         # upstream rounding; the routing itself must match on its own logits exactly
         ok = (e[0] < 1e-2 and e[1] < 1e-2 and e[2] < 3e-2 and e[3] < 3e-2 and e[4] < 3e-2 and e[5] < 1e-3
-              and e[8] == 0 and e[9] < 1e-5 and e[10] < 1e-2)
+              and e[8] == 0 and e[9] < 1e-5 and e[10] < 1e-2
+              and e[11] < 1e-2)
         print(f"layer m {m:3d} L {L} nvb a{nva}{'w' if wa else ''} m{nvm}  rel_l2 mid {e[0]:.2e} h {e[1]:.2e} core "
-              f"{e[2]:.2e} latent {e[3]:.2e} shared {e[4]:.2e} topk_w {e[5]:.1e} topk rows differing {e[6]:.2%} "
+              f"{e[2]:.2e} windows {e[11]:.2e} latent {e[3]:.2e} shared {e[4]:.2e} topk_w {e[5]:.1e} topk rows differing {e[6]:.2%} "
               f"(own logits: {int(e[8])} rows, w {e[9]:.1e}){f' capture {e[10]:.2e}' if cap else ''}  "
               f"us: layer {e[7]:6.1f}  {'PASS' if ok else 'FAIL'}", flush=True)
     torch.cuda.synchronize()

@@ -10,10 +10,12 @@ are R x num_draft with a configured width, at that layer:
   its bank and the prefix it returns are this launch's inputs (``t1=False``:
   the MoE tail of the previous layer is not part of the check); the launch runs
   right there, before SGLang's attention touches the KDA state, on copies of the
-  ring rows and its own conv staging, so SGLang's state is never written;
+  ring rows, SGLang's conv state (read only) and its own window rows, so SGLang's
+  state is never written;
 * the references, as SGLang computes them: the seam's normed x, o_proj's input
   (core_out), the MLP seam's normed x' and prefix, top-k, latent down and the
-  shared experts' output (the hooks that fire on this path).
+  shared experts' output (the hooks that fire on this path), and after the layer
+  the verify conv windows SGLang's attention wrote.
 
 After the layer, rank 0 prints the worst rel L2 over the ranks per hand-off.
 """
@@ -191,13 +193,17 @@ class WideCheck:
         self.layer.register_forward_pre_hook(keep_batch, with_kwargs=True)
 
     # ---------------------------------------------------------------- launch
-    def _state(self, rows):
-        """The step's KDA state, as K1's prepare reads it, for every request."""
+    @staticmethod
+    def _backend():
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
+        return get_attn_backend().linear_attn_backend
+
+    def _state(self, rows):
+        """The step's KDA state, as K1's prepare reads it, for every request."""
         from sgl_amd_mono.kimi_k3.gfx950.attention import kda as k1
 
-        backend = get_attn_backend().linear_attn_backend
+        backend = self._backend()
         pool = backend.req_to_token_pool
         meta = backend.forward_metadata
         cache = pool.mamba_pool.mamba_cache
@@ -213,7 +219,8 @@ class WideCheck:
         spec = getattr(self.fb, "spec_info", None)
         rows = mid.shape[0]
         L = getattr(spec, "draft_token_num", 0) if spec is not None else 0
-        width = next((w for w in sorted(CFGS) if w >= rows), None)
+        # a bucket's config holds exactly its rows (serving pads to it): fewer rows give a wrong latent / fault
+        width = rows if rows in CFGS else None
         if not L or rows % L or width is None or rows < 16:
             self.ours = None
             return
@@ -241,18 +248,17 @@ class WideCheck:
             self.epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
         self.epoch[0] += 1
         cols = slice(self.rank * sl, (self.rank + 1) * sl)
-        # KDA state: conv staging a pool slot, ring copies, the committed state read only
-        state_len = L + k1.CONV_W - 1
+        # KDA state: the conv state and the committed state read only, ring copies, own window rows
         conv_all = cache.conv[0][idx]  # [slots, CONV_W - 1, C]
-        stage = torch.zeros(conv_all.shape[0], 3 * k1.PROJ, state_len, dtype=bf, device=dev)
-        stage[slots, :, : k1.CONV_W - 1] = conv_all[slots].mT
+        win = torch.zeros(r_n, L, k1.CONV_W - 1, conv_all.shape[-1], dtype=bf, device=dev)
+        win_row = torch.arange(r_n, dtype=torch.int32, device=dev)
         ring = tuple(t[idx].clone() for t in (cache.replayssm_rawk, cache.replayssm_rawv, cache.replayssm_g,
                                               cache.replayssm_beta))
         st_idx = slots.to(torch.int32).view(r_n, 1).expand(r_n, L).contiguous()
         num_acc = torch.ones(r_n, dtype=torch.int32, device=dev)
         core = torch.zeros(rows, k1.PROJ, dtype=bf, device=dev)
-        tab = self.pa.kda_table(dev, **self.kda_w, conv_state=stage, rstate=cache.temporal[idx], st_idx=st_idx,
-                                num_acc=num_acc, core_out=core, ring=ring)
+        tab = self.pa.kda_table(dev, **self.kda_w, conv_state=conv_all.mT, rstate=cache.temporal[idx], st_idx=st_idx,
+                                num_acc=num_acc, core_out=core, conv_win=win, win_row=win_row, ring=ring)
         nbk = 8
         bank_s = torch.zeros(rows, nbk, sl, dtype=bf, device=dev)
         if bank is not None:
@@ -291,7 +297,14 @@ class WideCheck:
             return b[at : at + rows * n * 2].view(bf).view(rows, n).clone()
         at = par * half + offs["rgat"]
         logits = b[at : at + rows * E * 4].view(torch.float32).view(rows, E).clone()
+        from sglang.srt.layers.attention.linear.utils import select_verify_intermediate_state_indices
+
+        backend = self._backend()
+        vrows = select_verify_intermediate_state_indices(backend.verify_intermediate_state_indices,
+                                                         self.fb.req_pool_indices, slots >= 0,
+                                                         backend.req_to_token_pool.size)[:r_n].long()
         self.ours = dict(x=region("ag", H), xm=region("o_ag", H), core=core, h=o["pout"], cols=cols, logits=logits,
+                         win=win, win_at=(cache.intermediate_conv_window[0][idx], vrows, slots >= 0),
                          t1=t1, mid=mid_s,
                          lat=o["lat"], ids=o["ids"], w=o["w"], sh=o["sh"], rows=rows, R=r_n, L=L)
 
@@ -308,6 +321,8 @@ class WideCheck:
              "h": _rel(ours["h"], ref["h"][:, cols]) if "h" in ref else -1.0,
              "lat": _rel(ours["lat"], ref["latent"]) if "latent" in ref else -1.0,
              "sh": _rel(ours["sh"], ref["shared"]) if "shared" in ref else -1.0}
+        sg_win, vrows, live = ours["win_at"]
+        e["win"] = _rel(ours["win"][live], sg_win[vrows[live]]) if bool(live.any()) else -1.0
         if "topk" in ref:
             tk = ref["topk"]
             ids = getattr(tk, "topk_ids", None)
@@ -343,12 +358,12 @@ class WideCheck:
                     if same.any():
                         e["topk_w"] = _rel(ours["w"].gather(-1, oa)[same], wts[: ours["rows"]].float().gather(-1, ob)[same])
         t = torch.tensor([e.get(k, -1.0) for k in ("x", "core", "xm", "h", "lat", "sh", "topk_rows_diff", "topk_w",
-                                                  "logits", "rule_vs_sglang", "ours_vs_rule", "mid")], device=self.device)
+                                                  "logits", "rule_vs_sglang", "ours_vs_rule", "mid", "win")], device=self.device)
         dist.all_reduce(t, op=dist.ReduceOp.MAX)
         v = t.tolist()
         _say(f"layer {self.i} rows {ours['rows']} (R {ours['R']} x {ours['L']}) nvb {ref['nvb']} t1 {int(ours['t1'])}: "
              f"rel L2 mid (T1) {v[11]:.2e} x {v[0]:.2e} "
-             f"core {v[1]:.2e} x' {v[2]:.2e} h {v[3]:.2e} latent {v[4]:.2e} shared {v[5]:.2e} topk rows "
+             f"core {v[1]:.2e} windows {v[12]:.2e} x' {v[2]:.2e} h {v[3]:.2e} latent {v[4]:.2e} shared {v[5]:.2e} topk rows "
              f"differing {v[6]:.1%} (w {v[7]:.1e}; logits {v[8]:.1e}, rule on SGLang's logits vs SGLang {v[9]:.1%}, "
              f"ours vs rule on our logits {v[10]:.1%})   (-1 = hook did not fire); fired: {sorted(k for k in ref)}")
         self.ref = {}

@@ -58,34 +58,53 @@ def fold_up(w_up, w_n, rank):
 
 # the KDA stage's arguments, an int64 table (``kda_table``): pointers, then strides
 KDA_PTRS = ("w_fb", "conv_w", "conv_st", "a_log", "dt_bias", "on_w", "rstate", "st_idx", "num_acc", "ring_k",
-            "ring_v", "ring_g", "ring_b", "core_out")
-KDA_INTS = ("cs_seq", "cs_dim", "cs_tok", "rs_seq", "st_stride", "rk_seq", "rv_seq", "rg_seq", "rb_seq", "ring_len")
+            "ring_v", "ring_g", "ring_b", "core_out", "conv_win", "win_row")
+KDA_INTS = ("cs_seq", "cs_dim", "cs_tok", "rs_seq", "st_stride", "rk_seq", "rv_seq", "rg_seq", "rb_seq", "ring_len",
+            "cw_seq", "cw_tok", "cw_q")
 
 
 def kda_table(device, *, w_fb, conv_w, conv_state, a_log, dt_bias, on_w, rstate, st_idx, num_acc, core_out,
-              ring=None):
+              conv_win, win_row, ring=None):
     """The KDA stage's arguments as ``kimi_k3``'s ``kda_pre`` takes them (same
-    layouts and strides), packed for the launch's ``kda_tab``."""
+    layouts and strides), packed for the launch's ``kda_tab``.
+
+    ``conv_state`` [slot, channel, token] by its strides (SGLang's conv cache
+    [slot, CONV_W - 1, C] is its ``.mT``), read only. ``conv_win`` [row, L,
+    CONV_W - 1, C] (SGLang's ``intermediate_conv_window`` of the layer; channels
+    contiguous) gets request r's verify windows at row ``win_row[r]`` (int32,
+    < 0: none)."""
     import torch
 
+    assert conv_win.dim() == 4 and conv_win.stride(3) == 1, (tuple(conv_win.shape), conv_win.stride())
+    assert win_row.dtype == torch.int32 and win_row.is_contiguous()
     rk, rv, rg, rb = ring if ring is not None else (None,) * 4
     ptrs = dict(w_fb=w_fb, conv_w=conv_w, conv_st=conv_state, a_log=a_log, dt_bias=dt_bias, on_w=on_w,
                 rstate=rstate, st_idx=st_idx, num_acc=num_acc, ring_k=rk, ring_v=rv, ring_g=rg, ring_b=rb,
-                core_out=core_out)
+                core_out=core_out, conv_win=conv_win, win_row=win_row)
     ints = dict(cs_seq=conv_state.stride(0), cs_dim=conv_state.stride(1), cs_tok=conv_state.stride(2),
                 rs_seq=rstate.stride(0), st_stride=st_idx.stride(0),
                 rk_seq=rk.stride(0) if rk is not None else 0, rv_seq=rv.stride(0) if rv is not None else 0,
                 rg_seq=rg.stride(0) if rg is not None else 0, rb_seq=rb.stride(0) if rb is not None else 0,
-                ring_len=rk.shape[2] if rk is not None else 0)
+                ring_len=rk.shape[2] if rk is not None else 0,
+                cw_seq=conv_win.stride(0), cw_tok=conv_win.stride(1), cw_q=conv_win.stride(2))
     vals = [0 if ptrs[k] is None else ptrs[k].data_ptr() for k in KDA_PTRS] + [ints[k] for k in KDA_INTS]
     return torch.tensor(vals, dtype=torch.int64, device=device)
 
 
+class _KdaArgs:
+    """The table's entries, each loaded where it is read (none held across the stage)."""
+
+    def __init__(self, tab):
+        self.tab = tab
+
+    def __getitem__(self, k):
+        if k in KDA_PTRS:
+            return load_ptr64(self.tab, KDA_PTRS.index(k))
+        return ld_i32(self.tab, 2 * (len(KDA_PTRS) + KDA_INTS.index(k)))
+
+
 def _kda_args(tab):
-    a = {k: load_ptr64(tab, i) for i, k in enumerate(KDA_PTRS)}
-    for i, k in enumerate(KDA_INTS):
-        a[k] = ld_i32(tab, 2 * (len(KDA_PTRS) + i))
-    return a
+    return _KdaArgs(tab)
 
 
 def plan(m, gu, gi, nin, nvb, kda=None, wide=True):

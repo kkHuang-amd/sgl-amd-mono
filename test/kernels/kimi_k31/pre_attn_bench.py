@@ -58,6 +58,22 @@ def kda_ref(proj, conv_w, conv_in, slot_c, rstate, slot0, acc_idx, w_fb, dt_bias
     return out.reshape(r_n * L, pw).to(BF)
 
 
+def win_ref(proj, conv_in, slot_c, acc_idx, k1, L):
+    """The verify conv windows [R, L, CONV_W - 1, 3 PROJ] the KDA stage writes: token j's
+    window is the CONV_W - 1 conv inputs up to and including token j."""
+    r_n = proj.shape[0] // L
+    win = torch.stack([conv_in[slot_c[r], :, acc_idx[r] : acc_idx[r] + k1.CONV_W - 1] for r in range(r_n)])
+    seq = torch.cat([win.transpose(1, 2), proj.view(r_n, L, -1)[..., : 3 * k1.PROJ]], dim=1)
+    return torch.stack([seq[:, j + 1 : j + k1.CONV_W] for j in range(L)], dim=1)
+
+
+def win_bufs(nl, r_n, L, k1, dev):
+    """Window rows of nl launches: request r at row r_n - 1 - r, row r_n never written."""
+    conv_win = torch.zeros(nl, r_n + 1, L, k1.CONV_W - 1, 3 * k1.PROJ, dtype=BF, device=dev)
+    win_row = torch.arange(r_n - 1, -1, -1, dtype=torch.int32, device=dev)
+    return conv_win, win_row
+
+
 def run(args, spec, mode, rank, dev, cpu):
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
@@ -148,9 +164,11 @@ def run(args, spec, mode, rank, dev, cpu):
                 torch.zeros(m, k1.NH, ring_len, k1.HD, device=dev),
                 torch.zeros(m, k1.NH, ring_len, device=dev))
         core = torch.zeros(nl, m, k1.PROJ, dtype=BF, device=dev)
+        conv_win, win_row = win_bufs(nl, r_n, L, k1, dev)
         tabs = torch.stack([pa.kda_table(dev, w_fb=w_fb, conv_w=conv_w, conv_state=conv[i], a_log=a_log,
                                          dt_bias=dt_bias, on_w=on_w, rstate=rstate, st_idx=st_idx, num_acc=num_acc,
-                                         core_out=core[i], ring=ring) for i in range(nl)])
+                                         core_out=core[i], conv_win=conv_win[i], win_row=win_row, ring=ring)
+                            for i in range(nl)])
         sc, s0 = st_idx[:, 0].tolist(), [int(st_idx[r, int(num_acc[r]) - 1]) for r in range(r_n)]
         ai = (num_acc - 1).tolist()
         for s in sets:
@@ -179,7 +197,7 @@ def run(args, spec, mode, rank, dev, cpu):
         one(i)
     torch.cuda.synchronize()
     graph, us_fused = graph_us(one, nl)
-    worst_p, worst_o, worst_k, bank_ok = 0.0, 0.0, 0.0, True
+    worst_p, worst_o, worst_k, bank_ok, win_bad = 0.0, 0.0, 0.0, True, 0
     for r in range(max(args.reps_check, SETS)):
         s = sets[r % SETS]
         for k in cur:
@@ -197,6 +215,9 @@ def run(args, spec, mode, rank, dev, cpu):
             want = kda_ref(own, conv_w, conv0, sc, rstate, s0, ai, w_fb, dt_bias, a_log, on_w, k1, L, EPS_N).float()
             ek = ((core[-1].float() - want).norm() / want.norm()).item()
             worst_k = max(worst_k, ek if ek == ek else float("inf"))
+            # the windows: copies of the conv inputs, exact; the unused row untouched
+            got = conv_win[-1][win_row.long()]
+            win_bad += int((got != win_ref(own, conv0, sc, ai, k1, L)).sum()) + int(conv_win[:, -1].count_nonzero())
         else:
             eo = ((result() - s["ref_out"]).norm() / s["ref_out"].norm()).item()
         worst_p = max(worst_p, ep if ep == ep else float("inf"))
@@ -228,7 +249,7 @@ def run(args, spec, mode, rank, dev, cpu):
         torch.cuda.synchronize()
         _, us_std = graph_us(std, nl)
 
-    stats = torch.tensor([worst_p, worst_o, float(bank_ok), us_fused, us_std, worst_k], device=dev)
+    stats = torch.tensor([worst_p, worst_o, float(bank_ok), us_fused, us_std, worst_k, float(win_bad)], device=dev)
     every = [torch.empty_like(stats) for _ in range(TP)]
     dist.all_gather(every, stats)
     if rank == 0:
@@ -236,9 +257,9 @@ def run(args, spec, mode, rank, dev, cpu):
         mx = e.max(0).values.tolist()
         # end to end, KDA (l2norm, gates, recurrence) amplifies the in_proj rounding:
         # its own check is against the rows it read (mx[5])
-        ok = mx[0] < 1e-2 and mx[1] < (3e-2 if L else 1e-2) and e[:, 2].min().item() == 1.0 and mx[5] < 5e-3
+        ok = mx[0] < 1e-2 and mx[1] < (3e-2 if L else 1e-2) and e[:, 2].min().item() == 1.0 and mx[5] < 5e-3 and mx[6] == 0
         print(f"nvb {nvb}{'w' if write else ''} m {m:3d} up t{gu.bm}x{gu.bn} ks{gu.ks} in t{gi.bm}x{gi.bn} ks{gi.ks} "
-              f"{mode:5s}{' kda' + str(L) if L else ''}  rel_l2 prefix {mx[0]:.2e} {'core_out' if L else 'in_proj'} {mx[1]:.2e}{f' (kda alone {mx[5]:.2e})' if L else ''}  us: pre_attn {mx[3]:6.1f} | standard "
+              f"{mode:5s}{' kda' + str(L) if L else ''}  rel_l2 prefix {mx[0]:.2e} {'core_out' if L else 'in_proj'} {mx[1]:.2e}{f' (kda alone {mx[5]:.2e}, windows off {int(mx[6])})' if L else ''}  us: pre_attn {mx[3]:6.1f} | standard "
               f"{mx[4]:6.1f}  {'PASS' if ok else 'FAIL'}", flush=True)
     # every rank unmaps the peers' buffers before any frees its own (a freed
     # buffer's address can come back for the next case's, still imported elsewhere)

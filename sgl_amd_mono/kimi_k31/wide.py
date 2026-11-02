@@ -9,10 +9,10 @@ DSA layers), which go launch by launch:
     enter    the stream after the previous (standard) layer, folded to the full
              prefix, and the bank -> this rank's column slices
     layer i  launch i (MoE tail of i - 1 unless it starts the run; restart on a
-             block-write layer; DSpark capture of i - 1 when asked) -> the KDA
-             conv windows handed to SGLang's accept (K1's finish, a request each),
-             a written bank row gathered into SGLang's bank -> SGLang's routed
-             experts on the launch's latent and router logits
+             block-write layer; DSpark capture of i - 1 when asked; reads the conv
+             state from SGLang's cache by slot and writes the verify windows for
+             SGLang's accept) -> a written bank row gathered into SGLang's bank
+             -> SGLang's routed experts on the launch's latent and router logits
     leave    the last layer's MoE tail on SGLang (``_column_split_tail``) from the
              gathered prefix -> the stream the next standard layer reads
 
@@ -129,7 +129,7 @@ class Wide:
         self.epoch[guard.GUARD_DEADLINE] = lo - (1 << 32) if lo >= 1 << 31 else lo
         self.epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
         self.cols = slice(rank * SL, (rank + 1) * SL)
-        self.stage = None
+        self.kda_ready = False
         _say(f"{len(idx)} covered layers ({idx[0]} .. {idx[-1]}), captures {sorted(caps)}, "
              f"block-write {[i for i in idx if self.layers[i].write]}")
 
@@ -180,7 +180,8 @@ class Wide:
             acc_u=z(b, SL), acc_o=z(b * H), cnt=torch.zeros(lay.counters(b, cfg, NF), dtype=torch.int32, device=dev),
             scratch=torch.zeros(scratch, dtype=torch.uint8, device=dev),
             st_idx=torch.full((b // L, L), -1, dtype=torch.int32, device=dev),
-            num_acc=torch.ones(b // L, dtype=torch.int32, device=dev))
+            num_acc=torch.ones(b // L, dtype=torch.int32, device=dev),
+            win_row=torch.full((b // L,), -1, dtype=torch.int32, device=dev))
         self.bufs[b] = bufs
         _say(f"bucket {b}: peer {need / 1e6:.1f} MB, scratch {scratch / 1e6:.1f} MB")
         return bufs
@@ -216,7 +217,8 @@ class Wide:
 
         t0 = time.time()
         dev, bf, f32 = self.device, torch.bfloat16, torch.float32
-        dummy = dict(conv_state=torch.zeros(1, 3 * k1.PROJ, L + 3, dtype=bf, device=dev),
+        dummy = dict(conv_state=torch.zeros(1, k1.CONV_W - 1, 3 * k1.PROJ, dtype=bf, device=dev).mT,
+                     conv_win=torch.zeros(1, L, k1.CONV_W - 1, 3 * k1.PROJ, dtype=bf, device=dev),
                      rstate=torch.zeros(1, k1.NH, k1.HD, k1.HD, dtype=f32, device=dev),
                      ring=(torch.zeros(1, k1.NH, 16, k1.HD, dtype=bf, device=dev),
                            torch.zeros(1, k1.NH, 16, k1.HD, dtype=bf, device=dev),
@@ -227,6 +229,7 @@ class Wide:
             bufs = self._ensure(b, L, set())
             st_idx = torch.full((b // L, L), -1, dtype=torch.int32, device=dev)
             num_acc = torch.ones(b // L, dtype=torch.int32, device=dev)
+            win_row = torch.full((b // L,), -1, dtype=torch.int32, device=dev)
             seen = set()
             for pk in self.layers.values():
                 v = self._variant(pk, b, L, set())
@@ -234,7 +237,8 @@ class Wide:
                 if key in seen:
                     continue
                 seen.add(key)
-                tab = pa.kda_table(dev, **pk.kda_w, **dummy, st_idx=st_idx, num_acc=num_acc, core_out=bufs["core"])
+                tab = pa.kda_table(dev, **pk.kda_w, **dummy, st_idx=st_idx, num_acc=num_acc, win_row=win_row,
+                                   core_out=bufs["core"])
                 self.epoch[0] += 1
                 self._build_launch(pk, b, L, v, bufs["cfg"])(*self._launch_args(pk, b, bufs, tab, 0,
                                                                                  self.slots[pk.i]),
@@ -254,42 +258,38 @@ class Wide:
         pool, meta = backend.req_to_token_pool, backend.forward_metadata
         cache = pool.mamba_pool.mamba_cache
         assert getattr(cache, "replayssm_rawv", None) is not None, "the wide launch runs on the ReplaySSM ring"
-        if self.stage is None:
+        if not self.kda_ready:
+            self.kda_ready = True
             for pk in self.layers.values():
                 pk.mamba_idx = pool.mamba2_layer_index(pk.layer.self_attn.attn.layer_id)
-            slots_n = cache.conv[0].shape[1]
-            self.stage = torch.zeros(slots_n, cache.conv[0].shape[-1], L + 3, dtype=torch.bfloat16, device=self.device)
         slots = meta.mamba_cache_indices[:R]
         vrows = select_verify_intermediate_state_indices(backend.verify_intermediate_state_indices,
                                                          fb.req_pool_indices, slots >= 0, pool.size)[:R]
-        st_idx = bufs["st_idx"]
-        st_idx.fill_(-1)
-        st_idx[:R] = slots.to(torch.int32).view(R, 1)
-        return dict(cache=cache, slots=slots.long(), vrows=vrows.long(), st_idx=st_idx, num_acc=bufs["num_acc"])
+        bufs["st_idx"].fill_(-1)
+        bufs["st_idx"][:R] = slots.to(torch.int32).view(R, 1)
+        bufs["win_row"].fill_(-1)
+        bufs["win_row"][:R] = vrows.to(torch.int32)
+        return dict(cache=cache)
 
-    def _kda_table(self, pk, ks, b, core):
+    def _kda_table(self, pk, ks, b, bufs):
+        """The launch reads the conv state from SGLang's cache by slot (``st_idx``)
+        and writes the verify windows at ``win_row`` (K1's ``finish`` for R requests)."""
         from sgl_amd_mono.kimi_k31.gfx950 import pre_attn as pa
 
-        c, i = ks["cache"], pk.mamba_idx
-        self.stage[ks["slots"], :, :3] = c.conv[0][i][ks["slots"]].mT
         tab = self.tabs.get((b, pk.i))
         if tab is None:
             # a host-to-device copy: the eager warmup forwards before a capture build it
             assert not torch.cuda.is_current_stream_capturing(), f"KDA table ({b}, {pk.i}) first built in a capture"
+            c, i = ks["cache"], pk.mamba_idx
+            conv, win = c.conv[0][i], c.intermediate_conv_window[0][i]
+            assert conv.shape[1:] == win.shape[2:] and conv.shape[1] == 3, (tuple(conv.shape), tuple(win.shape))
             ring = (c.replayssm_rawk[i], c.replayssm_rawv[i], c.replayssm_g[i], c.replayssm_beta[i])
-            tab = self.tabs[(b, pk.i)] = pa.kda_table(self.device, **pk.kda_w, conv_state=self.stage,
-                                                      rstate=c.temporal[i], st_idx=ks["st_idx"],
-                                                      num_acc=ks["num_acc"], core_out=core, ring=ring)
+            tab = self.tabs[(b, pk.i)] = pa.kda_table(self.device, **pk.kda_w, conv_state=conv.mT,
+                                                      rstate=c.temporal[i], st_idx=bufs["st_idx"],
+                                                      num_acc=bufs["num_acc"], core_out=bufs["core"],
+                                                      conv_win=win,
+                                                      win_row=bufs["win_row"], ring=ring)
         return tab
-
-    def _kda_finish(self, pk, ks, L):
-        """The conv inputs this step convolved, a window a token, to SGLang's accept
-        (K1's ``finish`` for R requests)."""
-        c, i, slots = ks["cache"], pk.mamba_idx, ks["slots"]
-        window = c.conv[0][i][slots].mT  # [R, C, 3]
-        seq = torch.cat([window, self.stage[slots][:, :, 3:]], dim=2)
-        windows = seq.unfold(2, 3, 1)[:, :, 1 : L + 1]  # [R, C, L, 3]
-        c.intermediate_conv_window[0][i, ks["vrows"]] = windows.permute(0, 2, 3, 1)
 
     # ------------------------------------------------------------ the step
     def backbone(self, built, input_ids, fb, input_embeds):
@@ -342,7 +342,7 @@ class Wide:
                 v = self._variant(pk, b, L, captures)
                 assert v["t1"] == (n > 0)
                 assert res.num_valid_blocks == pk.nvb, (li, res.num_valid_blocks, pk.nvb)
-                tab = self._kda_table(pk, ks, b, bufs["core"])
+                tab = self._kda_table(pk, ks, b, bufs)
                 cur = 1 - ping
                 self._build_launch(pk, b, L, v, cfg)(*self._launch_args(pk, b, bufs, tab, ping, self.slots[li]),
                                                      stream=torch.cuda.current_stream())
@@ -350,7 +350,6 @@ class Wide:
                     aux.append(bufs["cap"][:rows].clone())
                 if pk.write:
                     res.write(tensor_model_parallel_all_gather(bufs["bank"][:rows, pk.nvb].contiguous(), dim=-1))
-                self._kda_finish(pk, ks, L)
                 lat_p = bufs["lat_p"][cur]
                 pk.moe._forward_routed(bufs["lat"][:rows], bufs["logits"][:rows], bufs["lat"][:rows], lat_p[:rows])
                 ping = cur
