@@ -145,9 +145,7 @@ def _seam_row(c, row, m, sl, rb, ct, nvb, nbk, res_out, bank, cw, w_o, eps, pdon
         stamp(tl_on, tls, tid, 6)
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
-    for p in range_constexpr(TP):
-        if tid == p:
-            c["put"](c["agf_of"](p), rank * m + row, fx.Int32(1))
+    coll.put_each_peer(c, [("agf", rank * m + row, fx.Int32(1))])
 
 
 @flyc.jit

@@ -201,9 +201,7 @@ def _lred(c, row, m, shs):
                             row * SL + 8 * u + 4 * k, cache_modifier=CM_DEV)
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
-    for p in range_constexpr(TP):
-        if tid == p:
-            c["put"](c["lagf_of"](p), rank * m + row, fx.Int32(1))
+    coll.put_each_peer(c, [("lagf", rank * m + row, fx.Int32(1))])
 
 
 @flyc.jit
@@ -288,11 +286,8 @@ def _seam(c, row, m, rb, ct, nvb, nbk, prefix_out, bank, cw, w_in, eps, pdone, r
     attnres_row(c, row, m, SL, nvb, nbk, prefix_out, bank, cw, w_in, eps, eps, red, emit, write, 0, emit_mixed)
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
-    for p in range_constexpr(TP):
-        if tid == p:
-            c["put"](c["agf_of"](p), rank * m + row, fx.Int32(1))
-            if const_expr(capture):
-                c["put"](c["capf_of"](p), rank * m + row, fx.Int32(1))
+    coll.put_each_peer(c, [("agf", rank * m + row, fx.Int32(1))]
+                       + ([("capf", rank * m + row, fx.Int32(1))] if capture else []))
 
 
 @flyc.jit

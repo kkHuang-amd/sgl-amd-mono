@@ -34,8 +34,8 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
 from sgl_amd_mono.common import guard
-from sgl_amd_mono.common.ops import CM_SYS, bf2_f32, bf16_pair, clock, ld_i32, load_ptr64, peer_bases, rsrc, uniform
-from sgl_amd_mono.common.plan import BLOCKS, THREADS
+from sgl_amd_mono.common.ops import CM_SYS, bf2_f32, bf16_pair, clock, ld_i32, load_ptr64, rsrc, sfresh64, sload64, uniform
+from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES
 from sgl_amd_mono.common.sync import Mailbox, preg, shift
 from sgl_amd_mono.kimi_k3.gfx950.tag import step_tag
 
@@ -155,13 +155,25 @@ def tag_collective(c, kind, x, y, m, h):
 
 
 @flyc.jit
+def put_each_peer(c, puts):
+    """``puts``: [(region, i, v)]; lane 0 of wave p puts each to rank p's region (p < TP).
+
+    One wave-uniform peer address per wave: with ``if tid == p`` LLVM folds the p branches into a switch on tid
+    and merges the puts behind a per-lane address, a waterfall loop the bundled backend miscompiles.
+    """
+    assert WAVES >= TP
+    tid = c["tid"]
+    p = uniform(tid // 64)
+    if (p < TP) & (tid % 64 == 0):
+        for region, i, v in puts:
+            c["put"](c[f"{region}_of"](p), i, v)
+
+
 def _flag_signal(c, phase):
     """Drain this CTA's stores, then flag (phase, this rank, this CTA) on every rank."""
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
-    for p in range_constexpr(TP):
-        if c["tid"] == p:
-            c["put"](c["fl_of"](p), (phase * TP + c["rank"]) * BLOCKS + c["bid"], fx.Int32(1))
+    put_each_peer(c, [("fl", (phase * TP + c["rank"]) * BLOCKS + c["bid"], fx.Int32(1))])
 
 
 @flyc.jit
@@ -251,28 +263,50 @@ def region_context(peers, rank, epoch, slot, offs, half, tid, bid, launches=1, p
     e = uniform(ld_i32(epoch, 0))
     bit = (e * launches + slot) % 2 if parity == "launch" else e % 2
     par = fx.Int64(bit) * half
-    bases = peer_bases(peers, TP)
-    own = load_ptr64(peers, rank)
+
+    def base_of(p):
+        # read from the peers table where used (scalar load through an opaque copy of the table address):
+        # bases formed once at the entry stay live, or spilled, across the whole launch
+        return sload64(sfresh64(peers) + fx.Int64(p) * 8)
 
     def region(name):
         def of(p):
-            base = bases[p] if isinstance(p, int) else load_ptr64(peers, p)
+            base = base_of(p) if isinstance(p, int) else load_ptr64(peers, p)
             return shift(preg(base, offs[name], name), par)
 
         return of
 
-    c = {
+    c = _Context({
         "tid": tid,
         "bid": bid,
         "rank": rank,
         "put": mb.put,
         "put_words": mb.put_words,
         "poll": mb.poll,
-    }
+    })
     for name in offs:
         c[f"{name}_of"] = region(name)
-        c[f"{name}_own"] = shift(preg(own, offs[name], name), par)
+        c.lazy[f"{name}_own"] = lambda name=name: shift(preg(base_of(rank), offs[name], name), par)
     return c
+
+
+class _Context(dict):
+    """A region context whose ``<name>_own`` addresses are formed at each use (``lazy``), not at the entry."""
+
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.lazy = {}
+
+    def __getitem__(self, k):
+        if not dict.__contains__(self, k) and k in self.lazy:
+            return self.lazy[k]()
+        return super().__getitem__(k)
+
+    def __contains__(self, k):
+        return dict.__contains__(self, k) or k in self.lazy
+
+    def get(self, k, default=None):
+        return self[k] if k in self else default
 
 
 @flyc.jit

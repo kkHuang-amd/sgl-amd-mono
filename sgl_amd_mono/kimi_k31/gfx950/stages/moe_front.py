@@ -26,6 +26,7 @@ from flydsl.expr.typing import T
 from sgl_amd_mono.common.ops import CM_DEV, CM_SYS, bf2_f32, bf16_pair, hw_exp2, hw_rcp, rsrc, xshfl
 from sgl_amd_mono.common.plan import THREADS
 from sgl_amd_mono.kimi_k3.gfx950.attention.kda import ld_f32
+from sgl_amd_mono.kimi_k31.gfx950.stages import coll
 
 TP = 8
 E, E_R = 896, 112  # experts, a rank's
@@ -72,20 +73,18 @@ def finish_front(c, fbuf, sgu, m, r0, rb, n0, bn, band, t, nbf, smark, tnf):
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
     if n0 < S0:
-        for p in range_constexpr(TP):
-            if tid == p:
-                c["put"](c["fgf_of"](p), (rank * nbf + band) * gathered_tiles(bn) + t, fx.Int32(1))
+        coll.put_each_peer(c, [("fgf", (rank * nbf + band) * gathered_tiles(bn) + t, fx.Int32(1))])
     if (n0 + bn > S0) & (tid == 0):
         c["put"](smark, band * tnf + t, fx.Int32(1))
-
-
-def _sigmoid(x):
-    return hw_rcp(1.0 + hw_exp2(x * (-LOG2E)))
 
 
 def _ld_sys(r, i):
     """One f32 of a peer region other ranks wrote (system scope: no stale cached line)."""
     return fx.Float32(bo.buffer_load(r, i, vec_width=1, dtype=T.f32, cache_modifier=CM_SYS))
+
+
+def _sigmoid(x):
+    return hw_rcp(1.0 + hw_exp2(x * (-LOG2E)))
 
 
 @flyc.jit
@@ -116,13 +115,15 @@ def route_row(c, row, m, rbf, nbf, bn, bias, lat_out, topk_ids, topk_w, logits_o
             sc.append(s)
             key.append(s + ld_f32(bias, e))
         taken = fx.Int32(0)  # a lane's taken experts, a bit each
-        ids, ws = [], []
-        for k in range_constexpr(TOPK):
+        tot, sel_i, sel_w = fx.Float32(0.0), fx.Int32(0), fx.Float32(0.0)
+        # not unrolled, and a taken expert's key ORed to NaN / -inf (never > best) instead of a "free" lane mask:
+        # the unrolled picks with 14 live masks each were the launch's largest SGPR spill site
+        for k in range(0, TOPK, 1, unroll=1):
             best, bi, bs = fx.Float32(-3.0e38), fx.Int32(E), fx.Float32(0.0)
             for i in range_constexpr(per):
-                free = ((taken >> i) & 1) == 0
-                better = free & (key[i] > best)
-                best = better.select(key[i], best)
+                ki = (key[i].bitcast(fx.Int32) | (((taken >> i) & 1) * fx.Int32(-8388608))).bitcast(fx.Float32)
+                better = ki > best
+                best = better.select(ki, best)
                 bi = better.select(fx.Int32(lane * per + i), bi)
                 bs = better.select(sc[i], bs)
             # wave argmax (ties: the lower expert)
@@ -136,17 +137,12 @@ def route_row(c, row, m, rbf, nbf, bn, bias, lat_out, topk_ids, topk_w, logits_o
                 bs = take.select(os_, bs)
             mine = (bi // per) == lane
             taken = mine.select(taken | (fx.Int32(1) << (bi % per)), taken)
-            ids.append(bi)
-            ws.append(bs)
-        tot = ws[0]
-        for k in range_constexpr(1, TOPK):
-            tot = tot + ws[k]
+            tot = tot + bs
+            pick = lane == fx.Int32(k)
+            sel_i = pick.select(bi, sel_i)
+            sel_w = pick.select(bs, sel_w)
         inv = hw_rcp(tot)
         if lane < TOPK:
-            sel_i, sel_w = ids[0], ws[0]
-            for k in range_constexpr(1, TOPK):
-                sel_i = (lane == k).select(ids[k], sel_i)
-                sel_w = (lane == k).select(ws[k], sel_w)
             bo.buffer_store(sel_i, rsrc(topk_ids), row * TOPK + lane)
             bo.buffer_store(sel_w * inv, rsrc(topk_w), row * TOPK + lane)
     gpu.barrier()

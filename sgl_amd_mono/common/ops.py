@@ -71,6 +71,63 @@ def fresh(v):
     )
 
 
+def sfresh64(v):
+    """Pass a wave-uniform i64 through an opaque scalar move: LLVM cannot merge it with another use or hoist it."""
+    return fx.Int64(
+        llvm.inline_asm(T.i64, [fx.Int64(v).ir_value()], "s_mov_b64 $0, $1", "=s,s", has_side_effects=True)
+    )
+
+
+def uniform64(v):
+    v = fx.Int64(v)
+    return (fx.Int64(uniform(fx.Int32(v >> 32))) << 32) | fx.Int64(fx.Uint32(uniform(fx.Int32(v))))
+
+
+def sload64(addr):
+    """The wave-uniform i64 at device address ``addr``, which no thread writes during the launch (scalar load).
+
+    ``addr`` goes through readfirstlane: inside a divergent branch FlyDSL's bundled LLVM otherwise takes it
+    as divergent and emits a vector load and a waterfall loop around the use.
+    """
+    from flydsl._mlir import ir
+
+    p = llvm.inttoptr(ir.Type.parse("!llvm.ptr<4>"), uniform64(addr).ir_value())
+    return fx.Int64(llvm.load(T.i64, p, alignment=8, invariant=True))
+
+
+class KernArgs:
+    """Kernel arguments re-read from the kernarg segment where a stage needs them.
+
+    ``params``: (name, bytes) in signature order (natural alignment, as the kernarg ABI lays them out).
+    ``ka(*names)`` loads those arguments (scalar loads) at the call site and returns them by name. Every call
+    goes through its own opaque copy of the segment pointer, so the loads are neither merged across calls nor
+    hoisted to the kernel entry: an argument stays in SGPRs only while the stage that loaded it runs.
+    """
+
+    def __init__(self, params):
+        self.offs, off = {}, 0
+        for name, nb in params:
+            off = -(-off // nb) * nb
+            self.offs[name] = (off, nb)
+            off += nb
+
+    def __call__(self, *names):
+        from types import SimpleNamespace
+
+        from flydsl._mlir import ir
+
+        ptr4 = ir.Type.parse("!llvm.ptr<4>")
+        seg = llvm.call_intrinsic(ptr4, "llvm.amdgcn.kernarg.segment.ptr", [], [], [])
+        base = sfresh64(fx.Int64(llvm.ptrtoint(T.i64, seg)))
+        got = {}
+        for name in names:
+            off, nb = self.offs[name]
+            p = llvm.inttoptr(ptr4, (base + fx.Int64(off)).ir_value())
+            v = llvm.load(T.i64 if nb == 8 else T.i32, p, alignment=nb, invariant=True)
+            got[name] = fx.Int64(v) if nb == 8 else fx.Int32(v)
+        return SimpleNamespace(**got)
+
+
 def uniform(v):
     return fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(v)))
 
