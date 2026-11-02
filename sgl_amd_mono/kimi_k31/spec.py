@@ -9,8 +9,9 @@ parallel (DCP) combine all stay on SGLang's path. Under DCP the attention
 hands o_proj the same TP-local 12-head core as without it, which is what the
 layer launch starts from.
 
-What differs from K3's spec: the model type, DCP accepted, the decode
-attention backend K3.1 serves with (dsa), and K1's state check. K1 reads the
+What differs from K3's spec: the model type, DCP accepted, DFLASH drafts
+accepted, the decode attention backend K3.1 serves with (dsa), and K1's state
+check. K1 reads the
 per-token fp32 ``intermediate_ssm`` snapshots, which
 ``--enable-linear-replayssm-spec`` does not allocate; under it every KDA layer
 declines K1 and runs SGLang's attention before the layer launch.
@@ -108,6 +109,9 @@ SPEC = msgspec.structs.replace(
     requires=msgspec.structs.replace(
         k3.SPEC.requires,
         attention_backends=frozenset({"dsa"}),
+        # DFLASH's target steps are DSpark's: uniform verify steps of block_size
+        # rows a request, its taps the bank-path captures (set_dflash_layers_to_capture)
+        server_args={**k3.SPEC.requires.server_args, "speculative_algorithm": frozenset({None, "DSPARK", "DFLASH"})},
         hf_config={"model_type": "kimi_k31"},
     ),
     config_disable_reasons=_config_disable_reasons,
