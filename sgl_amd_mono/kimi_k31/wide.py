@@ -239,13 +239,22 @@ class Wide:
         # the routed latent and shared partials of a ping share one buffer: the column exit
         # reduces the pair in one collective, as SGLang's fused front does
         flat = [z(b * (LAT + H)), z(b * (LAT + H))]
+        # the launch's hand-off mailboxes uncached (as the K3 launches): a consumer reads a line at its home memory,
+        # not through the producer XCD's L2. A one-rank peer buffer, never freed while the process lives.
+        scr_pb = None
+        if os.environ.get("SGLANG_AMD_MONO_K31_WIDE_UNCACHED_SCRATCH", "1") == "1":
+            scr_pb = PeerBuffer(scratch, self.group, self.rank, 1, dev)
+            scr = scr_pb.bytes
+            scr.zero_()
+        else:
+            scr = torch.zeros(scratch, dtype=torch.uint8, device=dev)
         bufs = dict(
             cfg=cfg, mid=z(b, SL), bank=z(b, 8, SL), pout=[z(b, H), z(b, H)], lat=z(b, LAT), flat=flat,
             lat_p=[f[: b * LAT].view(b, LAT) for f in flat], sh=[f[b * LAT :].view(b, H) for f in flat],
             ids=z(b, 16, dt=torch.int32), w=z(b, 16, dt=torch.float32),
             logits=z(b, E, dt=torch.float32), cap=z(b, H), core=z(b, k1.PROJ), ip_buf=z(b, k1.NPROJ),
             acc_u=z(b, SL), acc_o=z(b * H), cnt=torch.zeros(lay.counters(b, cfg, NF), dtype=torch.int32, device=dev),
-            scratch=torch.zeros(scratch, dtype=torch.uint8, device=dev),
+            scratch=scr, scratch_pb=scr_pb,
             st_idx=torch.full((b // L, L), -1, dtype=torch.int32, device=dev),
             num_acc=torch.ones(b // L, dtype=torch.int32, device=dev),
             win_row=torch.full((b // L,), -1, dtype=torch.int32, device=dev))

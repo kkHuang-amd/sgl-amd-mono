@@ -205,8 +205,23 @@ def run(args, m, rank, dev, cpu):
     col0 = 2 * rank * sl
     pfx_rows = m - args.pfx_short  # rows of the prefix tensor (SGLang's step rows <= the bucket's)
     ip_buf = torch.zeros(nl, m, k1.NPROJ, dtype=BF, device=dev)
-    acc_u = torch.zeros(nl, m, sl, dtype=BF, device=dev)
-    acc_o = torch.zeros(nl, m * H * 2, dtype=torch.uint8, device=dev)
+    unc = set(filter(None, os.environ.get("K31_UNCACHED", "scratch").split(",")))  # as wide.py: scratch uncached
+    keep = []
+
+    def zeros(name, shape, dtype):
+        if name not in unc:
+            return torch.zeros(*shape, dtype=dtype, device=dev)
+        n = 1
+        for d in shape:
+            n *= d
+        pb = PeerBuffer(n * torch.tensor([], dtype=dtype).element_size(), cpu, rank, 1, dev)
+        keep.append(pb)
+        t = pb.bytes.view(dtype).view(*shape)
+        t.zero_()
+        return t
+
+    acc_u = zeros("acc_u", (nl, m, sl), BF)
+    acc_o = zeros("acc_o", (nl, m * H * 2), torch.uint8)
     lat_out = torch.zeros(nl, m, 3584, dtype=BF, device=dev)
     tk_ids = torch.zeros(nl, m, TOPK, dtype=torch.int32, device=dev)
     tk_w = torch.zeros(nl, m, TOPK, device=dev)
@@ -214,8 +229,8 @@ def run(args, m, rank, dev, cpu):
     aux = torch.zeros(nl, m, NCAP * H, dtype=BF, device=dev)
     logits_out = torch.zeros(nl, m, E, device=dev)
     cap_view = aux[..., CAP_SLOT * H : (CAP_SLOT + 1) * H]
-    cnt = torch.zeros(lay.counters(m, cfg, nf), dtype=torch.int32, device=dev)
-    scratch = torch.zeros(pl.scratch_bytes(), dtype=torch.uint8, device=dev)
+    cnt = zeros("cnt", (lay.counters(m, cfg, nf),), torch.int32)
+    scratch = zeros("scratch", (pl.scratch_bytes(),), torch.uint8)
     pa_ = peers.addresses.data_ptr()
     assert nl % step == 0
 
