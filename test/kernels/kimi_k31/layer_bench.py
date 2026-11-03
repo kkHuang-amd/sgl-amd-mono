@@ -57,6 +57,31 @@ def rel(a, b):
     return e if e == e else float("inf")
 
 
+def timeline(pl, scratch, m, rank):
+    """The last replayed launch's marks over every rank's CTAs: first / median / last, us from that rank's
+    earliest CTA start (the GPUs' clocks are not aligned)."""
+    from sgl_amd_mono.common.plan import BLOCKS
+    from sgl_amd_mono.kimi_k31.gfx950 import layer as lay
+
+    o = pl.scratch_offsets[0]["tl"]
+    tl = scratch[o : o + BLOCKS * lay.TL_POINTS * 8].view(torch.int64).view(BLOCKS, lay.TL_POINTS).clone()
+    every = [torch.empty_like(tl) for _ in range(TP)]
+    dist.all_gather(every, tl)
+    if rank != 0:
+        return
+    t = torch.stack(every).cpu()
+    t0 = torch.stack([t[r, :, 0][t[r, :, 0] > 0].min() for r in range(TP)]).view(TP, 1, 1)
+    t = torch.where(t > 0, t - t0, torch.full_like(t, -1))
+    print(f"timeline m {m}: mark  CTAs  first  median  last (us)", flush=True)
+    for k, name in enumerate(lay.MARKS):
+        v = t[..., k]
+        v = v[v >= 0].double() / 100.0
+        if v.numel():
+            print(f"  {k:2d} {name:11s} {v.numel():5d} {v.min():7.1f} {v.median():7.1f} {v.max():7.1f}", flush=True)
+    ends = [t[r, :, -1].max().item() / 100.0 for r in range(TP)]
+    print("  end by rank: " + " ".join(f"{e:5.1f}" for e in ends), flush=True)
+
+
 def run(args, m, rank, dev, cpu):
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
@@ -74,7 +99,8 @@ def run(args, m, rank, dev, cpu):
     cfg = lay.LayerCfg(*(Gemm(*(int(v) for v in c.split(":"))) for c in CFGS.get(m) or SERVE_CFGS[m]))
     cap = args.capture
     launch, pl = lay.kda_layer(m, cfg, L, nf, nvb_a=nva, nvb_m=nvm, write_a=wa, nbk=nbk, launches=step, eps=EPS,
-                               eps_n=1e-5, capture=cap, t1=not args.no_t1, restart=args.restart)
+                               eps_n=1e-5, capture=cap, t1=not args.no_t1, restart=args.restart,
+                               timeline=args.timeline)
     if rank == 0 and args.plan:
         print(pl.describe(), flush=True)
     peers = PeerBuffer(pl.peer_bytes(), cpu, rank, TP, dev)
@@ -268,6 +294,8 @@ def run(args, m, rank, dev, cpu):
               f"{e[2]:.2e} windows {e[11]:.2e} latent {e[3]:.2e} shared {e[4]:.2e} topk_w {e[5]:.1e} topk rows differing {e[6]:.2%} "
               f"(own logits: {int(e[8])} rows, w {e[9]:.1e}){f' capture {e[10]:.2e}' if cap else ''}  "
               f"us: layer {e[7]:6.1f}  {'PASS' if ok else 'FAIL'}", flush=True)
+    if args.timeline:
+        timeline(pl, scratch, m, rank)
     torch.cuda.synchronize()
     dist.barrier()
     peers.close()
@@ -290,6 +318,7 @@ def main():
     p.add_argument("--capture", action="store_true", help="DSpark capture of the previous layer")
     p.add_argument("--no-t1", action="store_true", help="no MoE tail (a run's first layer)")
     p.add_argument("--restart", action="store_true", help="block-write layer: the prefix restarts at the attention output")
+    p.add_argument("--timeline", action="store_true", help="per-stage CTA marks of the last launch")
     args = p.parse_args()
     if os.environ.get("SGLANG_AMD_MONO_ROCM_LLVM"):
         from sgl_amd_mono.common import rocm_codegen

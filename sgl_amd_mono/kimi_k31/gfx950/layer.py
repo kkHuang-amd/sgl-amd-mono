@@ -23,6 +23,7 @@ from sgl_amd_mono.common.ops import CM_DEV, KernArgs, load_ptr64
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES, first_task
 from sgl_amd_mono.common.sync import sreg
 from sgl_amd_mono.kimi_k3.gfx950.attention import kda as k1
+from sgl_amd_mono.kimi_k3.gfx950.stamps import stamp, stamp_begin, stamp_flush
 from sgl_amd_mono.kimi_k31.gfx950 import chain as post
 from sgl_amd_mono.kimi_k31.gfx950 import pre_attn as pre
 from sgl_amd_mono.kimi_k31.gfx950.stages import coll
@@ -36,6 +37,10 @@ from sgl_amd_mono.kimi_k31.plan import ALIGN, Plan
 
 TP, H, SL, LAT, LSL = coll.TP, pre.H, pre.SL, pre.LAT, pre.LSL
 KO = post.KO
+# timeline marks: a CTA passes mark k when it has finished its tasks of that stage
+MARKS = ("start", "t1 push", "t1 up", "t2 seam", "t3 in_proj", "kda", "t4 oproj", "t5 rs", "t5 seam", "t6 front",
+         "route", "situ", "sdown", "end")
+TL_POINTS = len(MARKS)
 
 
 class LayerCfg:
@@ -48,7 +53,7 @@ class LayerCfg:
         return tuple(g.key() for g in (self.up, self.inp, self.oproj, self.front, self.sdown))
 
 
-def plan(m, cfg, L, nvb_a, nvb_m, nf, capture=False):
+def plan(m, cfg, L, nvb_a, nvb_m, nf, capture=False, timeline=False):
     """(combined Plan, pre plan, post plan, post region offset shift, post scratch shift)."""
     pp = pre.plan(m, cfg.up, cfg.inp, k1.NPROJ, nvb_a, L, True)
     po = post.plan(m, cfg.oproj, cfg.front, nf, nvb_m)
@@ -82,6 +87,8 @@ def plan(m, cfg, L, nvb_a, nvb_m, nf, capture=False):
         p.region("cap", m * H * 2)
         p.region("capf", TP * m * 8)
         p.stage("capture", m, waits_on=("seam",), all_ranks=True)
+    if timeline:
+        p.region("tl", BLOCKS * TL_POINTS * 8, peer=False)
     return p.check(), pp, po
 
 
@@ -99,7 +106,7 @@ _BUILDS: dict = {}
 
 
 def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk=8, launches=1, eps=1e-5,
-              eps_n=1e-5, kpt=16, capture=False, t1=True, restart=False, half_bytes=0):
+              eps_n=1e-5, kpt=16, capture=False, t1=True, restart=False, half_bytes=0, timeline=False):
     """Build the layer launch; returns (launch, plan). Arguments: the pre half's
     (lat_p, sh_p, w_up (``pre.fold_up``), prefix, cw_a, w_in, w_ip, ip_buf (in_proj
     merge, bf16 [m, 6288] zeroed once), acc_u (bf16 [m, 896] zeroed once)), mid
@@ -119,16 +126,17 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
     (SGLang passes no prefix_sum there). ``logits_out`` f32 [m, 896]: the gathered
     router logits, for SGLang's own top-k and experts. ``half_bytes``: lay the peer
     buffer out with at least this half size (every variant sharing one buffer must
-    agree on its halves and on where the guard's flags are)."""
+    agree on its halves and on where the guard's flags are). ``timeline``: per-CTA clock marks (MARKS) -> the
+    scratch region ``tl``, int64 [BLOCKS, TL_POINTS]."""
     key = (m, cfg.key(), L, nf, nvb_a, nvb_m, write_a, write_m, nbk, launches, eps, eps_n, kpt, capture, t1, restart,
-           half_bytes)
+           half_bytes, timeline)
     if key in _BUILDS:
         return _BUILDS[key]
     gu, gi, go, gf, gs = cfg.up, cfg.inp, cfg.oproj, cfg.front, cfg.sdown
     assert nf == mf.NF and gf.ks > 1 and gs.ks == 1 and m % L == 0 and (not write_a or nvb_m <= nvb_a + 1) and (not write_m or nvb_m < nbk)
     # the up and in_proj finishes read and zero linbf tiles
     assert gu.ks > 1 and gi.ks > 1
-    pl, pp, po = plan(m, cfg, L, nvb_a, nvb_m, nf, capture)
+    pl, pp, po = plan(m, cfg, L, nvb_a, nvb_m, nf, capture, timeline)
     offs, half = pl.peer_offsets
     assert half_bytes == 0 or half <= half_bytes, (half, half_bytes)
     half = max(half, half_bytes)
@@ -192,8 +200,13 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
         rms: fx.Array[fx.Float32, gu.bm, 16]
         red: fx.Array[fx.Float32, max(red_words(nvb_a), red_words(nvb_m)), 16]
 
+    @fx.struct
+    class Tls:
+        v: fx.Array[fx.Int64, TL_POINTS, 16]
+
     name = (f"k31_kda_layer_m{m}_{'_'.join('x'.join(map(str, g)) for g in cfg.key())}_L{L}_n{nf}_a{nvb_a}{int(write_a)}"
-            f"_m{nvb_m}{int(write_m)}of{nbk}_l{launches}_p{kpt}_c{int(capture)}_t{int(t1)}_r{int(restart)}")
+            f"_m{nvb_m}{int(write_m)}of{nbk}_l{launches}_p{kpt}_c{int(capture)}_t{int(t1)}_r{int(restart)}"
+            + ("_tl" if timeline else ""))
 
     def layer_body(lat_p: Int64, sh_p: Int64, w_up: Int64, prefix: Int64, mid: Int64, prefix_out: Int64,
                      bank: Int64, cw_a: Int64, w_in: Int64, w_ip: Int64, ip_buf: Int64, acc_u: Int64, kda_tab: Int64,
@@ -208,6 +221,8 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
             st = alloc.allocate(Smem)
             small = alloc.allocate(Small).peek()
             slot, rmsl, red = small.slot.ptr, small.rms.ptr, small.red.ptr
+            tls = alloc.allocate(Tls).peek().v.ptr if timeline else None
+            stamp_begin(timeline, tls, tid, TL_POINTS)
             lds, cl = st.ab.peek(), st.c.peek().c.ptr
             ca = coll.region_context(peers, rank, epoch, slot_i, pre_offs, half, tid, bid, launches)
             co = coll.region_context(peers, rank, epoch, slot_i, post_offs, half, tid, bid, launches)
@@ -229,6 +244,7 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
                 pre._push(ca, t // TP, t % TP, m, a.lat_p, a.sh_p)
             for row in range(bid, m if t1 else 0, BLOCKS):
                 pre._lred(ca, row, m, shs)
+            stamp(timeline, tls, tid, 1)
             lagx = ca["lag_own"].value
             for task in range(bid, n_u if t1 else 0, BLOCKS):
                 sk = task % gu.ks
@@ -249,11 +265,13 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
                 r0 = m0 + sk * rb_u
                 pre._finish(ca, a.acc_u, shs, a.prefix, a.mid, m, r0, rb_u, n0, gu.bn, gu.ks, pd_a,
                             (r0 // rb_u) * ct_u + n0 // gu.bn)
+            stamp(timeline, tls, tid, 2)
             # ---- T2: attention seam
             for row in range(bid, m, BLOCKS):
                 a2 = ka("mid", "bank", "cw_a", "w_in", "scratch")
                 pre._seam(ca, row, m, rb_u, ct_u, nvb_a, nbk, a2.mid, a2.bank, a2.cw_a, a2.w_in, eps, sr(a2, "pdone"),
                           red, write_a, capture, t1)
+            stamp(timeline, tls, tid, 3)
             # ---- T3: in_proj -> KDA
             xa = ca["ag_own"].value
             f0 = first_task(bid, max(BLOCKS - n_i, 0))
@@ -269,6 +287,7 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
                 _arrive_all(tid, a3.cnt + fx.Int64(4 * cnt_i), tile, gi.ks, slot)
                 rbi = gi.bm // gi.ks
                 pre._finish_proj(ca, a3.ip_buf, m, nin, m0 + sk * rbi, rbi, n0, gi.bn, gi.ks, sr(a3, "proj"))
+            stamp(timeline, tls, tid, 4)
             a = ka("kda_tab", "scratch")
             proj, kdone = sr(a, "proj"), sr(a, "kdone")
             ca.update({
@@ -276,6 +295,7 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
                 "proj": proj, "args": pre._kda_args(a.kda_tab), "kdone": kdone,
             })
             kdaw.kda_heads(ca, st.kw.peek().v.ptr, 0, kpt)
+            stamp(timeline, tls, tid, 5)
             # ---- T4: o_proj (core_out of this launch)
             for task in range(bid, n_o, BLOCKS):
                 sk = task % go.ks
@@ -290,15 +310,18 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
                 _arrive_all(tid, a4.cnt + fx.Int64(4 * cnt_o), tile, go.ks, slot)
                 piece = ((m0 + sk * rb_o) // rb_o) * ct_o + (n0 % SL) // go.bn
                 _push_band_flag(co, a4.acc_o, m, H, m0 + sk * rb_o, rb_o, n0, go.bn, go.ks, "linbf", SL, piece)
+            stamp(timeline, tls, tid, 6)
             # ---- T5: RS + residual, MLP seam
             for piece in range(bid, ((m + rb_o - 1) // rb_o) * ct_o, BLOCKS):
                 a5 = ka("mid", "prefix_out", "scratch")
                 post._rs_piece(co, piece, m, SL, rb_o, go.bn, None if restart else a5.mid, a5.prefix_out,
                                sr(a5, "o_pdone"), False, None, False, CM_DEV)
+            stamp(timeline, tls, tid, 7)
             for row in range(bid, m, BLOCKS):
                 a5r = ka("prefix_out", "bank", "cw_m", "w_ln", "scratch")
                 post._seam_row(co, row, m, SL, rb_o, ct_o, nvb_m, nbk, a5r.prefix_out, a5r.bank, a5r.cw_m, a5r.w_ln, eps,
                                sr(a5r, "o_pdone"), red, write_m, False, None, False, CM_DEV if write_a else 0)
+            stamp(timeline, tls, tid, 8)
             # ---- T6: MoE front
             xm = co["ag_own"].value
             g0 = first_task(bid, max(BLOCKS - n_f, 0))
@@ -315,14 +338,17 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
                 _arrive_all(tid, a6.cnt + fx.Int64(4 * cnt_f), tile, gf.ks, slot)
                 r0 = m0 + sk * rbf
                 mf.finish_front(cf, fbuf, sp(a6, "sgu"), m, r0, rbf, n0, gf.bn, r0 // rbf, n0 // gf.bn, nbf, sr(a6, "smark"), tnf)
+            stamp(timeline, tls, tid, 9)
             # ---- T6 tail: routing + latent for the experts, shared SiTU + down
             for row in range(bid, m, BLOCKS):
                 a7 = ka("bias", "lat_out", "topk_ids", "topk_w", "logits_out")
                 mf.route_row(cf, row, m, rbf, nbf, gf.bn, a7.bias, a7.lat_out, a7.topk_ids, a7.topk_w, a7.logits_out)
+            stamp(timeline, tls, tid, 10)
             for row in range(first_task(bid, max(BLOCKS - m, 0)), m, BLOCKS):
                 a8 = ka("scratch")
                 mf.situ_row(cf, row, m, rbf, tnf, gf.bn, sp(a8, "sgu"), sr(a8, "smark"), sp(a8, "hbuf"),
                             sr(a8, "hmark"))
+            stamp(timeline, tls, tid, 11)
             for task in range(bid, n_s, BLOCKS):
                 a9 = ka("w_sd", "sh_out", "scratch")
                 hbuf, hmark = sp(a9, "hbuf"), sr(a9, "hmark")
@@ -334,11 +360,16 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
                 gpu.barrier()
                 mma_tile(tid, hbuf, mf.SI, m, m0, a9.w_sd, mf.SI, H, n0, 0, mf.SI, gs.bm, gs.bn, gs.wm, gs.wn,
                          lds.xs.ptr, lds.ws.ptr, bf16_emit(a9.sh_out, H, n0, m, H), DEPTH, None, cl, CM_DEV)
+            stamp(timeline, tls, tid, 12)
             # ---- DSpark capture of the previous layer
             if const_expr(capture):
                 a = ka("cap_out", "cap_ld")
                 for row in range(first_task(bid, max(BLOCKS - m, 0)), m, BLOCKS):
                     pre.capture_row(ca, row, m, a.cap_out, a.cap_ld)
+            stamp(timeline, tls, tid, 13)
+            if const_expr(timeline):
+                a = ka("scratch")
+                stamp_flush(timeline, tls, sp(a, "tl"), tid, bid, TL_POINTS)
 
     ka = KernArgs([(n, 8 if t is Int64 else 4) for n, t in layer_body.__annotations__.items() if n != "return"])
     layer_kernel = flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])(layer_body)
