@@ -23,7 +23,8 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from sgl_amd_mono.common.ops import CM_DEV, CM_SYS, bf2_f32, bf16_pair, hw_exp2, hw_rcp, rsrc, xshfl
+from sgl_amd_mono.common.ops import (CM_DEV, CM_SYS, bf2_f32, bf16_pair, hw_exp2, hw_rcp, read_lane_i32, rsrc,
+                                     wave_umax, write_lane_i32)
 from sgl_amd_mono.common.plan import THREADS
 from sgl_amd_mono.kimi_k3.gfx950.attention.kda import ld_f32
 from sgl_amd_mono.kimi_k31.gfx950.stages import coll
@@ -88,6 +89,32 @@ def _sigmoid(x):
     return hw_rcp(1.0 + hw_exp2(x * (-LOG2E)))
 
 
+def _batcher(n):
+    """Batcher's odd-even merge sort network on n (a power of two) slots: (a, b) pairs."""
+    pairs = []
+    p = 1
+    while p < n:
+        k = p
+        while k >= 1:
+            for j in range(k % p, n - k, 2 * k):
+                for i in range(min(k, n - j - k)):
+                    if (i + j) // (2 * p) == (i + j + k) // (2 * p):
+                        pairs.append((i + j, i + j + k))
+            k //= 2
+        p *= 2
+    return pairs
+
+
+SLOTS = 16  # a lane's 14 candidates (896 / 64) padded to the network's width
+NET = _batcher(SLOTS)
+
+
+def _okey(v):
+    """An order-preserving uint32 key of an f32 (larger float, larger key)."""
+    b = v.bitcast(fx.Int32)
+    return fx.Uint32((b < fx.Int32(0)).select(~b, b ^ fx.Int32(-2147483648)))
+
+
 @flyc.jit
 def route_row(c, row, m, rbf, nbf, bn, bias, lat_out, topk_ids, topk_w, logits_out=None):
     """The row's gathered latent -> the experts' input; top-16 of the gathered logits
@@ -108,44 +135,45 @@ def route_row(c, row, m, rbf, nbf, bn, bias, lat_out, topk_ids, topk_w, logits_o
         for e in range(tid, E, THREADS):
             bo.buffer_store(_ld_sys(rg, row * E + e), rsrc(logits_out), row * E + e)
     if wave == 0:
-        per = E // 64  # 14 experts a lane
-        sc, key = [], []
+        # max-extraction (as the K3 K2 launch, mono/kimi-k31 05dfa48): each lane sorts its 14 candidates (expert
+        # lane + 64 i; key descending, the lower expert first on a tie), then 16 rounds of a wave max pop the heads;
+        # pick k lands in lane k, ranked. Same picks, order and weights as one rescan a pick.
+        per = E // 64
+        ks, ids, sg = [], [], []
         for i in range_constexpr(per):
-            e = lane * per + i
+            e = lane + 64 * i
             s = _sigmoid(_ld_sys(rg, row * E + e))
-            sc.append(s)
-            key.append(s + ld_f32(bias, e))
-        taken = fx.Int32(0)  # a lane's taken experts, a bit each
-        tot, sel_i, sel_w = fx.Float32(0.0), fx.Int32(0), fx.Float32(0.0)
-        # not unrolled, and a taken expert's key ORed to NaN / -inf (never > best) instead of a "free" lane mask:
-        # the unrolled picks with 14 live masks each were the launch's largest SGPR spill site
-        for k in range(0, TOPK, 1, unroll=1):
-            best, bi, bs = fx.Float32(-3.0e38), fx.Int32(E), fx.Float32(0.0)
-            for i in range_constexpr(per):
-                ki = (key[i].bitcast(fx.Int32) | (((taken >> i) & 1) * fx.Int32(-8388608))).bitcast(fx.Float32)
-                better = ki > best
-                best = better.select(ki, best)
-                bi = better.select(fx.Int32(lane * per + i), bi)
-                bs = better.select(sc[i], bs)
-            # wave argmax (ties: the lower expert)
-            for off in (32, 16, 8, 4, 2, 1):
-                ob = xshfl(best, off)
-                oi = xshfl(bi, off)
-                os_ = xshfl(bs, off)
-                take = (ob > best) | ((ob == best) & (oi < bi))
-                best = take.select(ob, best)
-                bi = take.select(oi, bi)
-                bs = take.select(os_, bs)
-            mine = (bi // per) == lane
-            taken = mine.select(taken | (fx.Int32(1) << (bi % per)), taken)
-            tot = tot + bs
-            pick = lane == fx.Int32(k)
-            sel_i = pick.select(bi, sel_i)
-            sel_w = pick.select(bs, sel_w)
+            ks.append(_okey(s + ld_f32(bias, e)))
+            ids.append(fx.Int32(e))
+            sg.append(s.bitcast(fx.Int32))
+        ks += [fx.Uint32(0)] * (SLOTS - per)
+        ids += [fx.Int32(1023)] * (SLOTS - per)
+        sg += [fx.Int32(0)] * (SLOTS - per)
+        for x, y in NET:
+            first = (ks[x] > ks[y]) | ((ks[x] == ks[y]) & (ids[x] < ids[y]))
+            kx, ky, ix, iy, sx, sy = ks[x], ks[y], ids[x], ids[y], sg[x], sg[y]
+            ks[x], ks[y] = first.select(kx, ky), first.select(ky, kx)
+            ids[x], ids[y] = first.select(ix, iy), first.select(iy, ix)
+            sg[x], sg[y] = first.select(sx, sy), first.select(sy, sx)
+        ks = [fx.Int32(k) for k in ks] + [fx.Int32(0)]
+        ids = ids + [fx.Int32(1023)]
+        sg = sg + [fx.Int32(0)]
+        tot, sel_i, sel_s = fx.Float32(0.0), fx.Int32(0), fx.Int32(0)
+        for k in range_constexpr(TOPK):
+            mx = wave_umax(ks[0])
+            expert = fx.Int32(1023) - wave_umax((ks[0] == mx).select(fx.Int32(1023) - ids[0], fx.Int32(0)))
+            sig = read_lane_i32(sg[0], expert % 64)  # the winner's sigmoid, before its lane pops its head
+            hit = (ks[0] == mx) & (ids[0] == expert)
+            ks = [hit.select(ks[i + 1], ks[i]) for i in range(SLOTS)] + [ks[-1]]
+            ids = [hit.select(ids[i + 1], ids[i]) for i in range(SLOTS)] + [ids[-1]]
+            sg = [hit.select(sg[i + 1], sg[i]) for i in range(SLOTS)] + [sg[-1]]
+            tot = tot + sig.bitcast(fx.Float32)
+            sel_i = write_lane_i32(expert, k, sel_i)
+            sel_s = write_lane_i32(sig, k, sel_s)
         inv = hw_rcp(tot)
         if lane < TOPK:
             bo.buffer_store(sel_i, rsrc(topk_ids), row * TOPK + lane)
-            bo.buffer_store(sel_w * inv, rsrc(topk_w), row * TOPK + lane)
+            bo.buffer_store(sel_s.bitcast(fx.Float32) * inv, rsrc(topk_w), row * TOPK + lane)
     gpu.barrier()
 
 

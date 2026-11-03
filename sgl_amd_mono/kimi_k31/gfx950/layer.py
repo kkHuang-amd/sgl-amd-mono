@@ -210,7 +210,7 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
 
     name = (f"k31_kda_layer_m{m}_{'_'.join('x'.join(map(str, g)) for g in cfg.key())}_L{L}_n{nf}_a{nvb_a}{int(write_a)}"
             f"_m{nvb_m}{int(write_m)}of{nbk}_l{launches}_p{kpt}_c{int(capture)}_t{int(t1)}_r{int(restart)}"
-            + ("_tl" if timeline else "") + "_cs_pH")
+            + ("_tl" if timeline else "") + "_cs_pH_rp")
 
     def layer_body(lat_p: Int64, sh_p: Int64, w_up: Int64, prefix: Int64, mid: Int64, prefix_out: Int64,
                      bank: Int64, cw_a: Int64, w_in: Int64, w_ip: Int64, ip_buf: Int64, acc_u: Int64, kda_tab: Int64,
