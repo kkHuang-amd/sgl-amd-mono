@@ -272,7 +272,8 @@ def _finish(c, acc, shs, prefix, prefix_out, m, r0, rb, n0, bn, ks, pdone, piece
                                 cache_modifier=CM_DEV)
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
-    if tid == 0:
+    # a partial tile's pieces past row m: no piece of the region (the index would land past it)
+    if (tid == 0) & (r0 < m):
         c["put"](pdone, piece, fx.Int32(1))
 
 

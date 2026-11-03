@@ -168,7 +168,8 @@ def _push_band_flag(c, acc, m, n, m0, rb, n0, bn, ks, mode, sl, piece):
                 bo.buffer_store(fx.Vector.filled(4, 0, fx.Int32), r, (row * n + col) // 2, cache_modifier=CM_DEV)
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
-    if c["tid"] == 0:
+    # a partial tile's pieces past row m: no piece the owner reduces
+    if (c["tid"] == 0) & (m0 < m):
         c["put"](c["fl_of"](owner), c["rank"] * BLOCKS + piece, fx.Int32(1))
 
 

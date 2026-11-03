@@ -72,9 +72,10 @@ def finish_front(c, fbuf, sgu, m, r0, rb, n0, bn, band, t, nbf, smark, tnf):
                 bo.buffer_store(words, rsrc(sgu), (row * 2 * SI + col - S0) // 2, cache_modifier=CM_DEV)
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
-    if n0 < S0:
+    # a partial tile's pieces past row m hold no rows: their band (>= nbf) would flag another rank's
+    if (n0 < S0) & (r0 < m):
         coll.put_each_peer(c, [("fgf", (rank * nbf + band) * gathered_tiles(bn) + t, fx.Int32(1))])
-    if (n0 + bn > S0) & (tid == 0):
+    if (n0 + bn > S0) & (tid == 0) & (r0 < m):
         c["put"](smark, band * tnf + t, fx.Int32(1))
 
 
