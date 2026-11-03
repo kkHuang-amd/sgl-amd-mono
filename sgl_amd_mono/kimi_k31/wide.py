@@ -51,9 +51,12 @@ def buckets() -> tuple:
 
 
 def wide_widths(tokens: int = 8, max_reqs: int = 48) -> tuple:
-    # only widths a warmed bucket holds: a graph capture must not meet a cold one
-    top = min(max_reqs, buckets()[-1] // tokens)
-    return tuple(tokens * r for r in range(2, top + 1))
+    # only widths a warmed bucket holds: a graph capture must not meet a cold one; rows
+    # up to a bucket left out below the smallest one stay on SGLang's own path
+    bs = buckets()
+    lo = max((x for x in BUCKETS if x < bs[0]), default=NARROW)
+    top = min(max_reqs, bs[-1] // tokens)
+    return tuple(tokens * r for r in range(2, top + 1) if tokens * r > lo)
 
 
 def _say(msg):
@@ -140,6 +143,7 @@ class Wide:
                           and _tail_fusable(bb.layers[i - 1])}
         self.layers = {i: _Layer(bb, i, rank, cov | self.entry) for i in idx}
         self.check_left = _check_steps()
+        self.column_exit = os.environ.get("SGLANG_AMD_MONO_K31_WIDE_COLUMN_EXIT", "1") == "1"
         self.slots = {i: n for n, i in enumerate(idx)}  # a launch's slot in the step
         caps = set(bb.dspark_layers_to_capture or ())
         self.peers, self.bufs, self.half = {}, {}, {}
@@ -198,9 +202,13 @@ class Wide:
 
         from sgl_amd_mono.kimi_k3.gfx950.attention import kda as k1
 
+        # the routed latent and shared partials of a ping share one buffer: the column exit
+        # reduces the pair in one collective, as SGLang's fused front does
+        flat = [z(b * (LAT + H)), z(b * (LAT + H))]
         bufs = dict(
-            cfg=cfg, mid=z(b, SL), bank=z(b, 8, SL), pout=[z(b, SL), z(b, SL)], lat=z(b, LAT), lat_p=[z(b, LAT),
-            z(b, LAT)], sh=[z(b, H), z(b, H)], ids=z(b, 16, dt=torch.int32), w=z(b, 16, dt=torch.float32),
+            cfg=cfg, mid=z(b, SL), bank=z(b, 8, SL), pout=[z(b, SL), z(b, SL)], lat=z(b, LAT), flat=flat,
+            lat_p=[f[: b * LAT].view(b, LAT) for f in flat], sh=[f[b * LAT :].view(b, H) for f in flat],
+            pfull=z(b, H), ids=z(b, 16, dt=torch.int32), w=z(b, 16, dt=torch.float32),
             logits=z(b, E, dt=torch.float32), cap=z(b, H), core=z(b, k1.PROJ), ip_buf=z(b, k1.NPROJ),
             acc_u=z(b, SL), acc_o=z(b * H), cnt=torch.zeros(lay.counters(b, cfg, NF), dtype=torch.int32, device=dev),
             scratch=torch.zeros(scratch, dtype=torch.uint8, device=dev),
@@ -329,12 +337,43 @@ class Wide:
         x = layer.ffn_boundary.prepare(h, fb)
         prefix = written_residual(fb)
         assert x.shape == (rows, H) and prefix is not None and prefix.shape == (rows, H), (x.shape, prefix)
+        from sglang.srt.models.kimi_k3 import _vector_aligned
+
         moe = layer.mlp
-        gate_up, logits, routed = moe._fused_front(x)
-        moe._forward_shared(gate_up, bufs["sh"][ping][:rows])
-        moe._forward_routed(x, logits, routed, bufs["lat_p"][ping][:rows])
+        # as SGLang's fused front: the routed input's bf16 cast rides the shared SiTU launch
+        defer = moe._defer_routed_cast_eligible
+        gate_up, logits, routed = moe._fused_front(x, cast_routed=not defer)
+        if defer and not _vector_aligned(routed):
+            defer, routed = False, routed.to(x.dtype)
+        cast = (routed, torch.empty(routed.shape, dtype=x.dtype, device=x.device)) if defer else None
+        moe._forward_shared(gate_up, bufs["sh"][ping][:rows], routed_cast=cast)
+        moe._forward_routed(x, logits, cast[1] if defer else routed, bufs["lat_p"][ping][:rows])
         bufs["pout"][ping][:rows] = prefix[:, self.cols]
         return x, prefix
+
+    def _column_exit(self, moe, b, rows, bufs, ping):
+        """A run's exit as SGLang's column tail (<= 64 rows): one all-reduce of the
+        [latent | shared] pair, this rank's stream columns (its prefix columns added
+        there), and the stream's all-gather that also stages the next layer's attention
+        read. None, before anything runs, when SGLang's kernels do not take the batch."""
+        from sglang.kernels.ops.attention import k3_attn_res_read_hip as hip
+        from sglang.srt.distributed import tensor_model_parallel_all_reduce
+        from sglang.srt.models import kimi_k3 as k3m
+
+        read = moe.next_attn_read
+        if (not self.column_exit or read is None or rows > k3m._COLUMN_TAIL_MAX_TOKENS
+                or not moe._fused_latent_tail_eligible):
+            return None
+        prefix = bufs["pfull"][:rows]
+        if not (hip.tail_covered(bufs["sh"][ping][:rows], prefix)
+                and read.bank.require().gather_covers(rows, SL, read.writes_block)):
+            return None
+        prefix[:, self.cols] = bufs["pout"][ping][:rows]
+        red = tensor_model_parallel_all_reduce(bufs["flat"][ping])
+        stream = moe._column_tail_and_next_read(red[: b * LAT].view(b, LAT)[:rows], red[b * LAT :].view(b, H)[:rows],
+                                                prefix)
+        assert stream is not None
+        return stream
 
     def _rel(self, got, ref):
         """rel L2 over the TP group of tensors each rank holds a part of."""
@@ -421,16 +460,18 @@ class Wide:
                 lat_p = bufs["lat_p"][cur]
                 pk.moe._forward_routed(bufs["lat"][:rows], bufs["logits"][:rows], bufs["lat"][:rows], lat_p[:rows])
                 ping = cur
-            # leave: the last layer's MoE tail on SGLang; this rank's prefix columns ride
-            # in its columns of the shared partial sum, so the tail's all-reduce carries them
-            # (in place: the next run's first launch, t1 off, does not read sh)
+            # leave: the last layer's MoE tail on SGLang
             last = self.layers[run[-1]]
             sh = bufs["sh"][ping][:rows]
             if check:  # the gathered-prefix tail
                 full = tensor_model_parallel_all_gather(bufs["pout"][ping][:rows].contiguous(), dim=-1)
                 ref = last.moe._column_split_tail(bufs["lat_p"][ping][:rows].clone(), sh.clone(), full, cols=cols)
-            sh[:, cols] += bufs["pout"][ping][:rows]
-            stream = last.moe._column_split_tail(bufs["lat_p"][ping][:rows], sh, None, cols=cols)
+            stream = self._column_exit(last.moe, b, rows, bufs, ping)
+            if stream is None:
+                # this rank's prefix columns ride in its columns of the shared partial, so
+                # the tail's all-reduce carries them (in place: no launch reads sh after)
+                sh[:, cols] += bufs["pout"][ping][:rows]
+                stream = last.moe._column_split_tail(bufs["lat_p"][ping][:rows], sh, None, cols=cols)
             if check:
                 _say(f"exit check layer {run[-1]} rows {rows}: stream rel "
                      f"{((stream.float() - ref.float()).norm() / ref.float().norm()).item():.2e}")
