@@ -262,11 +262,11 @@ class WideCheck:
         if t1:
             lat_p = t1_in["lat_p"].contiguous()
             sh_p = t1_in["sh_p"].contiguous()
-            pre_s = t1_in["prefix"][:, cols].contiguous()
+            pre_s = t1_in["prefix"].contiguous()  # full rows: the launch reads its columns by stride H
         else:
             lat_p = sh_p = pre_s = None
         o = {k: torch.zeros(*shape, dtype=dt, device=dev) for k, shape, dt in (
-            ("pout", (rows, sl), bf), ("ip_buf", (rows, k1.NPROJ), bf), ("acc_u", (rows, sl), bf),
+            ("pout", (rows, H), bf), ("ip_buf", (rows, k1.NPROJ), bf), ("acc_u", (rows, sl), bf),
             ("acc_o", (rows * H,), bf), ("lat", (rows, 3584), bf), ("ids", (rows, 16), torch.int32),
             ("w", (rows, 16), torch.float32), ("sh", (rows, H), bf), ("lg", (rows, E), torch.float32))}
         cnt = torch.zeros(lay.counters(rows, cfg, NF), dtype=torch.int32, device=dev)
@@ -274,13 +274,16 @@ class WideCheck:
         z = torch.zeros(1, dtype=bf, device=dev)
         w = self.w
         ptr = lambda t: z.data_ptr() if t is None else t.data_ptr()  # noqa: E731
-        launch(ptr(lat_p), ptr(sh_p), self.w_up.data_ptr(), ptr(pre_s), mid_s.data_ptr(), o["pout"].data_ptr(),
+        col0 = 2 * cols.start
+        launch(ptr(lat_p), ptr(sh_p), self.w_up.data_ptr(), ptr(pre_s) + (col0 if t1 else 0), mid_s.data_ptr(),
+               o["pout"].data_ptr() + col0,
                bank_s.data_ptr(), w["cw_a"].data_ptr(), w["w_in"].data_ptr(), w["w_ip"].data_ptr(),
                o["ip_buf"].data_ptr(), o["acc_u"].data_ptr(), tab.data_ptr(), core.data_ptr(), w["wo"].data_ptr(),
                w["cw_m"].data_ptr(), w["w_ln"].data_ptr(), w["wf"].data_ptr(), o["acc_o"].data_ptr(),
                w["bias"].data_ptr(), o["lat"].data_ptr(), o["ids"].data_ptr(), o["w"].data_ptr(), w["w_sd"].data_ptr(),
                o["sh"].data_ptr(), z.data_ptr(), 0, o["lg"].data_ptr(), cnt.data_ptr(), scratch.data_ptr(),
                self.peers[rows].addresses.data_ptr(), self.rank, self.epoch.data_ptr(), 0,
+               rows * H * 2 - col0 if t1 else 0,
                stream=torch.cuda.current_stream())
         torch.cuda.synchronize()
         # the gathered seam outputs, from this launch's half of the peer buffer
@@ -298,7 +301,7 @@ class WideCheck:
         vrows = select_verify_intermediate_state_indices(backend.verify_intermediate_state_indices,
                                                          self.fb.req_pool_indices, slots >= 0,
                                                          backend.req_to_token_pool.size)[:r_n].long()
-        self.ours = dict(x=region("ag", H), xm=region("o_ag", H), core=core, h=o["pout"], cols=cols, logits=logits,
+        self.ours = dict(x=region("ag", H), xm=region("o_ag", H), core=core, h=o["pout"][:, cols], cols=cols, logits=logits,
                          win=win, win_at=(cache.intermediate_conv_window[0][idx], vrows, slots >= 0),
                          t1=t1, mid=mid_s,
                          lat=o["lat"], ids=o["ids"], w=o["w"], sh=o["sh"], rows=rows, R=r_n, L=L)

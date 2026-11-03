@@ -240,9 +240,9 @@ class Wide:
         # reduces the pair in one collective, as SGLang's fused front does
         flat = [z(b * (LAT + H)), z(b * (LAT + H))]
         bufs = dict(
-            cfg=cfg, mid=z(b, SL), bank=z(b, 8, SL), pout=[z(b, SL), z(b, SL)], lat=z(b, LAT), flat=flat,
+            cfg=cfg, mid=z(b, SL), bank=z(b, 8, SL), pout=[z(b, H), z(b, H)], lat=z(b, LAT), flat=flat,
             lat_p=[f[: b * LAT].view(b, LAT) for f in flat], sh=[f[b * LAT :].view(b, H) for f in flat],
-            pfull=z(b, H), ids=z(b, 16, dt=torch.int32), w=z(b, 16, dt=torch.float32),
+            ids=z(b, 16, dt=torch.int32), w=z(b, 16, dt=torch.float32),
             logits=z(b, E, dt=torch.float32), cap=z(b, H), core=z(b, k1.PROJ), ip_buf=z(b, k1.NPROJ),
             acc_u=z(b, SL), acc_o=z(b * H), cnt=torch.zeros(lay.counters(b, cfg, NF), dtype=torch.int32, device=dev),
             scratch=torch.zeros(scratch, dtype=torch.uint8, device=dev),
@@ -253,18 +253,23 @@ class Wide:
         _say(f"bucket {b}: peer {need / 1e6:.1f} MB, scratch {scratch / 1e6:.1f} MB")
         return bufs
 
-    def _launch_args(self, pk, b, bufs, tab, ping, slot):
+    def _launch_args(self, pk, b, bufs, tab, ping, slot, prefix=None):
+        """``prefix``: SGLang's prefix [rows, H] a run's first launch reads (else the
+        previous launch's ``pout``); the launch reads / writes this rank's columns."""
         w, zt = pk.w, bufs["mid"]
         prev, cur = ping, 1 - ping
+        col0 = 2 * self.cols.start
+        pre = bufs["pout"][prev] if prefix is None else prefix
         return (bufs["lat_p"][prev].data_ptr(), bufs["sh"][prev].data_ptr(), w.get("w_up", zt).data_ptr(),
-                bufs["pout"][prev].data_ptr(), bufs["mid"].data_ptr(), bufs["pout"][cur].data_ptr(),
+                pre.data_ptr() + col0, bufs["mid"].data_ptr(), bufs["pout"][cur].data_ptr() + col0,
                 bufs["bank"].data_ptr(), w["cw_a"].data_ptr(), w["w_in"].data_ptr(), w["w_ip"].data_ptr(),
                 bufs["ip_buf"].data_ptr(), bufs["acc_u"].data_ptr(), tab.data_ptr(), bufs["core"].data_ptr(),
                 w["wo"].data_ptr(), w["cw_m"].data_ptr(), w["w_ln"].data_ptr(), w["wf"].data_ptr(),
                 bufs["acc_o"].data_ptr(), w["bias"].data_ptr(), bufs["lat"].data_ptr(), bufs["ids"].data_ptr(),
                 bufs["w"].data_ptr(), w["w_sd"].data_ptr(), bufs["sh"][cur].data_ptr(), bufs["cap"].data_ptr(), H,
                 bufs["logits"].data_ptr(), bufs["cnt"].data_ptr(), bufs["scratch"].data_ptr(),
-                self.peers[b].addresses.data_ptr(), self.rank, self.epoch.data_ptr(), slot)
+                self.peers[b].addresses.data_ptr(), self.rank, self.epoch.data_ptr(), slot,
+                pre.shape[0] * H * 2 - col0)
 
     def _build_launch(self, pk, b, L, v, cfg):
         from sgl_amd_mono.kimi_k31.gfx950 import layer as lay
@@ -363,7 +368,7 @@ class Wide:
     def _tail_front(self, layer, hidden, positions, fb, zero_allocator, bufs, rows, ping):
         """A standard layer whose MoE tail the next launch takes: SGLang's layer up to
         the MoE's TP partials (routed latent -> lat_p, shared -> sh) and this rank's
-        columns of the prefix the tail adds (-> pout), the next launch's T1 inputs."""
+        prefix the tail adds (the launch reads its columns), the next launch's T1 inputs."""
         from sglang.srt.layers.layer_boundary.residual.batch import written_residual
 
         h = layer.attn_boundary.prepare(hidden, fb, capture_gathered=None)
@@ -383,7 +388,6 @@ class Wide:
         cast = (routed, torch.empty(routed.shape, dtype=x.dtype, device=x.device)) if defer else None
         moe._forward_shared(gate_up, bufs["sh"][ping][:rows], routed_cast=cast)
         moe._forward_routed(x, logits, cast[1] if defer else routed, bufs["lat_p"][ping][:rows])
-        bufs["pout"][ping][:rows] = prefix[:, self.cols]
         return x, prefix
 
     def _column_exit(self, moe, b, rows, bufs, ping):
@@ -399,11 +403,10 @@ class Wide:
         if (not self.column_exit or read is None or rows > k3m._COLUMN_TAIL_MAX_TOKENS
                 or not moe._fused_latent_tail_eligible):
             return None
-        prefix = bufs["pfull"][:rows]
+        prefix = bufs["pout"][ping][:rows]  # this rank's columns written, the others 0
         if not (hip.tail_covered(bufs["sh"][ping][:rows], prefix)
                 and read.bank.require().gather_covers(rows, SL, read.writes_block)):
             return None
-        prefix[:, self.cols] = bufs["pout"][ping][:rows]
         red = tensor_model_parallel_all_reduce(bufs["flat"][ping])
         stream = moe._column_tail_and_next_read(red[: b * LAT].view(b, LAT)[:rows], red[b * LAT :].view(b, H)[:rows],
                                                 prefix)
@@ -451,10 +454,16 @@ class Wide:
         i = m.start_layer
         ping = 0
         ref_mid = None
+        entry_prefix = None  # SGLang's prefix the next run's first launch reads (kept alive until it is enqueued)
+        bank_synced = False
         while i < m.end_layer:
             if i in self.entry:
                 x, prefix = self._tail_front(m.layers[i], hidden, built._positions, fb, zero_allocator, bufs, rows,
                                              ping)
+                if prefix.stride() == (H, 1):
+                    entry_prefix = prefix
+                else:
+                    bufs["pout"][ping][:rows, cols] = prefix[:, cols]
                 if check:  # SGLang's whole MoE on the same input, this rank's columns
                     ref_mid = m.layers[i].mlp(x, prefix_sum=prefix)[:, cols].clone()
                 i += 1
@@ -471,7 +480,15 @@ class Wide:
             if not self.layers[i].t1:  # else its first launch runs the previous layer's MoE tail
                 full = fold(hidden, fb)
                 bufs["mid"][:rows] = full[:, cols]
-            bufs["bank"][:rows] = res.block_residual[:rows, :, cols]
+            # SGLang writes bank rows only before the first run (layer 0); the launches write the later ones
+            # into bufs["bank"] themselves (then gathered into SGLang's bank), so one copy a step
+            nvb = res.num_valid_blocks
+            if not bank_synced:
+                bufs["bank"][:rows, :nvb] = res.block_residual[:rows, :nvb, cols]
+                bank_synced = True
+            elif check:
+                d = (bufs["bank"][:rows, :nvb] != res.block_residual[:rows, :nvb, cols]).sum().item()
+                assert d == 0, f"wide bank out of sync at layer {i}: {d} values"
             run = []
             while i in self.layers:
                 run.append(i)
@@ -483,8 +500,11 @@ class Wide:
                 assert res.num_valid_blocks == pk.nvb, (li, res.num_valid_blocks, pk.nvb)
                 tab = self._kda_table(pk, ks, b, bufs)
                 cur = 1 - ping
-                self._build_launch(pk, b, L, v, cfg)(*self._launch_args(pk, b, bufs, tab, ping, self.slots[li]),
+                pre = entry_prefix if n == 0 else None
+                self._build_launch(pk, b, L, v, cfg)(*self._launch_args(pk, b, bufs, tab, ping, self.slots[li], pre),
                                                      stream=torch.cuda.current_stream())
+                if n == 0:
+                    entry_prefix = None
                 if n == 0 and ref_mid is not None:
                     e = self._rel(bufs["mid"][:rows], ref_mid)
                     _say(f"entry check layer {li - 1} -> {li} rows {rows}: mid rel {e:.2e}")
@@ -500,13 +520,13 @@ class Wide:
             last = self.layers[run[-1]]
             sh = bufs["sh"][ping][:rows]
             if check:  # the gathered-prefix tail
-                full = tensor_model_parallel_all_gather(bufs["pout"][ping][:rows].contiguous(), dim=-1)
+                full = tensor_model_parallel_all_gather(bufs["pout"][ping][:rows, cols].contiguous(), dim=-1)
                 ref = last.moe._column_split_tail(bufs["lat_p"][ping][:rows].clone(), sh.clone(), full, cols=cols)
             stream = self._column_exit(last.moe, b, rows, bufs, ping)
             if stream is None:
                 # this rank's prefix columns ride in its columns of the shared partial, so
                 # the tail's all-reduce carries them (in place: no launch reads sh after)
-                sh[:, cols] += bufs["pout"][ping][:rows]
+                sh[:, cols] += bufs["pout"][ping][:rows, cols]
                 stream = last.moe._column_split_tail(bufs["lat_p"][ping][:rows], sh, None, cols=cols)
             if check:
                 _say(f"exit check layer {run[-1]} rows {rows}: stream rel "

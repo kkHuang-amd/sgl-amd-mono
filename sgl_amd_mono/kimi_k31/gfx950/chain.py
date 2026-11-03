@@ -79,12 +79,14 @@ def plan(m, go, gf, nf, nvb=0):
 
 
 @flyc.jit
-def _rs_piece(c, piece, m, sl, rb, bn, res, res_out, pdone, tl_on, tls, first, res_cm=0):
+def _rs_piece(c, piece, m, sl, rb, bn, res, res_out, pdone, tl_on, tls, first, res_cm=0, ldo=0):
     """Sum piece ``piece``'s TP sources in rank order, add the residual, store the
-    new residual (device scope: the seam's CTA reads it), mark the piece."""
+    new residual (device scope: the seam's CTA reads it), mark the piece. ``ldo``:
+    ``res_out``'s row stride (0: sl)."""
     tid = c["tid"]
     q8 = bn // 8
     ct = sl // bn
+    ldo = ldo or sl
     if tid < TP:
         c["poll"]([(c["fl_own"], tid * BLOCKS + piece, 1)])
     gpu.barrier()
@@ -111,7 +113,7 @@ def _rs_piece(c, piece, m, sl, rb, bn, res, res_out, pdone, tl_on, tls, first, r
                 r = [v for e in range(4) for v in bf2_f32(rv[e])]
                 acc = [a + b for a, b in zip(acc, r)]
             words = [bf16_pair(acc[2 * j], acc[2 * j + 1]).bitcast(fx.Int32) for j in range(4)]
-            bo.buffer_store(fx.Vector.from_elements(words, fx.Int32), r_out, (row * sl + col) // 2,
+            bo.buffer_store(fx.Vector.from_elements(words, fx.Int32), r_out, (row * ldo + col) // 2,
                             cache_modifier=CM_DEV)
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
@@ -121,7 +123,7 @@ def _rs_piece(c, piece, m, sl, rb, bn, res, res_out, pdone, tl_on, tls, first, r
 
 @flyc.jit
 def _seam_row(c, row, m, sl, rb, ct, nvb, nbk, res_out, bank, cw, w_o, eps, pdone, red, write, tl_on, tls, first,
-              bank_cm=0):
+              bank_cm=0, ldo=0):
     """The MLP AttnRes seam of one row (``attnres.attnres_row``) once its band's
     pieces are in; the normalized slice goes to every rank's gather region, then
     (this rank, row) is flagged on every rank."""
@@ -140,7 +142,7 @@ def _seam_row(c, row, m, sl, rb, ct, nvb, nbk, res_out, bank, cw, w_o, eps, pdon
                 bo.buffer_store(vec, rsrc(ags[p].value), (row * TP * sl + rank * sl + 8 * q) // 2,
                                 cache_modifier=CM_SYS)
 
-    attnres_row(c, row, m, sl, nvb, nbk, res_out, bank, cw, w_o, eps, eps, red, emit, write, bank_cm)
+    attnres_row(c, row, m, sl, nvb, nbk, res_out, bank, cw, w_o, eps, eps, red, emit, write, bank_cm, None, ldo)
     if first:
         stamp(tl_on, tls, tid, 6)
     rocdl.s_waitcnt(vmcnt=0)

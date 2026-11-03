@@ -247,9 +247,11 @@ def _row_rms(c, m0, bm, m, eps, rmsl):
 
 
 @flyc.jit
-def _finish(c, acc, shs, prefix, prefix_out, m, r0, rb, n0, bn, ks, pdone, piece):
+def _finish(c, acc, shs, prefix, prefix_out, m, r0, rb, n0, bn, ks, pdone, piece, ldp=SL, pbytes=None):
     """Rows r0 .. r0 + rb of a finished up tile: y = up + shared, prefix' = prefix +
-    y (bf16 roundings as SGLang's two adds), zero the up tile, mark the piece."""
+    y (bf16 roundings as SGLang's two adds), zero the up tile, mark the piece.
+    ``ldp``: the prefix's row stride (H: this rank's columns of a full-width row);
+    ``pbytes``: bytes readable from ``prefix`` (rows past it load 0)."""
     tid = c["tid"]
     q4 = bn // 4
     for it in range(tid, rb * q4, THREADS):
@@ -259,7 +261,7 @@ def _finish(c, acc, shs, prefix, prefix_out, m, r0, rb, n0, bn, ks, pdone, piece
             uv = fx.Vector(bo.buffer_load(rsrc(acc), (row * SL + col) // 2, vec_width=2, dtype=T.i32,
                                           cache_modifier=CM_DEV))
             sv = fx.Vector(bo.buffer_load(rsrc(shs), row * SL + col, vec_width=4, dtype=T.f32, cache_modifier=CM_DEV))
-            pv = fx.Vector(bo.buffer_load(rsrc(prefix), (row * SL + col) // 2, vec_width=2, dtype=T.i32))
+            pv = fx.Vector(bo.buffer_load(rsrc(prefix, pbytes), (row * ldp + col) // 2, vec_width=2, dtype=T.i32))
             up = [x for w in (uv[0], uv[1]) for x in bf2_f32(w)]
             pr = [x for w in (pv[0], pv[1]) for x in bf2_f32(w)]
             y = [fx.Float32(fx.Float32(up[e] + sv[e]).to(fx.BFloat16)) for e in range(4)]

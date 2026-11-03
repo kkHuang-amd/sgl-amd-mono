@@ -37,7 +37,7 @@ def red_words(nvb):
 
 @flyc.jit
 def attnres_row(c, row, m, sl, nvb, nbk, prefix, bank, cw, w_o, eps_s, eps_o, red, emit, write, bank_cm=0,
-                emit_mixed=None):
+                emit_mixed=None, ldp=0):
     """One row: ``prefix`` [m, sl] (device scope, just written), ``bank`` [m, nbk, sl]
     (snapshots 0 .. nvb - 1), ``cw`` f32 [H], ``w_o`` bf16 [H]; ``c["xs_of"]`` /
     ``c["xs_own"]`` the scalar exchange region [src][m][V]. ``emit(q, live, vec)``
@@ -45,11 +45,13 @@ def attnres_row(c, row, m, sl, nvb, nbk, prefix, bank, cw, w_o, eps_s, eps_o, re
     prefix becomes bank row nvb (device scope: a later seam of the launch may read
     it); ``bank_cm`` CM_DEV when an earlier seam of this launch wrote the bank.
     ``emit_mixed(q, live, vec)``: the pre-norm mixture (bf16), SGLang's
-    ``aggregate_stream`` -- what DSpark captures after the previous layer."""
+    ``aggregate_stream`` -- what DSpark captures after the previous layer. ``ldp``: the
+    prefix's row stride (0: sl)."""
     tid = c["tid"]
     lane, wave = tid % 64, tid // 64
     rank = c["rank"]
     h = 8 * sl
+    ldp = ldp or sl
     r_n = nvb + 1
     nv = scalars(nvb)
     q8 = sl // 8
@@ -61,7 +63,7 @@ def attnres_row(c, row, m, sl, nvb, nbk, prefix, bank, cw, w_o, eps_s, eps_o, re
         v = fx.Vector(bo.buffer_load(rsrc(bank), ((row * nbk + r) * sl + 8 * q) // 2, vec_width=4, dtype=T.i32,
                                      cache_modifier=bank_cm))
         xs.append([x for e in range(4) for x in bf2_f32(v[e])])
-    pv = fx.Vector(bo.buffer_load(rsrc(prefix), (row * sl + 8 * q) // 2, vec_width=4, dtype=T.i32,
+    pv = fx.Vector(bo.buffer_load(rsrc(prefix), (row * ldp + 8 * q) // 2, vec_width=4, dtype=T.i32,
                                   cache_modifier=CM_DEV))
     xs.append([x for e in range(4) for x in bf2_f32(pv[e])])
     cwv = [fx.Vector(bo.buffer_load(rsrc(cw), rank * sl + 8 * q + 4 * k, vec_width=4, dtype=T.f32)) for k in range(2)]

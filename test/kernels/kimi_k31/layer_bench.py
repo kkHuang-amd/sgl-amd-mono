@@ -157,6 +157,11 @@ def run(args, m, rank, dev, cpu):
         lat_p = (torch.randn(nl, m, LAT, generator=g, device=dev) * 0.3).to(BF)
         sh_p = (torch.randn(nl, m, H, generator=g, device=dev) * 0.3).to(BF)
         prefix = torch.randn(nl, m, H, generator=gb, device=dev).to(BF)
+        prefix_l = prefix
+        if args.pfx_short:  # rows past the prefix tensor's: NaN in memory, 0 to the launch (the descriptor bound)
+            prefix[:, m - args.pfx_short :] = 0
+            prefix_l = prefix.clone()
+            prefix_l[:, m - args.pfx_short :] = float("nan")
         bk = torch.randn(nl, m, nbk, H, generator=gb, device=dev).to(BF)
         lat = lat_p.float()
         dist.all_reduce(lat)
@@ -188,7 +193,7 @@ def run(args, m, rank, dev, cpu):
         latent = torch.cat(lats, dim=-1).to(BF)
         gu_ = front[..., 560:].to(BF)
         shp = situ(gu_[..., :SI], gu_[..., SI:]).float() @ w_sd.float().T
-        sets.append(dict(lat_p=lat_p, sh_p=sh_p, prefix=prefix[..., cols].contiguous(),
+        sets.append(dict(lat_p=lat_p, sh_p=sh_p, prefix=prefix_l,  # full rows: the launch reads its columns by stride H
                          bank=bk.view(nl, m, nbk, TP, sl)[:, :, :, rank].contiguous(),
                          ref=dict(mid=mid[..., cols], h=h[..., cols], core=cr, latent=latent, sh=shp,
                                   win=torch.stack([win_ref(ip[i], conv0, sc, ai, k1, L) for i in range(nl)]),
@@ -196,7 +201,9 @@ def run(args, m, rank, dev, cpu):
                          ids=ids.sort(-1).values, wts=wts.gather(-1, ids.sort(-1).indices)))
     cur = {k: sets[0][k].clone() for k in ("lat_p", "sh_p", "prefix", "bank")}
     mid = torch.zeros(nl, m, sl, dtype=BF, device=dev)
-    pout = torch.zeros(nl, m, sl, dtype=BF, device=dev)
+    pout = torch.zeros(nl, m, H, dtype=BF, device=dev)  # the launch writes its columns of full rows
+    col0 = 2 * rank * sl
+    pfx_rows = m - args.pfx_short  # rows of the prefix tensor (SGLang's step rows <= the bucket's)
     ip_buf = torch.zeros(nl, m, k1.NPROJ, dtype=BF, device=dev)
     acc_u = torch.zeros(nl, m, sl, dtype=BF, device=dev)
     acc_o = torch.zeros(nl, m * H * 2, dtype=torch.uint8, device=dev)
@@ -215,12 +222,13 @@ def run(args, m, rank, dev, cpu):
     def one(i):
         if i % step == 0:
             epoch[0].add_(1)
-        launch(cur["lat_p"][i].data_ptr(), cur["sh_p"][i].data_ptr(), w_up_r.data_ptr(), cur["prefix"][i].data_ptr(),
-               mid[i].data_ptr(), pout[i].data_ptr(), cur["bank"][i].data_ptr(), cw_a.data_ptr(), ln["in"].data_ptr(),
+        launch(cur["lat_p"][i].data_ptr(), cur["sh_p"][i].data_ptr(), w_up_r.data_ptr(), cur["prefix"][i].data_ptr() + col0,
+               mid[i].data_ptr(), pout[i].data_ptr() + col0, cur["bank"][i].data_ptr(), cw_a.data_ptr(), ln["in"].data_ptr(),
                w_ip.data_ptr(), ip_buf[i].data_ptr(), acc_u[i].data_ptr(), tabs[i].data_ptr(), core[i].data_ptr(),
                wo.data_ptr(), cw_m.data_ptr(), ln["post"].data_ptr(), wf.data_ptr(), acc_o[i].data_ptr(),
                bias.data_ptr(), lat_out[i].data_ptr(), tk_ids[i].data_ptr(), tk_w[i].data_ptr(), w_sd.data_ptr(),
                sh_out[i].data_ptr(), cap_view[i].data_ptr(), NCAP * H, logits_out[i].data_ptr(), cnt.data_ptr(), scratch.data_ptr(), pa_, rank, epoch.data_ptr(), i % step,
+               pfx_rows * H * 2 - col0,
                stream=torch.cuda.current_stream())
 
     for i in range(nl):
@@ -235,8 +243,10 @@ def run(args, m, rank, dev, cpu):
             cur[k].copy_(s[k])
         conv.copy_(conv0.unsqueeze(0).expand_as(conv))
         graph.replay()
-        for k, got in (("mid", mid), ("h", pout), ("core", core), ("latent", lat_out), ("sh", sh_out)):
+        for k, got in (("mid", mid), ("h", pout[..., cols]), ("core", core), ("latent", lat_out), ("sh", sh_out)):
             worst[k] = max(worst[k], rel(got, s["ref"][k]))
+        others = torch.cat([pout[..., : rank * sl], pout[..., (rank + 1) * sl :]], dim=-1)
+        worst["h"] = max(worst["h"], float(others.abs().max().item() > 0) * 9.0)  # wrote outside its columns
         worst["win"] = max(worst["win"], rel(conv_win[:, win_row.long()], s["ref"]["win"]),
                            float(conv_win[:, -1].count_nonzero().item() > 0) * 9.0)  # the unused row
         if cap:
@@ -318,6 +328,7 @@ def main():
     p.add_argument("--plan", action="store_true")
     p.add_argument("--capture", action="store_true", help="DSpark capture of the previous layer")
     p.add_argument("--no-t1", action="store_true", help="no MoE tail (a run's first layer)")
+    p.add_argument("--pfx-short", type=int, default=0, help="the prefix holds this many rows fewer than m (they read 0)")
     p.add_argument("--restart", action="store_true", help="block-write layer: the prefix restarts at the attention output")
     p.add_argument("--timeline", action="store_true", help="per-stage CTA marks of the last launch")
     args = p.parse_args()

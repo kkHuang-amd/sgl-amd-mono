@@ -114,7 +114,10 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
     (the prefix after the MoE tail, [m, 896]), kda_tab (``pre.kda_table``; its
     core_out is the o_proj input ``core``), the post half's (wo, cw_m, w_ln, wf,
     out (MoE front output), acc_o (o_proj merge, zeroed once)), prefix_out (after
-    the attention add), bank, the T6 tail's (bias f32 [896] (e_score_correction_bias),
+    the attention add; prefix and prefix_out are this rank's columns of full-width
+    rows: row stride H, the pointer at the rank's first column; ``pfx_bytes``: bytes
+    readable from prefix, later rows read 0: SGLang's prefix holds the step's rows,
+    not the bucket's), bank, the T6 tail's (bias f32 [896] (e_score_correction_bias),
     lat_out bf16 [m, 3584] + topk_ids int32 / topk_w f32 [m, 16] (the routed
     experts' input), w_sd [H, 768] (shared down rows of this rank), sh_out bf16
     [m, H] (the shared partial the next layer's MoE tail reads)), cnt (every tile
@@ -207,14 +210,14 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
 
     name = (f"k31_kda_layer_m{m}_{'_'.join('x'.join(map(str, g)) for g in cfg.key())}_L{L}_n{nf}_a{nvb_a}{int(write_a)}"
             f"_m{nvb_m}{int(write_m)}of{nbk}_l{launches}_p{kpt}_c{int(capture)}_t{int(t1)}_r{int(restart)}"
-            + ("_tl" if timeline else "") + "_cs")
+            + ("_tl" if timeline else "") + "_cs_pH")
 
     def layer_body(lat_p: Int64, sh_p: Int64, w_up: Int64, prefix: Int64, mid: Int64, prefix_out: Int64,
                      bank: Int64, cw_a: Int64, w_in: Int64, w_ip: Int64, ip_buf: Int64, acc_u: Int64, kda_tab: Int64,
                      core: Int64, wo: Int64, cw_m: Int64, w_ln: Int64, wf: Int64, acc_o: Int64, bias: Int64,
                      lat_out: Int64, topk_ids: Int64, topk_w: Int64, w_sd: Int64, sh_out: Int64, cap_out: Int64,
                      cap_ld: Int32, logits_out: Int64, cnt: Int64, scratch: Int64, peers: Int64, rank: Int32, epoch: Int64,
-                     slot_i: Int32):
+                     slot_i: Int32, pfx_bytes: Int64):
         own = load_ptr64(peers, rank)
         with guard.scope(guard.Guard(epoch, own=own, peers=peers, rank=rank, npes=TP, flags_offset=fo)):
             tid, bid = fx.thread_idx.x, fx.block_idx.x
@@ -239,7 +242,7 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
             # Each stage loads the arguments and scratch regions it uses (ka) instead of keeping all of them
             # live from the kernel entry: the launch is at the SGPR limit.
             # ---- T1: MoE tail
-            a = ka("lat_p", "sh_p", "w_up", "acc_u", "cnt", "prefix", "mid", "scratch")
+            a = ka("lat_p", "sh_p", "w_up", "acc_u", "cnt", "prefix", "mid", "scratch", "pfx_bytes")
             shs, pd_a = sp(a, "shs"), sr(a, "pdone")
             for t in range(bid, m * TP if t1 else 0, BLOCKS):
                 pre._push(ca, t // TP, t % TP, m, a.lat_p, a.sh_p)
@@ -265,7 +268,7 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
                 _arrive_all(tid, a.cnt, tile, gu.ks, slot, CNT_STRIDE)
                 r0 = m0 + sk * rb_u
                 pre._finish(ca, a.acc_u, shs, a.prefix, a.mid, m, r0, rb_u, n0, gu.bn, gu.ks, pd_a,
-                            (r0 // rb_u) * ct_u + n0 // gu.bn)
+                            (r0 // rb_u) * ct_u + n0 // gu.bn, H, a.pfx_bytes)
             stamp(timeline, tls, tid, 2)
             # ---- T2: attention seam
             for row in range(bid, m, BLOCKS):
@@ -316,12 +319,12 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
             for piece in range(bid, ((m + rb_o - 1) // rb_o) * ct_o, BLOCKS):
                 a5 = ka("mid", "prefix_out", "scratch")
                 post._rs_piece(co, piece, m, SL, rb_o, go.bn, None if restart else a5.mid, a5.prefix_out,
-                               sr(a5, "o_pdone"), False, None, False, CM_DEV)
+                               sr(a5, "o_pdone"), False, None, False, CM_DEV, H)
             stamp(timeline, tls, tid, 7)
             for row in range(bid, m, BLOCKS):
                 a5r = ka("prefix_out", "bank", "cw_m", "w_ln", "scratch")
                 post._seam_row(co, row, m, SL, rb_o, ct_o, nvb_m, nbk, a5r.prefix_out, a5r.bank, a5r.cw_m, a5r.w_ln, eps,
-                               sr(a5r, "o_pdone"), red, write_m, False, None, False, CM_DEV if write_a else 0)
+                               sr(a5r, "o_pdone"), red, write_m, False, None, False, CM_DEV if write_a else 0, H)
             stamp(timeline, tls, tid, 8)
             # ---- T6: MoE front
             xm = co["ag_own"].value
@@ -381,12 +384,12 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
                wo: Int64, cw_m: Int64, w_ln: Int64, wf: Int64, acc_o: Int64, bias: Int64, lat_out: Int64,
                topk_ids: Int64, topk_w: Int64, w_sd: Int64, sh_out: Int64, cap_out: Int64, cap_ld: Int32,
                logits_out: Int64, cnt: Int64,
-               scratch: Int64, peers: Int64, rank: Int32, epoch: Int64, slot_i: Int32,
+               scratch: Int64, peers: Int64, rank: Int32, epoch: Int64, slot_i: Int32, pfx_bytes: Int64,
                stream: fx.Stream = fx.Stream(None)):  # noqa: B008
         layer_kernel(lat_p, sh_p, w_up, prefix, mid, prefix_out, bank, cw_a, w_in, w_ip, ip_buf, acc_u, kda_tab, core,
                      wo, cw_m, w_ln, wf, acc_o, bias, lat_out, topk_ids, topk_w, w_sd, sh_out, cap_out, cap_ld,
                      logits_out, cnt,
-                     scratch, peers, rank, epoch, slot_i).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
+                     scratch, peers, rank, epoch, slot_i, pfx_bytes).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     _BUILDS[key] = (launch, pl)
     return launch, pl
