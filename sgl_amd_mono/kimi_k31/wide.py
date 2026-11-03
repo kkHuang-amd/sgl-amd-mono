@@ -41,6 +41,9 @@ CFGS = {  # 8-token bucket -> (up, in_proj, o_proj, front, shared down): bm:bn:w
     256: ("128:32:4:2:8", "128:128:2:4:4", "128:64:2:4:1", "128:128:2:4:8", "128:64:2:4:1"),
     384: ("128:32:4:2:4", "192:128:4:2:2", "192:64:4:2:1", "128:128:2:4:4", "128:64:2:4:1"),
 }
+# bucket rows -> MoE front config, where the CFGS one is a poor fit: 17 column tiles x the row tiles x ks must stay
+# within BLOCKS (one round), and a row tile past m is wasted work
+FRONT_ROWS = {192: "64:128:2:4:4", 256: "96:128:2:4:4", 288: "96:128:2:4:4"}
 NARROW = 8  # rows up to this stay on Kimi-K3's launches (S1)
 
 
@@ -71,7 +74,9 @@ def buckets(L: int = 8) -> tuple:
 def cfg_rows(b: int, L: int) -> str:
     """The CFGS entry of an L-token bucket of b rows."""
     assert b % L == 0 and b // L in REQ_BUCKETS, (b, L)
-    return CFGS[8 * (b // L)]
+    c = CFGS[8 * (b // L)]
+    f = FRONT_ROWS.get(b)
+    return c if f is None else c[:3] + (f,) + c[4:]
 
 
 def wide_widths(max_reqs: int = 48) -> tuple:

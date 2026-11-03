@@ -62,16 +62,16 @@ def _arrive(tid, cnt, tile, ks, slot):
 
 
 @flyc.jit
-def _arrive_all(tid, cnt, tile, ks, slot):
+def _arrive_all(tid, cnt, tile, ks, slot, stride=1):
     """Count this K slice in ``tile``'s counter, then wait until every slice of
     the tile has: they are consecutive tasks of one round, so the wait is short."""
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
     if tid == 0:
-        ptr = fx.inttoptr(fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4), cnt + fx.Int64(tile * 4))
+        ptr = fx.inttoptr(fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4), cnt + fx.Int64(tile * (4 * stride)))
         old = fx.llvm.atomic_add(ptr, fx.Int32(1), syncscope="agent")
         target = (old // ks + 1) * ks
-        _spin(lambda: ld_i32(cnt, tile, CM_DEV), lambda v: (v - target) < 0)
+        _spin(lambda: ld_i32(cnt, tile * stride, CM_DEV), lambda v: (v - target) < 0)
     gpu.barrier()
 
 

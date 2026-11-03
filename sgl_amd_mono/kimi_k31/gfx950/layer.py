@@ -103,6 +103,7 @@ def _heads_wait(c, m0, bm, m, L, h0, nh):
 
 
 _BUILDS: dict = {}
+CNT_STRIDE = 32  # int32s between tile counters: one 128 B line each (split-K pieces of many tiles arrive at once)
 
 
 def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk=8, launches=1, eps=1e-5,
@@ -206,7 +207,7 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
 
     name = (f"k31_kda_layer_m{m}_{'_'.join('x'.join(map(str, g)) for g in cfg.key())}_L{L}_n{nf}_a{nvb_a}{int(write_a)}"
             f"_m{nvb_m}{int(write_m)}of{nbk}_l{launches}_p{kpt}_c{int(capture)}_t{int(t1)}_r{int(restart)}"
-            + ("_tl" if timeline else ""))
+            + ("_tl" if timeline else "") + "_cs")
 
     def layer_body(lat_p: Int64, sh_p: Int64, w_up: Int64, prefix: Int64, mid: Int64, prefix_out: Int64,
                      bank: Int64, cw_a: Int64, w_in: Int64, w_ip: Int64, ip_buf: Int64, acc_u: Int64, kda_tab: Int64,
@@ -261,7 +262,7 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
 
                 mma_tile(tid, lagx, LAT, m, m0, a.w_up, LAT, SL, n0, sk * ktu, ktu, gu.bm, gu.bn, gu.wm, gu.wn,
                          lds.xs.ptr, lds.ws.ptr, None, DEPTH, (e_, scaled), cl)
-                _arrive_all(tid, a.cnt, tile, gu.ks, slot)
+                _arrive_all(tid, a.cnt, tile, gu.ks, slot, CNT_STRIDE)
                 r0 = m0 + sk * rb_u
                 pre._finish(ca, a.acc_u, shs, a.prefix, a.mid, m, r0, rb_u, n0, gu.bn, gu.ks, pd_a,
                             (r0 // rb_u) * ct_u + n0 // gu.bn)
@@ -284,7 +285,7 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
                 a3 = ka("w_ip", "ip_buf", "cnt", "scratch")
                 mma_tile(tid, xa, H, m, m0, a3.w_ip, H, nin, n0, sk * kti, kti, gi.bm, gi.bn, gi.wm, gi.wn, lds.xs.ptr,
                          lds.ws.ptr, None, DEPTH, atomic_lin(a3.ip_buf, nin, n0, m, nin, True), cl)
-                _arrive_all(tid, a3.cnt + fx.Int64(4 * cnt_i), tile, gi.ks, slot)
+                _arrive_all(tid, a3.cnt + fx.Int64(4 * CNT_STRIDE * cnt_i), tile, gi.ks, slot, CNT_STRIDE)
                 rbi = gi.bm // gi.ks
                 pre._finish_proj(ca, a3.ip_buf, m, nin, m0 + sk * rbi, rbi, n0, gi.bn, gi.ks, sr(a3, "proj"))
             stamp(timeline, tls, tid, 4)
@@ -307,7 +308,7 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
                 mma_tile(tid, a4.core, KO, m, m0, a4.wo, KO, H, n0, sk * kto, kto, go.bm, go.bn, go.wm, go.wn, lds.xs.ptr,
                          lds.ws.ptr, dev_emit(a4.acc_o, H, n0, m, H, False) if go.ks == 1 else None, DEPTH,
                          None if go.ks == 1 else atomic_lin(a4.acc_o, H, n0, m, H, True), cl, CM_DEV)
-                _arrive_all(tid, a4.cnt + fx.Int64(4 * cnt_o), tile, go.ks, slot)
+                _arrive_all(tid, a4.cnt + fx.Int64(4 * CNT_STRIDE * cnt_o), tile, go.ks, slot, CNT_STRIDE)
                 piece = ((m0 + sk * rb_o) // rb_o) * ct_o + (n0 % SL) // go.bn
                 _push_band_flag(co, a4.acc_o, m, H, m0 + sk * rb_o, rb_o, n0, go.bn, go.ks, "linbf", SL, piece)
             stamp(timeline, tls, tid, 6)
@@ -335,7 +336,7 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
                 fbuf = sp(a6, "fbuf")
                 mma_tile(tid, xm, H, m, m0, a6.wf, H, nf, n0, sk * ktf, ktf, gf.bm, gf.bn, gf.wm, gf.wn, lds.xs.ptr,
                          lds.ws.ptr, None, DEPTH, atomic_lin(fbuf, nf, n0, m, nf, False), cl)
-                _arrive_all(tid, a6.cnt + fx.Int64(4 * cnt_f), tile, gf.ks, slot)
+                _arrive_all(tid, a6.cnt + fx.Int64(4 * CNT_STRIDE * cnt_f), tile, gf.ks, slot, CNT_STRIDE)
                 r0 = m0 + sk * rbf
                 mf.finish_front(cf, fbuf, sp(a6, "sgu"), m, r0, rbf, n0, gf.bn, r0 // rbf, n0 // gf.bn, nbf, sr(a6, "smark"), tnf)
             stamp(timeline, tls, tid, 9)
@@ -395,4 +396,4 @@ def counters(m, cfg, nf):
     """int32 tile counters a layer build uses (up, in_proj, o_proj tiles)."""
     gu, gi, go, gf = cfg.up, cfg.inp, cfg.oproj, cfg.front
     return (((m + gu.bm - 1) // gu.bm) * (SL // gu.bn) + ((m + gi.bm - 1) // gi.bm) * ((k1.NPROJ + gi.bn - 1) // gi.bn)
-            + ((m + go.bm - 1) // go.bm) * (H // go.bn) + ((m + gf.bm - 1) // gf.bm) * ((nf + gf.bn - 1) // gf.bn))
+            + ((m + go.bm - 1) // go.bm) * (H // go.bn) + ((m + gf.bm - 1) // gf.bm) * ((nf + gf.bn - 1) // gf.bn)) * CNT_STRIDE
