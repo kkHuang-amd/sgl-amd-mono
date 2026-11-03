@@ -26,12 +26,6 @@ import torch
 import torch.distributed as dist
 
 TP, H, NF, E = 8, 7168, 2096, 896
-CFGS = {  # rows -> the five tile GEMM configs (layer_bench.CFGS)
-    16: ("16:128:1:8:8", "16:128:1:8:4", "16:128:1:8:4", "16:128:1:8:8", "16:128:1:8:1"),
-    32: ("32:128:2:4:8", "32:128:2:4:4", "32:128:2:4:2", "32:128:2:4:8", "32:128:2:4:1"),
-    128: ("128:32:4:2:8", "128:128:2:4:4", "64:64:2:4:1", "128:128:2:4:8", "64:64:2:4:1"),
-    384: ("128:32:4:2:4", "192:128:4:2:2", "192:64:4:2:1", "128:128:2:4:4", "128:64:2:4:1"),
-}
 
 
 def _say(msg):
@@ -219,9 +213,10 @@ class WideCheck:
         spec = getattr(self.fb, "spec_info", None)
         rows = mid.shape[0]
         L = getattr(spec, "draft_token_num", 0) if spec is not None else 0
-        # a bucket's config holds exactly its rows (serving pads to it): fewer rows give a wrong latent / fault
-        width = rows if rows in CFGS else None
-        if not L or rows % L or width is None or rows < 16:
+        # serving pads to a bucket: check only steps that fill one, with that bucket's config
+        from sgl_amd_mono.kimi_k31 import wide
+
+        if L not in wide.SUPPORTED_L or rows % L or rows // L not in wide.REQ_BUCKETS:
             self.ours = None
             return
         st = self._state(rows)
@@ -229,7 +224,7 @@ class WideCheck:
         r_n = rows // L
         slots = st["meta"].mamba_cache_indices[:r_n].long()
         dev, sl, bf = self.device, H // TP, torch.bfloat16
-        cfg = lay.LayerCfg(*(Gemm(*(int(v) for v in c.split(":"))) for c in CFGS[width]))
+        cfg = lay.LayerCfg(*(Gemm(*(int(v) for v in c.split(":"))) for c in wide.cfg_rows(rows, L)))
         nvb, write = self.ref["nvb"], self.ref["write"]
         t1_in, self.t1_in = getattr(self, "t1_in", None), None
         t1 = (t1_in is not None and {"lat_p", "sh_p", "prefix"} <= set(t1_in) and t1_in["prefix"] is not None

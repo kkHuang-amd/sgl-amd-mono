@@ -94,9 +94,10 @@ def run(args, m, rank, dev, cpu):
     nva, nvm, wa = args.nvb_a, args.nvb_m, args.write_a
     sl = H // TP
     cols = slice(rank * sl, (rank + 1) * sl)
-    from sgl_amd_mono.kimi_k31.wide import CFGS as SERVE_CFGS
+    from sgl_amd_mono.kimi_k31.wide import cfg_rows
 
-    cfg = lay.LayerCfg(*(Gemm(*(int(v) for v in c.split(":"))) for c in CFGS.get(m) or SERVE_CFGS[m]))
+    cfg = lay.LayerCfg(*(Gemm(*(int(v) for v in c.split(":"))) for c in (CFGS.get(m) if L == 8 else None)
+                         or cfg_rows(m, L)))
     cap = args.capture
     launch, pl = lay.kda_layer(m, cfg, L, nf, nvb_a=nva, nvb_m=nvm, write_a=wa, nbk=nbk, launches=step, eps=EPS,
                                eps_n=1e-5, capture=cap, t1=not args.no_t1, restart=args.restart,

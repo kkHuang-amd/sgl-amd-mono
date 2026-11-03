@@ -55,7 +55,7 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
 
 class _K31Built(k3._Built):
     """Kimi-K3's built launches for the narrow widths, and the wide-row layer
-    launch (``wide.py``) for the R x 8 verify steps above them."""
+    launch (``wide.py``) for the R x L verify steps above them."""
 
     def __init__(self, base, wide_runner):
         self.__dict__.update(base.__dict__)
@@ -82,12 +82,16 @@ def _build(model, hf_config, ctx):
 
     wide_check.install(model)
     if wide.enabled() and any(w > wide.NARROW for w in ctx.widths):
+        L = wide.tokens()
+        if L not in wide.SUPPORTED_L:
+            raise ValueError(f"SGLANG_AMD_MONO_K31_WIDE=1 with {L} draft tokens a request: the wide launch "
+                             f"supports {wide.SUPPORTED_L}; unset it")
         from sglang.srt.runtime_context import get_parallel
 
         p = get_parallel()
         device = k3._backbone(model).layers[0].input_layernorm.weight.device
-        w = wide.Wide(model, p.tp_rank, p.tp_group.cpu_group, device)
-        w.warmup(buckets=wide.buckets())
+        w = wide.Wide(model, p.tp_rank, p.tp_group.cpu_group, device, L=L)
+        w.warmup()
         built = _K31Built(built, w)
     return built
 

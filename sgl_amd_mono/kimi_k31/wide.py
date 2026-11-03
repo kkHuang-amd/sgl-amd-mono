@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Wide-row verify steps (R requests x 8 rows, R >= 2) on the layer launch
-(``gfx950/layer.py``), eager v0.
+"""Wide-row verify steps (R requests x L rows, R >= 2, L = the server's draft tokens,
+6 or 8) on the layer launch (``gfx950/layer.py``), eager v0.
 
 A step walks the layers as SGLang's backbone does, except for every run of covered
 layers (KDA attention + latent MoE: all but layer 0, which has a dense MLP, and the
@@ -29,8 +29,11 @@ import os
 import torch
 
 TP, H, SL, E, NF, LAT = 8, 7168, 896, 896, 2096, 3584
-BUCKETS = (16, 32, 64, 128, 256, 384)
-CFGS = {  # bucket -> (up, in_proj, o_proj, front, shared down): bm:bn:wm:wn:ks
+REQ_BUCKETS = (2, 4, 8, 16, 32, 48)  # requests a bucket holds; its rows are L x requests
+SUPPORTED_L = (6, 8)
+BUCKETS = tuple(8 * r for r in REQ_BUCKETS)
+CFGS = {  # 8-token bucket -> (up, in_proj, o_proj, front, shared down): bm:bn:wm:wn:ks; an L-token
+    # bucket of the same requests takes the same configs
     16: ("16:128:1:8:8", "16:128:1:8:4", "16:128:1:8:4", "16:128:1:8:8", "16:128:1:8:1"),
     32: ("32:128:2:4:8", "32:128:2:4:4", "32:128:2:4:2", "32:128:2:4:8", "32:128:2:4:1"),
     64: ("64:128:2:4:8", "64:128:2:4:4", "64:64:2:4:2", "64:128:2:4:8", "64:64:2:4:1"),
@@ -45,18 +48,41 @@ def enabled() -> bool:
     return os.environ.get("SGLANG_AMD_MONO_K31_WIDE") == "1"
 
 
-def buckets() -> tuple:
+def tokens() -> int:
+    """Rows a request takes in this server's verify steps (DSpark / DFLASH draft tokens)."""
+    from sglang.srt.runtime_context import get_spec
+
+    spec = get_spec()
+    if spec.speculative_algorithm is None:
+        return 1
+    return int(spec.speculative_num_draft_tokens or 1)
+
+
+def req_buckets() -> tuple:
+    # SGLANG_AMD_MONO_K31_WIDE_BUCKETS lists rows at 8 tokens a request
     env = os.environ.get("SGLANG_AMD_MONO_K31_WIDE_BUCKETS")
-    return tuple(sorted(int(x) for x in env.split(","))) if env else BUCKETS
+    return tuple(sorted(int(x) // 8 for x in env.split(","))) if env else REQ_BUCKETS
 
 
-def wide_widths(tokens: int = 8, max_reqs: int = 48) -> tuple:
+def buckets(L: int = 8) -> tuple:
+    return tuple(L * r for r in req_buckets())
+
+
+def cfg_rows(b: int, L: int) -> str:
+    """The CFGS entry of an L-token bucket of b rows."""
+    assert b % L == 0 and b // L in REQ_BUCKETS, (b, L)
+    return CFGS[8 * (b // L)]
+
+
+def wide_widths(max_reqs: int = 48) -> tuple:
     # only widths a warmed bucket holds: a graph capture must not meet a cold one; rows
-    # up to a bucket left out below the smallest one stay on SGLang's own path
-    bs = buckets()
-    lo = max((x for x in BUCKETS if x < bs[0]), default=NARROW)
-    top = min(max_reqs, bs[-1] // tokens)
-    return tuple(tokens * r for r in range(2, top + 1) if tokens * r > lo)
+    # up to a bucket left out below the smallest one stay on SGLang's own path. The
+    # server's draft tokens are not known at import: every supported L's widths (the
+    # binding keeps those a multiple of the server's)
+    rs = req_buckets()
+    lo = max((x for x in REQ_BUCKETS if x < rs[0]), default=1)
+    top = min(max_reqs, rs[-1])
+    return tuple(sorted({L * r for L in SUPPORTED_L for r in range(max(2, lo + 1), top + 1) if L * r > NARROW}))
 
 
 def _say(msg):
@@ -127,9 +153,11 @@ def _check_steps() -> int:
 
 
 class Wide:
-    def __init__(self, model, rank, group, device):
+    def __init__(self, model, rank, group, device, L=8):
         from sgl_amd_mono.common import guard
 
+        assert L in SUPPORTED_L, L
+        self.L = L
         lm = getattr(model, "language_model", model)
         self.bb = bb = lm.model
         self.rank, self.group, self.device = rank, group, device
@@ -147,7 +175,7 @@ class Wide:
         self.slots = {i: n for n, i in enumerate(idx)}  # a launch's slot in the step
         caps = set(bb.dspark_layers_to_capture or ())
         self.peers, self.bufs, self.half = {}, {}, {}
-        self.buckets = buckets()
+        self.buckets = buckets(L)
         self.tabs = {}  # (bucket, layer) -> KDA table: every pointer in it is fixed once built
         self.epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
         # long enough for a capture variant's first compile on one rank while the
@@ -158,7 +186,8 @@ class Wide:
         self.epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
         self.cols = slice(rank * SL, (rank + 1) * SL)
         self.kda_ready = False
-        _say(f"{len(idx)} covered layers ({idx[0]} .. {idx[-1]}), captures {sorted(caps)}, "
+        _say(f"{len(idx)} covered layers ({idx[0]} .. {idx[-1]}), {L} tokens a request, buckets {self.buckets}, "
+             f"captures {sorted(caps)}, "
              f"block-write {[i for i in idx if self.layers[i].write]}, tails into a run's first launch "
              f"{sorted(self.entry)}")
 
@@ -167,7 +196,7 @@ class Wide:
         from sgl_amd_mono.kimi_k31.gfx950 import layer as lay
         from sgl_amd_mono.kimi_k31.gfx950.chain import Gemm
 
-        return lay.LayerCfg(*(Gemm(*(int(v) for v in c.split(":"))) for c in CFGS[b]))
+        return lay.LayerCfg(*(Gemm(*(int(v) for v in c.split(":"))) for c in cfg_rows(b, self.L)))
 
     def _variant(self, pk, b, L, captures):
         cap = (pk.i - 1) in captures
@@ -239,12 +268,13 @@ class Wide:
                              launches=len(self.layers), eps=pk.eps, eps_n=pk.onorm_eps, capture=v["capture"],
                              t1=v["t1"], restart=v["restart"], half_bytes=self.half[b])[0]
 
-    def warmup(self, L=8, buckets=None):
+    def warmup(self, buckets=None):
         """Compile every non-capture variant of every bucket by launching it once on
         the real weights and dummy activations, with no KDA state (every slot -1).
         Every rank runs the same launches in the same order, before any step."""
         import time
 
+        L = self.L
         from sgl_amd_mono.kimi_k3.gfx950.attention import kda as k1
         from sgl_amd_mono.kimi_k31.gfx950 import pre_attn as pa
 
@@ -258,7 +288,7 @@ class Wide:
                            torch.zeros(1, k1.NH, 16, k1.HD, dtype=f32, device=dev),
                            torch.zeros(1, k1.NH, 16, dtype=f32, device=dev)))
         n = 0
-        for b in buckets or BUCKETS:
+        for b in buckets or self.buckets:
             bufs = self._ensure(b, L, set())
             st_idx = torch.full((b // L, L), -1, dtype=torch.int32, device=dev)
             num_acc = torch.ones(b // L, dtype=torch.int32, device=dev)
@@ -394,6 +424,7 @@ class Wide:
         hidden = m.embed_tokens(input_ids) if input_embeds is None else input_embeds
         rows = hidden.shape[0]
         L = int(fb.spec_info.draft_token_num)
+        assert L == self.L and rows % L == 0, (rows, L, self.L)
         if not getattr(self, "_said", False):
             self._said = True
             _say(f"first wide step: rows {rows}, L {L}")
