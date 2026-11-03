@@ -98,6 +98,9 @@ def run(args, m, rank, dev, cpu):
 
     cfg = lay.LayerCfg(*(Gemm(*(int(v) for v in c.split(":"))) for c in (CFGS.get(m) if L == 8 else None)
                          or cfg_rows(m, L)))
+    inp = dict(kv.split("=") for kv in args.inp.split(",")) if args.inp else {}
+    if str(m) in inp:
+        cfg.inp = Gemm(*(int(v) for v in inp[str(m)].split(":")))
     cap = args.capture
     launch, pl = lay.kda_layer(m, cfg, L, nf, nvb_a=nva, nvb_m=nvm, write_a=wa, nbk=nbk, launches=step, eps=EPS,
                                eps_n=1e-5, capture=cap, t1=not args.no_t1, restart=args.restart,
@@ -346,6 +349,7 @@ def main():
     p.add_argument("--pfx-short", type=int, default=0, help="the prefix holds this many rows fewer than m (they read 0)")
     p.add_argument("--restart", action="store_true", help="block-write layer: the prefix restarts at the attention output")
     p.add_argument("--timeline", action="store_true", help="per-stage CTA marks of the last launch")
+    p.add_argument("--inp", default="", help="in_proj config by rows, e.g. 192=96:128:2:4:2,288=144:128:1:8:2")
     args = p.parse_args()
     if os.environ.get("SGLANG_AMD_MONO_ROCM_LLVM"):
         from sgl_amd_mono.common import rocm_codegen
