@@ -51,8 +51,8 @@ def main():
             if a.time:
                 tg = (
                     f"  tgemm {bench(lambda w: tgemm.mm(
-                            x, w, None, otype=torch.bfloat16
-                        ), ws):6.1f} us"
+                                x, w, None, otype=torch.bfloat16
+                            ), ws):6.1f} us"
                 )
             for cfg, mode in (
                 (c, md) for c in a.cfg.split(",") for md in a.mode.split(",")
