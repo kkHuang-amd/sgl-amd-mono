@@ -128,6 +128,11 @@ def preg(base, offset, region):
     return Addr(region, Space.PEER, base + fx.Int64(offset))
 
 
+def shift(a, delta):
+    """``a`` moved by ``delta`` bytes (a traced or Python integer), same region."""
+    return Addr(a.region, a.space, a.value + delta)
+
+
 # the store / load cache policy of a hand-off in each space
 _SCOPE_CM = {Space.SCRATCH: CM_DEV, Space.PEER: CM_SYS}
 
