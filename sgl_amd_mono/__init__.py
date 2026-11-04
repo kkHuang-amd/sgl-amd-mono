@@ -33,6 +33,7 @@ SPECS = {
         "MiniMaxM3SparseForConditionalGeneration",
         None,
     ): "sgl_amd_mono.minimax.spec:SPEC",
+    ("KimiK31ForConditionalGeneration", None): "sgl_amd_mono.kimi_k31.spec:SPEC",
     # the MTP draft routes its own steps (qwen38_flash_next/draft.py)
     ("Qwen4ExpForCausalLMMTP", None): "sgl_amd_mono.qwen38_flash_next.draft:SPEC",
     (
