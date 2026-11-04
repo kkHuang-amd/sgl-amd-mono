@@ -46,6 +46,9 @@ CFGS = {  # 8-token bucket -> (up, in_proj, o_proj, front, shared down): bm:bn:w
 FRONT_ROWS = {192: "64:128:2:4:4", 256: "96:128:2:4:4", 288: "96:128:2:4:4"}
 # bucket rows -> in_proj config, by the same rule (50 column tiles x row tiles x ks within BLOCKS, no padded row tile)
 INP_ROWS = {96: "96:128:2:4:4", 192: "192:128:4:2:4", 256: "128:128:2:4:2"}
+# bucket rows -> latent up / shared down configs, by the same rule (o_proj: padded rows measured no cost, kept)
+UP_ROWS = {192: "96:64:2:4:8", 256: "128:64:4:2:8", 288: "96:64:2:4:4", 384: "96:128:2:4:8"}
+SDOWN_ROWS = {288: "96:128:2:4:1", 384: "192:64:4:2:1"}
 NARROW = 8  # rows up to this stay on Kimi-K3's launches (S1)
 
 
@@ -77,7 +80,7 @@ def cfg_rows(b: int, L: int) -> str:
     """The CFGS entry of an L-token bucket of b rows."""
     assert b % L == 0 and b // L in REQ_BUCKETS, (b, L)
     up, inp, oproj, front, sdown = CFGS[8 * (b // L)]
-    return up, INP_ROWS.get(b, inp), oproj, FRONT_ROWS.get(b, front), sdown
+    return UP_ROWS.get(b, up), INP_ROWS.get(b, inp), oproj, FRONT_ROWS.get(b, front), SDOWN_ROWS.get(b, sdown)
 
 
 def wide_widths(max_reqs: int = 48) -> tuple:

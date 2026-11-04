@@ -25,12 +25,6 @@ TP = 8
 SETS = 3
 BF = torch.bfloat16
 H, LAT, KO = 7168, 3584, 1536
-CFGS = {  # m -> (up, in_proj, o_proj, front, shared down): bm:bn:wm:wn:ks
-    16: ("16:128:1:8:8", "16:128:1:8:4", "16:128:1:8:4", "16:128:1:8:8", "16:128:1:8:1"),
-    32: ("32:128:2:4:8", "32:128:2:4:4", "32:128:2:4:2", "32:128:2:4:8", "32:128:2:4:1"),
-    128: ("128:32:4:2:8", "128:128:2:4:4", "64:64:2:4:1", "128:128:2:4:8", "64:64:2:4:1"),
-    384: ("128:32:4:2:4", "192:128:4:2:2", "192:64:4:2:1", "128:128:2:4:4", "128:64:2:4:1"),
-}
 E, TOPK, SI = 896, 16, 768
 
 
@@ -96,11 +90,11 @@ def run(args, m, rank, dev, cpu):
     cols = slice(rank * sl, (rank + 1) * sl)
     from sgl_amd_mono.kimi_k31.wide import cfg_rows
 
-    cfg = lay.LayerCfg(*(Gemm(*(int(v) for v in c.split(":"))) for c in (CFGS.get(m) if L == 8 else None)
-                         or cfg_rows(m, L)))
-    inp = dict(kv.split("=") for kv in args.inp.split(",")) if args.inp else {}
-    if str(m) in inp:
-        cfg.inp = Gemm(*(int(v) for v in inp[str(m)].split(":")))
+    cfg = lay.LayerCfg(*(Gemm(*(int(v) for v in c.split(":"))) for c in cfg_rows(m, L)))
+    for st in ("up", "inp", "oproj", "front", "sdown"):
+        ovr = dict(kv.split("=") for kv in getattr(args, st).split(",")) if getattr(args, st) else {}
+        if str(m) in ovr:
+            setattr(cfg, st, Gemm(*(int(v) for v in ovr[str(m)].split(":"))))
     cap = args.capture
     launch, pl = lay.kda_layer(m, cfg, L, nf, nvb_a=nva, nvb_m=nvm, write_a=wa, nbk=nbk, launches=step, eps=EPS,
                                eps_n=1e-5, capture=cap, t1=not args.no_t1, restart=args.restart,
@@ -350,6 +344,10 @@ def main():
     p.add_argument("--restart", action="store_true", help="block-write layer: the prefix restarts at the attention output")
     p.add_argument("--timeline", action="store_true", help="per-stage CTA marks of the last launch")
     p.add_argument("--inp", default="", help="in_proj config by rows, e.g. 192=96:128:2:4:2,288=144:128:1:8:2")
+    p.add_argument("--up", default="", help="latent up config by rows (as --inp)")
+    p.add_argument("--oproj", default="", help="o_proj config by rows (as --inp)")
+    p.add_argument("--front", default="", help="MoE front config by rows (as --inp)")
+    p.add_argument("--sdown", default="", help="shared down config by rows (as --inp)")
     args = p.parse_args()
     if os.environ.get("SGLANG_AMD_MONO_ROCM_LLVM"):
         from sgl_amd_mono.common import rocm_codegen
