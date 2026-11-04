@@ -107,7 +107,8 @@ CNT_STRIDE = 32  # int32s between tile counters: one 128 B line each (split-K pi
 
 
 def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk=8, launches=1, eps=1e-5,
-              eps_n=1e-5, kpt=16, capture=False, t1=True, restart=False, half_bytes=0, timeline=False):
+              eps_n=1e-5, kpt=16, capture=False, t1=True, restart=False, half_bytes=0, timeline=False,
+              front_rows=None, up_norm=False):
     """Build the layer launch; returns (launch, plan). Arguments: the pre half's
     (lat_p, sh_p, w_up (``pre.fold_up``), prefix, cw_a, w_in, w_ip, ip_buf (in_proj
     merge, bf16 [m, 6288] zeroed once), acc_u (bf16 [m, 896] zeroed once)), mid
@@ -131,9 +132,13 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
     router logits, for SGLang's own top-k and experts. ``half_bytes``: lay the peer
     buffer out with at least this half size (every variant sharing one buffer must
     agree on its halves and on where the guard's flags are). ``timeline``: per-CTA clock marks (MARKS) -> the
-    scratch region ``tl``, int64 [BLOCKS, TL_POINTS]."""
+    scratch region ``tl``, int64 [BLOCKS, TL_POINTS]. ``front_rows`` (router, latent down, shared gate_up): the
+    rows of ``wf`` this rank's front rows start at, when ``wf`` is SGLang's merged front weight (no copy); None:
+    ``wf`` holds this rank's [router | latent down | shared gate_up] rows contiguously. ``up_norm``: ``w_up`` is
+    SGLang's up projection rows as is and ``bias`` continues with the latent norm weight (f32 [LAT]), which the
+    MoE tail scales the gathered latent by (else ``w_up`` is ``pre.fold_up``'s copy)."""
     key = (m, cfg.key(), L, nf, nvb_a, nvb_m, write_a, write_m, nbk, launches, eps, eps_n, kpt, capture, t1, restart,
-           half_bytes, timeline)
+           half_bytes, timeline, front_rows, up_norm)
     if key in _BUILDS:
         return _BUILDS[key]
     gu, gi, go, gf, gs = cfg.up, cfg.inp, cfg.oproj, cfg.front, cfg.sdown
@@ -172,6 +177,14 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
     cnt_f = cnt_o + tmo * tno
     rbf = gf.bm // gf.ks
     nbf = (m + rbf - 1) // rbf
+    wrow_f = None
+    if front_rows is not None:
+        n_r, n_l = mf.E_R, mf.L_R
+        o_r, o_l, o_s = front_rows
+
+        def wrow_f(row):
+            return row + (row < n_r).select(fx.Int32(o_r), (row < n_r + n_l).select(fx.Int32(o_l - n_r),
+                                                                                   fx.Int32(o_s - n_r - n_l)))
     tns, tms = H // gs.bn, (m + gs.bm - 1) // gs.bm
     n_s = tms * tns
     gems = (gu, gi, go, gf, gs)
@@ -210,7 +223,9 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
 
     name = (f"k31_kda_layer_m{m}_{'_'.join('x'.join(map(str, g)) for g in cfg.key())}_L{L}_n{nf}_a{nvb_a}{int(write_a)}"
             f"_m{nvb_m}{int(write_m)}of{nbk}_l{launches}_p{kpt}_c{int(capture)}_t{int(t1)}_r{int(restart)}"
-            + ("_tl" if timeline else "") + "_cs_pH_rp")
+            + ("_tl" if timeline else "") + ("_fr" + "x".join(map(str, front_rows)) if front_rows else "")
+            + ("_un" if up_norm else "")
+            + "_cs_pH_rp")
 
     def layer_body(lat_p: Int64, sh_p: Int64, w_up: Int64, prefix: Int64, mid: Int64, prefix_out: Int64,
                      bank: Int64, cw_a: Int64, w_in: Int64, w_ip: Int64, ip_buf: Int64, acc_u: Int64, kda_tab: Int64,
@@ -242,12 +257,13 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
             # Each stage loads the arguments and scratch regions it uses (ka) instead of keeping all of them
             # live from the kernel entry: the launch is at the SGPR limit.
             # ---- T1: MoE tail
-            a = ka("lat_p", "sh_p", "w_up", "acc_u", "cnt", "prefix", "mid", "scratch", "pfx_bytes")
+            a = ka("lat_p", "sh_p", "w_up", "acc_u", "cnt", "prefix", "mid", "scratch", "pfx_bytes",
+                   *(("bias",) if up_norm else ()))
             shs, pd_a = sp(a, "shs"), sr(a, "pdone")
             for t in range(bid, m * TP if t1 else 0, BLOCKS):
                 pre._push(ca, t // TP, t % TP, m, a.lat_p, a.sh_p)
             for row in range(bid, m if t1 else 0, BLOCKS):
-                pre._lred(ca, row, m, shs)
+                pre._lred(ca, row, m, shs, a.bias + fx.Int64(mf.E * 4) if up_norm else None)
             stamp(timeline, tls, tid, 1)
             lagx = ca["lag_own"].value
             for task in range(bid, n_u if t1 else 0, BLOCKS):
@@ -338,7 +354,7 @@ def kda_layer(m, cfg, L, nf, nvb_a=0, nvb_m=0, write_a=False, write_m=False, nbk
                 a6 = ka("wf", "cnt", "scratch")
                 fbuf = sp(a6, "fbuf")
                 mma_tile(tid, xm, H, m, m0, a6.wf, H, nf, n0, sk * ktf, ktf, gf.bm, gf.bn, gf.wm, gf.wn, lds.xs.ptr,
-                         lds.ws.ptr, None, DEPTH, atomic_lin(fbuf, nf, n0, m, nf, False), cl)
+                         lds.ws.ptr, None, DEPTH, atomic_lin(fbuf, nf, n0, m, nf, False), cl, wrow=wrow_f)
                 _arrive_all(tid, a6.cnt + fx.Int64(4 * CNT_STRIDE * cnt_f), tile, gf.ks, slot, CNT_STRIDE)
                 r0 = m0 + sk * rbf
                 mf.finish_front(cf, fbuf, sp(a6, "sgu"), m, r0, rbf, n0, gf.bn, r0 // rbf, n0 // gf.bn, nbf, sr(a6, "smark"), tnf)

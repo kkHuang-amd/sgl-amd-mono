@@ -96,9 +96,15 @@ def run(args, m, rank, dev, cpu):
         if str(m) in ovr:
             setattr(cfg, st, Gemm(*(int(v) for v in ovr[str(m)].split(":"))))
     cap = args.capture
+    from sgl_amd_mono.kimi_k31.gfx950.stages import moe_front as mf
+
+    # --front-map: wf rows from a buffer laid out as SGLang's merged front weight
+    # [shared gate_up | router (all experts) | latent down (all)], as serving reads it
+    n_sgu = nf - mf.E_R - mf.L_R
+    front_rows = (n_sgu + rank * mf.E_R, n_sgu + mf.E + rank * mf.L_R, 0) if args.front_map else None
     launch, pl = lay.kda_layer(m, cfg, L, nf, nvb_a=nva, nvb_m=nvm, write_a=wa, nbk=nbk, launches=step, eps=EPS,
                                eps_n=1e-5, capture=cap, t1=not args.no_t1, restart=args.restart,
-                               timeline=args.timeline)
+                               timeline=args.timeline, front_rows=front_rows, up_norm=args.up_norm)
     if rank == 0 and args.plan:
         print(pl.describe(), flush=True)
     peers = PeerBuffer(pl.peer_bytes(), cpu, rank, TP, dev)
@@ -120,9 +126,20 @@ def run(args, m, rank, dev, cpu):
     w_ip = (torch.randn(k1.NPROJ, H, generator=g, device=dev) / H**0.5).to(BF)
     wo = (torch.randn(H, KO, generator=g, device=dev) / KO**0.5).to(BF)
     wf = (torch.randn(nf, H, generator=g, device=dev) / H**0.5).to(BF)
+    wf_dev = wf
+    if front_rows is not None:
+        wf_dev = torch.randn(n_sgu + mf.E + mf.LAT, H, generator=g, device=dev).to(BF)
+        wf_dev[front_rows[0] : front_rows[0] + mf.E_R] = wf[: mf.E_R]
+        wf_dev[front_rows[1] : front_rows[1] + mf.L_R] = wf[mf.E_R : mf.E_R + mf.L_R]
+        wf_dev[:n_sgu] = wf[mf.E_R + mf.L_R :]
     w_sd = (torch.randn(H, SI, generator=g, device=dev) / SI**0.5).to(BF)
     bias = (torch.randn(E, generator=gs, device=dev) * 0.05).contiguous()
     w_up_r = pa.fold_up(w_up, w_n, rank)
+    bias_dev = bias
+    if args.up_norm:
+        # serving's layout: SGLang's up rows as is, the norm weight after the bias
+        w_up_r = w_up[rank * (H // TP) : (rank + 1) * (H // TP)]
+        bias_dev = torch.cat([bias, w_n.float()])
     # KDA state (ring): conv state per launch (written), committed state shared (read only)
     r_n = m // L
     gk = torch.Generator(device=dev).manual_seed(70 + rank)
@@ -237,8 +254,8 @@ def run(args, m, rank, dev, cpu):
         launch(cur["lat_p"][i].data_ptr(), cur["sh_p"][i].data_ptr(), w_up_r.data_ptr(), cur["prefix"][i].data_ptr() + col0,
                mid[i].data_ptr(), pout[i].data_ptr() + col0, cur["bank"][i].data_ptr(), cw_a.data_ptr(), ln["in"].data_ptr(),
                w_ip.data_ptr(), ip_buf[i].data_ptr(), acc_u[i].data_ptr(), tabs[i].data_ptr(), core[i].data_ptr(),
-               wo.data_ptr(), cw_m.data_ptr(), ln["post"].data_ptr(), wf.data_ptr(), acc_o[i].data_ptr(),
-               bias.data_ptr(), lat_out[i].data_ptr(), tk_ids[i].data_ptr(), tk_w[i].data_ptr(), w_sd.data_ptr(),
+               wo.data_ptr(), cw_m.data_ptr(), ln["post"].data_ptr(), wf_dev.data_ptr(), acc_o[i].data_ptr(),
+               bias_dev.data_ptr(), lat_out[i].data_ptr(), tk_ids[i].data_ptr(), tk_w[i].data_ptr(), w_sd.data_ptr(),
                sh_out[i].data_ptr(), cap_view[i].data_ptr(), NCAP * H, logits_out[i].data_ptr(), cnt.data_ptr(), scratch.data_ptr(), pa_, rank, epoch.data_ptr(), i % step,
                pfx_rows * H * 2 - col0,
                stream=torch.cuda.current_stream())
@@ -348,6 +365,8 @@ def main():
     p.add_argument("--oproj", default="", help="o_proj config by rows (as --inp)")
     p.add_argument("--front", default="", help="MoE front config by rows (as --inp)")
     p.add_argument("--sdown", default="", help="shared down config by rows (as --inp)")
+    p.add_argument("--front-map", action="store_true", help="front weight rows read in place from a merged buffer")
+    p.add_argument("--up-norm", action="store_true", help="up projection rows as is, the latent scaled by the norm weight")
     args = p.parse_args()
     if os.environ.get("SGLANG_AMD_MONO_ROCM_LLVM"):
         from sgl_amd_mono.common import rocm_codegen

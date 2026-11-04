@@ -75,8 +75,21 @@ class _K31Built(k3._Built):
 
 
 def _build(model, hf_config, ctx):
+    import torch
+
     narrow = tuple(w for w in ctx.widths if w <= wide.NARROW)
+
+    def mem():
+        return torch.cuda.mem_get_info()[0], torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
+
+    def used(a, b):
+        return "device {:.2f} / torch allocated {:.2f} / reserved {:.2f} GiB".format(
+            *((x - y) / 2**30 for x, y in ((a[0], b[0]), (b[1], a[1]), (b[2], a[2]))))
+
+    m0 = mem()
     built = k3.SPEC.build(model, hf_config, msgspec.structs.replace(ctx, widths=narrow))
+    m1 = mem()
+    wide._say(f"memory: Kimi-K3 launches {used(m0, m1)}")
     # an eager check of the wide-row layer launch on this model (off unless asked)
     from sgl_amd_mono.kimi_k31 import wide_check
 
@@ -91,7 +104,11 @@ def _build(model, hf_config, ctx):
         p = get_parallel()
         device = k3._backbone(model).layers[0].input_layernorm.weight.device
         w = wide.Wide(model, p.tp_rank, p.tp_group.cpu_group, device, L=L)
+        m2 = mem()
         w.warmup()
+        m3 = mem()
+        torch.cuda.empty_cache()
+        wide._say(f"memory: wide layers {used(m1, m2)}; warmup {used(m2, m3)}; after empty_cache {used(m0, mem())}")
         built = _K31Built(built, w)
     return built
 

@@ -124,21 +124,47 @@ class _Layer:
             wo=attn.o_proj.weight,
             cw_m=(layer.mlp_res_norm.weight.float() * layer.mlp_res_proj.weight.view(H).float()).contiguous(),
             w_ln=layer.post_attention_layernorm.weight,
-            wf=torch.cat([moe.gate.weight[r * 112 : (r + 1) * 112].to(bf),
-                          moe.routed_expert_down_proj.weight[r * 448 : (r + 1) * 448].to(bf),
-                          moe.shared_experts.gate_up_proj.weight.to(bf)]).contiguous(),
             bias=moe.gate.e_score_correction_bias.float().contiguous(),
             w_sd=moe.shared_experts.down_proj.weight,
         )
+        self.w["wf"], self.front_rows = _front_weight(moe, r)
+        self.up_norm = False
         if self.t1:
             prev = backbone.layers[i - 1].mlp
-            self.w["w_up"] = pa.fold_up(prev.routed_expert_up_proj.weight, prev.routed_expert_norm.weight, r)
+            up = prev.routed_expert_up_proj.weight[r * SL : (r + 1) * SL]
+            if os.environ.get("SGLANG_AMD_MONO_K31_WIDE_UP_COPY") != "1" and up.is_contiguous():
+                # SGLang's rows as is; the launch scales the gathered latent by the norm weight
+                self.w["w_up"], self.up_norm = up, True
+                self.w["bias"] = torch.cat([self.w["bias"], prev.routed_expert_norm.weight.float()])
+            else:
+                self.w["w_up"] = pa.fold_up(prev.routed_expert_up_proj.weight, prev.routed_expert_norm.weight, r)
         self.kda_w = dict(w_fb=attn.f_b_proj.weight, conv_w=attn.qkv_conv1d.weight.squeeze(1),
                           a_log=attn.A_log.detach().reshape(-1).contiguous(), dt_bias=attn.dt_bias,
                           on_w=attn.o_norm.weight.data.to(bf).contiguous())
         self.eps = layer.input_layernorm.variance_epsilon
         self.onorm_eps = float(attn.o_norm.eps)
         self.mamba_idx = None
+        mods = (layer, backbone.layers[i - 1]) if self.t1 else (layer,)
+        self.shared = {t.untyped_storage().data_ptr() for mod in mods for t in mod.parameters()}
+
+
+def _front_weight(moe, rank):
+    """(wf, front_rows) for the layer launch's MoE front: SGLang's merged front weight
+    (``_merge_front_weights``: router, latent down and shared gate_up as views of one
+    bf16 buffer) with the rows this rank's slices start at, else a copy of this rank's
+    [router | latent down | shared gate_up] rows (front_rows None)."""
+    from sgl_amd_mono.kimi_k31.gfx950.stages import moe_front as mf
+
+    parts = (moe.gate.weight[rank * mf.E_R : (rank + 1) * mf.E_R],
+             moe.routed_expert_down_proj.weight[rank * mf.L_R : (rank + 1) * mf.L_R],
+             moe.shared_experts.gate_up_proj.weight)
+    st = {p.untyped_storage().data_ptr() for p in parts}
+    if (os.environ.get("SGLANG_AMD_MONO_K31_WIDE_FRONT_COPY") != "1" and len(st) == 1
+            and all(p.dtype == torch.bfloat16 and p.stride() == (H, 1) for p in parts)):
+        storage = parts[0].untyped_storage()
+        base = torch.empty(0, dtype=torch.bfloat16, device=parts[0].device).set_(storage, 0, (storage.nbytes() // (2 * H), H))
+        return base, tuple((p.data_ptr() - base.data_ptr()) // (2 * H) for p in parts)
+    return torch.cat([p.to(torch.bfloat16) for p in parts]).contiguous(), None
 
 
 def _is_covered(layer) -> bool:
@@ -178,7 +204,9 @@ class Wide:
         if os.environ.get("SGLANG_AMD_MONO_K31_WIDE_ENTRY_T1", "1") == "1":
             self.entry = {i - 1 for i in idx if (i - 1) not in cov and i - 1 >= bb.start_layer
                           and _tail_fusable(bb.layers[i - 1])}
+        a0 = torch.cuda.memory_allocated()
         self.layers = {i: _Layer(bb, i, rank, cov | self.entry) for i in idx}
+        a1 = torch.cuda.memory_allocated()
         self.check_left = _check_steps()
         self.column_exit = os.environ.get("SGLANG_AMD_MONO_K31_WIDE_COLUMN_EXIT", "1") == "1"
         self.slots = {i: n for n, i in enumerate(idx)}  # a launch's slot in the step
@@ -199,6 +227,16 @@ class Wide:
              f"captures {sorted(caps)}, "
              f"block-write {[i for i in idx if self.layers[i].write]}, tails into a run's first launch "
              f"{sorted(self.entry)}")
+        own, seen = {}, set()
+        for ly in self.layers.values():
+            for k, t in (*ly.w.items(), *ly.kda_w.items()):
+                st = t.untyped_storage()
+                if st.data_ptr() in ly.shared or st.data_ptr() in seen:
+                    continue
+                seen.add(st.data_ptr())
+                own[k] = own.get(k, 0) + st.nbytes()
+        _say(f"layers: torch allocated {(a1 - a0) / 2**30:.2f} GiB")
+        _say("weight copies: " + ", ".join(f"{k} {v / 2**20:.0f} MiB" for k, v in sorted(own.items(), key=lambda x: -x[1])))
 
     # ------------------------------------------------------------ per bucket
     def _cfg(self, b):
@@ -289,7 +327,8 @@ class Wide:
 
         return lay.kda_layer(b, cfg, L, NF, nvb_a=v["nvb_a"], nvb_m=v["nvb_m"], write_a=v["write_a"], nbk=8,
                              launches=len(self.layers), eps=pk.eps, eps_n=pk.onorm_eps, capture=v["capture"],
-                             t1=v["t1"], restart=v["restart"], half_bytes=self.half[b])[0]
+                             t1=v["t1"], restart=v["restart"], half_bytes=self.half[b], front_rows=pk.front_rows,
+                             up_norm=pk.up_norm)[0]
 
     def warmup(self, buckets=None):
         """Compile every non-capture variant of every bucket by launching it once on

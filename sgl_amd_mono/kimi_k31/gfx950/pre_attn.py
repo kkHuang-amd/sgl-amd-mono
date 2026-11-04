@@ -185,9 +185,11 @@ def _sum8(c, region, base, stride):
 
 
 @flyc.jit
-def _lred(c, row, m, shs):
+def _lred(c, row, m, shs, wn=None):
     """The owner's row: latent sum -> every rank's gather region + the slice's sum
-    of squares (tagged) to every rank; shared sum (f32) -> local scratch."""
+    of squares (tagged) to every rank; shared sum (f32) -> local scratch. ``wn``: the
+    latent norm weight (f32 [LAT]) the gathered latent is scaled by (the up projection
+    then takes SGLang's weight as is); the sum of squares stays the unscaled row's."""
     tid = c["tid"]
     rank = c["rank"]
     lane = tid % 64
@@ -204,6 +206,11 @@ def _lred(c, row, m, shs):
         for x in vb[1:]:
             part = part + x * x
         ss = wave_sum(live.select(part, fx.Float32(0.0)))
+        if const_expr(wn is not None):
+            wr = rsrc(wn)
+            wv = [fx.Vector(bo.buffer_load(wr, rank * LSL + 8 * q + 4 * h, vec_width=4, dtype=T.f32)) for h in range(2)]
+            wl = [wv[e // 4][e % 4] for e in range(8)]
+            words = [bf16_pair(vb[2 * k] * wl[2 * k], vb[2 * k + 1] * wl[2 * k + 1]).bitcast(fx.Int32) for k in range(4)]
         vec = fx.Vector.from_elements(words, fx.Int32)
         if live:
             for p in range_constexpr(TP):
