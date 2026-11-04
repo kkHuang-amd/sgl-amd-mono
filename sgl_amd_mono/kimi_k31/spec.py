@@ -33,6 +33,7 @@ from sgl_amd_mono.kimi_k31 import wide
 SGLANG_READS = {
     "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": ("Feature",),
     "srt/models/kimi_k3.py": ("KimiK31ForConditionalGeneration",),
+    "srt/runtime_context.py": ("get_parallel",),
 }
 
 # The decode context parallel size the launch was checked at.

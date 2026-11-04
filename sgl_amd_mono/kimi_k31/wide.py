@@ -28,6 +28,22 @@ import os
 
 import torch
 
+# The SGLang names this module reads (test/unit/test_contract.py).
+SGLANG_READS = {
+    "srt/runtime_context.py": ("get_spec",),
+    "srt/models/kimi_k3.py": ("KimiK3MoE", "AuxHiddenStateList", "_cdiv"),
+    # the new dev_amd moved KimiK3MoE's ROCm paths into kimi_k3_amd
+    "srt/models/kimi_k3_amd/moe.py": ("_vector_aligned", "_COLUMN_TAIL_MAX_TOKENS", "_forward_shared_casting_routed"),
+    "srt/layers/attn_residual_hip.py": ("gather_covers",),
+    "srt/layers/attention/linear/utils.py": ("select_verify_intermediate_state_indices",),
+    "srt/model_executor/forward_context.py": ("get_attn_backend",),
+    "srt/layers/layer_boundary/residual/batch.py": ("written_residual", "final_norm", "fold", "set_written", "start"),
+    # re-exported by srt/distributed/__init__.py
+    "srt/distributed/communication_op.py": ("tensor_model_parallel_all_reduce", "tensor_model_parallel_all_gather"),
+    "srt/distributed/parallel_state.py": ("get_tp_group",),
+    "srt/utils/common.py": ("BumpAllocator",),
+}
+
 TP, H, SL, E, NF, LAT = 8, 7168, 896, 896, 2096, 3584
 REQ_BUCKETS = (2, 4, 8, 16, 32, 48)  # requests a bucket holds; its rows are L x requests
 SUPPORTED_L = (6, 8)
@@ -429,7 +445,7 @@ class Wide:
         x = layer.ffn_boundary.prepare(h, fb)
         prefix = written_residual(fb)
         assert x.shape == (rows, H) and prefix is not None and prefix.shape == (rows, H), (x.shape, prefix)
-        from sglang.srt.models.kimi_k3 import _vector_aligned
+        from sglang.srt.models.kimi_k3_amd.moe import _vector_aligned
 
         moe = layer.mlp
         # as SGLang's fused front: the routed input's bf16 cast rides the shared SiTU launch
@@ -437,9 +453,12 @@ class Wide:
         gate_up, logits, routed = moe._fused_front(x, cast_routed=not defer)
         if defer and not _vector_aligned(routed):
             defer, routed = False, routed.to(x.dtype)
-        cast = (routed, torch.empty(routed.shape, dtype=x.dtype, device=x.device)) if defer else None
-        moe._forward_shared(gate_up, bufs["sh"][ping][:rows], routed_cast=cast)
-        moe._forward_routed(x, logits, cast[1] if defer else routed, bufs["lat_p"][ping][:rows])
+        sh = bufs["sh"][ping][:rows]
+        if defer:
+            routed = moe._forward_shared_casting_routed(gate_up, sh, routed)
+        else:
+            moe._forward_shared(gate_up, sh)
+        moe._forward_routed(x, logits, routed, bufs["lat_p"][ping][:rows])
         return x, prefix
 
     def _column_exit(self, moe, b, rows, bufs, ping):
@@ -447,17 +466,18 @@ class Wide:
         [latent | shared] pair, this rank's stream columns (its prefix columns added
         there), and the stream's all-gather that also stages the next layer's attention
         read. None, before anything runs, when SGLang's kernels do not take the batch."""
-        from sglang.kernels.ops.attention import k3_attn_res_read_hip as hip
+        import sglang.kernels.ops.attention.k3_attn_res_read_hip as hip
+        import sglang.srt.models.kimi_k3_amd.moe as k3_amd_moe
         from sglang.srt.distributed import tensor_model_parallel_all_reduce
-        from sglang.srt.models import kimi_k3 as k3m
+        from sglang.srt.layers.attn_residual_hip import gather_covers
 
         read = moe.next_attn_read
-        if (not self.column_exit or read is None or rows > k3m._COLUMN_TAIL_MAX_TOKENS
+        if (not self.column_exit or read is None or rows > k3_amd_moe._COLUMN_TAIL_MAX_TOKENS
                 or not moe._fused_latent_tail_eligible):
             return None
         prefix = bufs["pout"][ping][:rows]  # this rank's columns written, the others 0
         if not (hip.tail_covered(bufs["sh"][ping][:rows], prefix)
-                and read.bank.require().gather_covers(rows, SL, read.writes_block)):
+                and gather_covers(read.bank.require(), rows, SL, read.writes_block)):
             return None
         red = tensor_model_parallel_all_reduce(bufs["flat"][ping])
         stream = moe._column_tail_and_next_read(red[: b * LAT].view(b, LAT)[:rows], red[b * LAT :].view(b, H)[:rows],

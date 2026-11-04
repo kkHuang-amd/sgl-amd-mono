@@ -25,6 +25,14 @@ import os
 import torch
 import torch.distributed as dist
 
+# The SGLang names this module reads (test/unit/test_contract.py).
+SGLANG_READS = {
+    "srt/runtime_context.py": ("get_parallel",),
+    "srt/model_executor/forward_context.py": ("get_attn_backend",),
+    "srt/layers/attention/linear/utils.py": ("select_verify_intermediate_state_indices",),
+    "srt/layers/attn_residual.py": ("AttnResidual",),
+}
+
 TP, H, NF, E = 8, 7168, 2096, 896
 
 
@@ -94,7 +102,7 @@ class WideCheck:
 
     # ---------------------------------------------------------------- hooks
     def _hooks(self):
-        from sglang.srt.layers import attn_residual
+        import sglang.srt.layers.attn_residual as attn_residual
 
         chk = self
         orig = attn_residual.AttnResidual.forward
@@ -137,14 +145,17 @@ class WideCheck:
                 self.ref["latent"], self.ref["topk"] = inp[0].clone(), inp[1]
         moe.experts.register_forward_pre_hook(experts_in)
         def wrap_shared(mod, store):
-            orig_fs = mod._forward_shared
+            # the new dev_amd's fp32 front casts the routed input in the shared launch
+            # (_forward_shared_casting_routed); otherwise _forward_shared
+            for name in ("_forward_shared", "_forward_shared_casting_routed"):
+                orig = getattr(mod, name)
 
-            def fs(gate_up, shared_output, *a, **k):
-                out = orig_fs(gate_up, shared_output, *a, **k)
-                store(shared_output.clone())
-                return out
+                def fs(gate_up, shared_output, *a, _orig=orig, **k):
+                    out = _orig(gate_up, shared_output, *a, **k)
+                    store(shared_output.clone())
+                    return out
 
-            mod._forward_shared = fs
+                setattr(mod, name, fs)
 
         def wrap_routed(mod, store):
             orig_fr = mod._forward_routed
