@@ -93,6 +93,58 @@ def timeline(pl, scratch, m, rank):
     print("  end by rank: " + " ".join(f"{e:5.1f}" for e in ends), flush=True)
 
 
+def sort_check(m, nl, tk_ids, tk_w, lat_out, moe_out, sortb, rank):
+    """The launch's sort + quant (``--sort``) vs SGLang's small-sort Triton kernel on the launch's own ids /
+    weights / latent, bit for bit: num_valid, sorted ids / weights / expert ids up to num_valid, every fp8 byte,
+    the e8m0 codes of the real sorted rows (padding rows are never read), and the MoE output zeroed."""
+    from sglang.kernels.ops.moe.moe_sorting_small import _run_small_sort
+
+    from sgl_amd_mono.kimi_k31.wide import _sort_views
+
+    bad = 0
+    pad = (TOPK << 24) | m
+    for i in range(nl):
+        v = _sort_views(sortb[i], m)
+        ids, w = tk_ids[i].contiguous(), tk_w[i].contiguous()
+        maxp = v["ids"].numel()
+        r_ids = torch.empty(maxp, dtype=torch.int32, device=ids.device)
+        r_w = torch.empty(maxp, dtype=torch.float32, device=ids.device)
+        r_e = torch.empty(v["eids"].numel(), dtype=torch.int32, device=ids.device)
+        r_nv = torch.empty(2, dtype=torch.int32, device=ids.device)
+        r_buf = torch.ones(m, LAT, dtype=BF, device=ids.device)
+        r_q, r_qs = _run_small_sort(
+            ids, w, r_ids, r_w, r_e, r_nv, r_buf, 32, lat_out[i], E
+        )
+        nv = int(r_nv[0])
+        e = dict(
+            nv=int((v["nv"] != r_nv).sum()),
+            ids=int((v["ids"][:nv] != r_ids[:nv]).sum()),
+            w=int((v["w"][:nv].view(torch.int32) != r_w[:nv].view(torch.int32)).sum()),
+            eids=int((v["eids"][: nv // 32] != r_e[: nv // 32]).sum()),
+            q=int((v["q"].view(torch.uint8) != r_q.view(torch.uint8)).sum()),
+            out=int((moe_out[i] != 0).sum()),
+        )
+        d = torch.nonzero(r_ids[:nv] != pad).flatten()
+        y = torch.arange(112, device=ids.device)
+        base = (d // 32) * (112 * 32) + (d % 16) * 4 + (d % 32) // 16
+        sw = (
+            base[:, None]
+            + ((y // 8) * 256 + (y % 4) * 64 + ((y % 8) // 4) * 2)[None, :]
+        )
+        e["qs"] = int(
+            (v["qs"].flatten()[sw] != r_qs.view(torch.uint8).flatten()[sw]).sum()
+        )
+        n_bad = sum(e.values())
+        bad += n_bad
+        if rank == 0 and (i == 0 or n_bad):
+            print(
+                f"sort check m {m} launch {i}: num_valid {nv} rows {d.numel()} mismatches {e}"
+                + (" PASS" if n_bad == 0 else " FAIL"),
+                flush=True,
+            )
+    return bad
+
+
 def run(args, m, rank, dev, cpu):
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
@@ -145,6 +197,7 @@ def run(args, m, rank, dev, cpu):
         timeline=args.timeline,
         front_rows=front_rows,
         up_norm=args.up_norm,
+        sort=args.sort,
     )
     if rank == 0 and args.plan:
         print(pl.describe(), flush=True)
@@ -355,7 +408,19 @@ def run(args, m, rank, dev, cpu):
     lat_out = torch.zeros(nl, m, 3584, dtype=BF, device=dev)
     tk_ids = torch.zeros(nl, m, TOPK, dtype=torch.int32, device=dev)
     tk_w = torch.zeros(nl, m, TOPK, device=dev)
-    sh_out = torch.zeros(nl, m, H, dtype=BF, device=dev)
+    if args.sort:
+        # wide's flat ping: the MoE output [m, 3584] right before sh_out (the launch zeroes it: filled with 1 here)
+        moe_sh = torch.zeros(nl, m * (LAT + H), dtype=BF, device=dev)
+        moe_out = moe_sh[:, : m * LAT].view(nl, m, LAT)
+        sh_out = moe_sh[:, m * LAT :].view(nl, m, H)
+        moe_out.fill_(1.0)
+        sort_lay = mf.sort_layout(m)
+        sortb = torch.zeros(nl, sort_lay["nbytes"], dtype=torch.uint8, device=dev)
+        for i in range(nl):
+            mf.sort_init(sortb[i], m)
+    else:
+        sh_out = torch.zeros(nl, m, H, dtype=BF, device=dev)
+        sortb = torch.zeros(nl, 256, dtype=torch.uint8, device=dev)
     aux = torch.zeros(nl, m, NCAP * H, dtype=BF, device=dev)
     logits_out = torch.zeros(nl, m, E, device=dev)
     cap_view = aux[..., CAP_SLOT * H : (CAP_SLOT + 1) * H]
@@ -364,7 +429,7 @@ def run(args, m, rank, dev, cpu):
     pa_ = peers.addresses.data_ptr()
     assert nl % step == 0
 
-    def one(i):
+    def one(i, sb=None):
         if i % step == 0:
             epoch[0].add_(1)
         launch(
@@ -403,12 +468,31 @@ def run(args, m, rank, dev, cpu):
             epoch.data_ptr(),
             i % step,
             pfx_rows * H * 2 - col0,
+            sortb[i if sb is None else sb].data_ptr(),
             stream=torch.cuda.current_stream(),
         )
 
     for i in range(nl):
         one(i)
     torch.cuda.synchronize()
+    sort_bad = (
+        sort_check(m, nl, tk_ids, tk_w, lat_out, moe_out, sortb, rank)
+        if args.sort
+        else 0
+    )
+    if args.sort and nl > 1:
+        # again with each sort buffer holding another launch's rows (the reset-to-pad path serving runs: one
+        # buffer a bucket, a different routing every layer)
+        moe_out.fill_(1.0)
+        for i in range(nl):
+            one(i, (i + 1) % nl)
+        torch.cuda.synchronize()
+        rot = torch.stack([sortb[(i + 1) % nl] for i in range(nl)])
+        sort_bad += sort_check(m, nl, tk_ids, tk_w, lat_out, moe_out, rot, rank)
+        # back to each launch's own buffer for the timing loop
+        for i in range(nl):
+            one(i)
+        torch.cuda.synchronize()
     graph, us = graph_us(one, nl)
     worst = dict(
         mid=0.0, h=0.0, core=0.0, latent=0.0, sh=0.0, w=0.0, w_own=0.0, cap=0.0, win=0.0
@@ -569,6 +653,12 @@ def main():
     )
     p.add_argument(
         "--timeline", action="store_true", help="per-stage CTA marks of the last launch"
+    )
+    p.add_argument(
+        "--sort",
+        action="store_true",
+        help="the launch makes the routed experts' sort + mxfp8 quant + output zeroing; checked bit for bit "
+        "against SGLang's small-sort kernel",
     )
     p.add_argument(
         "--inp",

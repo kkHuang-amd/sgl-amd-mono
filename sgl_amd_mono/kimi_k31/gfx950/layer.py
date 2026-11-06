@@ -25,6 +25,7 @@ from sgl_amd_mono.common.ops import CM_DEV, KernArgs, load_ptr64
 from sgl_amd_mono.common.plan import (
     BLOCKS,
     THREADS,
+    WAVES,
     first_task,
     kernel_sources,
     key_tuple,
@@ -118,6 +119,7 @@ def plan(m, cfg, L, nvb_a, nvb_m, nf, capture=False, timeline=False):
     p.region("smark", nbf * tnf * 8, peer=False)
     p.region("hbuf", m * mf.SI * 2, peer=False)
     p.region("hmark", m * 8, peer=False)
+    p.region("srtmk", 8, peer=False)  # sort builds: sort_rows -> place_codes
     p.stage("route", m, waits_on=("front",), all_ranks=True)
     p.stage("situ", m, waits_on=("front",))
     p.stage(
@@ -167,6 +169,7 @@ def kda_layer(
     timeline=False,
     front_rows=None,
     up_norm=False,
+    sort=False,
 ):
     """Build the layer launch; returns (launch, plan). Arguments: the pre half's
     (lat_p, sh_p, w_up (``pre.fold_up``), prefix, cw_a, w_in, w_ip, ip_buf (in_proj
@@ -218,6 +221,7 @@ def kda_layer(
         timeline,
         front_rows,
         up_norm,
+        sort,
     )
     if key in _BUILDS:
         return _BUILDS[key]
@@ -230,6 +234,9 @@ def kda_layer(
         and (not write_a or nvb_m <= nvb_a + 1)
         and (not write_m or nvb_m < nbk)
     )
+    # sort: the routed experts' sort + mxfp8 quant + output zeroing made here (mf.sort_rows), SGLang's small-sort
+    # range only; sort_buf holds mf.sort_layout(m), the MoE output sits right before sh_out (wide's flat ping)
+    assert not sort or m <= mf.SORT_MAX_ROWS, m
     # the up and in_proj finishes read and zero linbf tiles
     assert gu.ks > 1 and gi.ks > 1
     pl, pp, po = plan(m, cfg, L, nvb_a, nvb_m, nf, capture, timeline)
@@ -264,6 +271,14 @@ def kda_layer(
     cnt_f = cnt_o + tmo * tno
     rbf = gf.bm // gf.ks
     nbf = (m + rbf - 1) // rbf
+    cnt_end = cnt_f + tmf * tnf
+    w_rt, w_lc = (
+        cnt_end * CNT_STRIDE,
+        (cnt_end + 1) * CNT_STRIDE,
+    )  # sort: rows routed / sort launches
+    lay_s = mf.sort_layout(m) if sort else None
+    sort_cta = BLOCKS - m - 1
+    help0 = sort_cta - mf.SORT_HELPERS  # place_codes CTAs: help0 .. sort_cta - 1
     wrow_f = None
     if front_rows is not None:
         n_r, n_l = mf.E_R, mf.L_R
@@ -279,6 +294,8 @@ def kda_layer(
 
     tns, tms = H // gs.bn, (m + gs.bm - 1) // gs.bm
     n_s = tms * tns
+    # sort builds: place_codes / sort_rows CTAs clear of route (0 .. m-1), sdown (0 .. n_s-1), situ (last m)
+    assert not sort or BLOCKS - m - 1 - mf.SORT_HELPERS >= max(m, n_s), (m, n_s)
     gems = (gu, gi, go, gf, gs)
     bmx, bnx = max(g.bm for g in gems), max(g.bn for g in gems)
     cwords = max(g.bm * (g.bn + 4) for g in gems)
@@ -297,11 +314,19 @@ def kda_layer(
     class KdwLds:
         v: fx.Array[fx.Float32, kwl, 16]
 
+    @fx.struct
+    class SortLds:
+        masks: fx.Array[fx.Int32, 2 * mf.E, 16]
+        bb: fx.Array[fx.Int32, mf.E, 16]
+        sa: fx.Array[fx.Int32, WAVES, 16]
+        sb: fx.Array[fx.Int32, WAVES, 16]
+
     @fx.union
     class Smem:
         ab: AbLds
         c: CLds
         kw: KdwLds
+        srt: SortLds
 
     @fx.struct
     class Small:
@@ -319,6 +344,7 @@ def kda_layer(
         + ("_tl" if timeline else "")
         + ("_fr" + "x".join(map(str, front_rows)) if front_rows else "")
         + ("_un" if up_norm else "")
+        + ("_srt" if sort else "")
         + "_cs_pH_rp"
     )
 
@@ -358,6 +384,7 @@ def kda_layer(
         epoch: Int64,
         slot_i: Int32,
         pfx_bytes: Int64,
+        sort_buf: Int64,
     ):
         own = load_ptr64(peers, rank)
         with guard.scope(
@@ -732,20 +759,78 @@ def kda_layer(
             stamp(timeline, tls, tid, 9)
             # ---- T6 tail: routing + latent for the experts, shared SiTU + down
             for row in range(bid, m, BLOCKS):
-                a7 = ka("bias", "lat_out", "topk_ids", "topk_w", "logits_out")
-                mf.route_row(
-                    cf,
-                    row,
-                    m,
-                    rbf,
-                    nbf,
-                    gf.bn,
-                    a7.bias,
-                    a7.lat_out,
-                    a7.topk_ids,
-                    a7.topk_w,
-                    a7.logits_out,
-                )
+                if const_expr(sort):
+                    a7 = ka(
+                        "bias",
+                        "lat_out",
+                        "topk_ids",
+                        "topk_w",
+                        "logits_out",
+                        "sh_out",
+                        "sort_buf",
+                        "cnt",
+                    )
+                    mf.route_row(
+                        cf,
+                        row,
+                        m,
+                        rbf,
+                        nbf,
+                        gf.bn,
+                        a7.bias,
+                        a7.lat_out,
+                        a7.topk_ids,
+                        a7.topk_w,
+                        a7.logits_out,
+                        qout=a7.sort_buf + fx.Int64(lay_s["offs"]["q"]),
+                        tscale=a7.sort_buf + fx.Int64(lay_s["offs"]["ts"]),
+                        moe_out=a7.sh_out - fx.Int64(m * mf.LAT * 2),
+                        cnt=a7.cnt,
+                        cnt_word=w_rt,
+                    )
+                else:
+                    a7 = ka("bias", "lat_out", "topk_ids", "topk_w", "logits_out")
+                    mf.route_row(
+                        cf,
+                        row,
+                        m,
+                        rbf,
+                        nbf,
+                        gf.bn,
+                        a7.bias,
+                        a7.lat_out,
+                        a7.topk_ids,
+                        a7.topk_w,
+                        a7.logits_out,
+                    )
+            if const_expr(sort):
+                sl = (
+                    st.srt.peek()
+                )  # outside the dynamic branch: the storage object is not an IR value
+                if bid == sort_cta:
+                    a7s = ka("cnt", "topk_ids", "topk_w", "sort_buf", "scratch")
+                    mf.sort_rows(
+                        cf,
+                        tid,
+                        m,
+                        a7s.cnt,
+                        w_rt,
+                        w_lc,
+                        a7s.topk_ids,
+                        a7s.topk_w,
+                        a7s.sort_buf,
+                        lay_s,
+                        sr(a7s, "srtmk"),
+                        sl.masks.ptr,
+                        sl.bb.ptr,
+                        sl.sa.ptr,
+                        sl.sb.ptr,
+                    )
+                if (bid >= help0) & (bid < sort_cta):
+                    a7h = ka("sort_buf", "scratch")
+                    mf.place_codes(
+                        cf, tid, bid - help0, m, a7h.sort_buf, lay_s, sr(a7h, "srtmk")
+                    )
             stamp(timeline, tls, tid, 10)
             for row in range(first_task(bid, max(BLOCKS - m, 0)), m, BLOCKS):
                 a8 = ka("scratch")
@@ -852,6 +937,7 @@ def kda_layer(
         epoch: Int64,
         slot_i: Int32,
         pfx_bytes: Int64,
+        sort_buf: Int64,
         stream: fx.Stream = fx.Stream(None),
     ):  # noqa: B008
         _ = keyed
@@ -891,6 +977,7 @@ def kda_layer(
             epoch,
             slot_i,
             pfx_bytes,
+            sort_buf,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     _BUILDS[key] = (launch, pl)
@@ -905,4 +992,5 @@ def counters(m, cfg, nf):
         + ((m + gi.bm - 1) // gi.bm) * ((k1.NPROJ + gi.bn - 1) // gi.bn)
         + ((m + go.bm - 1) // go.bm) * (H // go.bn)
         + ((m + gf.bm - 1) // gf.bm) * ((nf + gf.bn - 1) // gf.bn)
+        + 2  # sort builds: rows routed, sort launches
     ) * CNT_STRIDE

@@ -24,6 +24,7 @@ what they see today. Rows are padded to a bucket (padded requests have no KDA
 state: slot -1).
 """
 
+import contextlib
 import os
 
 import torch
@@ -189,6 +190,39 @@ def _say(msg):
         print(f"[k31 wide] {msg}", flush=True)
 
 
+def _launch_sort(b) -> bool:
+    """Bucket b's launches also make the routed experts' sort + mxfp8 quant + output zeroing
+    (``SGLANG_AMD_MONO_K31_WIDE_LAUNCH_SORT=1``, needs ``..._LAUNCH_TOPK=1``): SGLang's small-sort range only."""
+    from sgl_amd_mono.kimi_k31.gfx950.stages import moe_front as mf
+
+    return (
+        os.environ.get("SGLANG_AMD_MONO_K31_WIDE_LAUNCH_SORT", "0") == "1"
+        and os.environ.get("SGLANG_AMD_MONO_K31_WIDE_LAUNCH_TOPK", "0") == "1"
+        and b <= mf.SORT_MAX_ROWS
+    )
+
+
+def _sort_views(buf, m):
+    """Tensor views of the launch's sort buffer (``moe_front.sort_layout``), as SGLang's small sort returns them."""
+    from sgl_amd_mono.kimi_k31.gfx950.stages import moe_front as mf
+
+    ly = mf.sort_layout(m)
+    o = ly["offs"]
+
+    def at(k, n):
+        return buf[o[k] : o[k] + n]
+
+    maxp, nblk, srows = ly["maxp"], ly["nblk"], ly["srows"]
+    return dict(
+        ids=at("ids", 4 * maxp).view(torch.int32),
+        w=at("w", 4 * maxp).view(torch.float32),
+        eids=at("eids", 4 * nblk).view(torch.int32),
+        nv=at("nv", 8).view(torch.int32),
+        q=at("q", m * LAT).view(torch.float8_e4m3fn).view(m, LAT),
+        qs=at("qs", srows * mf.SCALE_COLS).view(srows, mf.SCALE_COLS),
+    )
+
+
 def _launch_topk_ok(moe) -> bool:
     """Whether the routed experts may take the launch's own top-16 (ids, w) instead of SGLang's
     ``self.topk``: the launch's route stage is sigmoid + bias, ungrouped top-16, renormalized (10.18), so only a
@@ -261,7 +295,7 @@ def _topk_check(moe, lat, logits, ids, w):
         )
 
 
-def _routed(moe, lat, logits, ids, w, out):
+def _routed(moe, lat, logits, ids, w, out, sortv=None):
     """SGLang's ``KimiK3MoE._forward_routed(lat, logits, lat, out)``, with the launch's (ids, w) in place of
     ``self.topk`` when ``SGLANG_AMD_MONO_K31_WIDE_LAUNCH_TOPK=1`` (saves aiter's topk kernel a layer)."""
     if not _launch_topk_ok(moe):
@@ -275,11 +309,18 @@ def _routed(moe, lat, logits, ids, w, out):
         and not torch.cuda.is_current_stream_capturing()
     ):
         _topk_check(moe, lat, logits, ids, w)
-    _experts(moe, lat, ids, w, out)
+    if (
+        sortv is not None
+        and os.environ.get("SGLANG_AMD_MONO_K31_WIDE_SORT_CHECK", "0") == "1"
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        _sort_check(moe, lat, ids, w, out, sortv)
+        return
+    _experts(moe, lat, ids, w, out, sortv)
 
 
-def _experts(moe, lat, ids, w, out):
-    """SGLang's routed experts on the launch's (ids, w) -> out."""
+def _experts(moe, lat, ids, w, out, sortv):
+    """SGLang's routed experts on the launch's (ids, w) -> out; with ``sortv``, on the launch's sort + quant."""
     from sglang.srt.layers import zero_copy_context
     from sglang.srt.layers.moe import route_quant_handoff
     from sglang.srt.layers.moe.topk import build_precomputed_topk_output
@@ -290,12 +331,92 @@ def _experts(moe, lat, ids, w, out):
         topk_output = build_precomputed_topk_output(
             w, ids, moe.topk.topk_config, moe.layer_idx
         )
-        with zero_copy_context.set_moe_output(out):
-            y = moe.experts(lat, topk_output)
+        with contextlib.ExitStack() as es:
+            inj = None
+            if sortv is not None:
+                from sgl_amd_mono.kimi_k31 import presort
+
+                inj = es.enter_context(presort.injected(sortv, ids.shape[0], ids, out))
+            with zero_copy_context.set_moe_output(out):
+                y = moe.experts(lat, topk_output)
+            if inj is not None and not getattr(moe, "_k31_sort_said", False):
+                moe._k31_sort_said = True
+                _say(
+                    f"launch sort {'on' if inj['used'] else 'NOT used'} (layer {moe.layer_idx})"
+                )
     finally:
         route_quant_handoff.clear()
     if y.data_ptr() != out.data_ptr():
         out.copy_(y)
+
+
+_SORT_CHECK = dict(calls=0, bad=0)
+
+
+def _sort_check(moe, lat, ids, w, out, sortv):
+    """Debug (``SGLANG_AMD_MONO_K31_WIDE_SORT_CHECK=1``, eager): on the served data, (1) the launch's sort
+    buffers vs SGLang's small-sort kernel on the same ids / weights / latent (as layer_bench --sort), (2) the
+    MoE output zeroed by the launch, (3) the experts' output with the launch's sort vs with SGLang's own."""
+    from sglang.kernels.ops.moe.moe_sorting_small import _run_small_sort
+
+    m = ids.shape[0]
+    st = _SORT_CHECK
+    st["calls"] += 1
+    pad = (16 << 24) | m
+    maxp, nblk = sortv["ids"].numel(), sortv["eids"].numel()
+    dev = ids.device
+    r_ids = torch.empty(maxp, dtype=torch.int32, device=dev)
+    r_w = torch.empty(maxp, dtype=torch.float32, device=dev)
+    r_e = torch.empty(nblk, dtype=torch.int32, device=dev)
+    r_nv = torch.empty(2, dtype=torch.int32, device=dev)
+    r_buf = torch.empty(m, LAT, dtype=torch.bfloat16, device=dev)
+    r_q, r_qs = _run_small_sort(
+        ids.contiguous(), w.contiguous(), r_ids, r_w, r_e, r_nv, r_buf, 32, lat, E
+    )
+    nv = int(r_nv[0])
+    e = dict(
+        nv=int((sortv["nv"] != r_nv).sum()),
+        ids=int((sortv["ids"][:nv] != r_ids[:nv]).sum()),
+        w=int((sortv["w"][:nv].view(torch.int32) != r_w[:nv].view(torch.int32)).sum()),
+        eids=int((sortv["eids"][: nv // 32] != r_e[: nv // 32]).sum()),
+        q=int((sortv["q"].view(torch.uint8) != r_q.view(torch.uint8)).sum()),
+        out_nonzero=int((out != 0).sum()),
+    )
+    d = torch.nonzero(r_ids[:nv] != pad).flatten()
+    y = torch.arange(112, device=dev)
+    base = (d // 32) * (112 * 32) + (d % 16) * 4 + (d % 32) // 16
+    sw = base[:, None] + ((y // 8) * 256 + (y % 4) * 64 + ((y % 8) // 4) * 2)[None, :]
+    e["qs"] = int(
+        (sortv["qs"].flatten()[sw] != r_qs.view(torch.uint8).flatten()[sw]).sum()
+    )
+    ref = torch.empty_like(out)
+    ref2 = torch.empty_like(out)
+    _experts(moe, lat, ids, w, ref, None)
+    _experts(
+        moe, lat, ids, w, ref2, None
+    )  # SGLang's own run to run spread (stage 2 accumulates atomically)
+    _experts(moe, lat, ids, w, out, sortv)
+
+    def rel(a, b):
+        return float((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-30))
+
+    e["out_rel"] = rel(out, ref)
+    e["ref_rel"] = rel(ref2, ref)
+    bad = (
+        any(v for k, v in e.items() if k not in ("out_rel", "ref_rel"))
+        or e["out_rel"] > 1e-2
+    )
+    st["bad"] += int(bad)
+    st["out_rel"] = st.get("out_rel", 0.0) + e["out_rel"]
+    st["ref_rel"] = st.get("ref_rel", 0.0) + e["ref_rel"]
+    if bad or st["calls"] <= 3 or st["calls"] % 100 == 0:
+        _say(
+            f"sort check mean over {st['calls']} calls: out_rel {st['out_rel'] / st['calls']:.2e} "
+            f"ref_rel (SGLang vs itself) {st['ref_rel'] / st['calls']:.2e}"
+        )
+        _say(
+            f"sort check call {st['calls']} layer {moe.layer_idx} m {m} nv {nv}: {e} bad so far {st['bad']}"
+        )
 
 
 class _Layer:
@@ -576,6 +697,18 @@ class Wide:
             num_acc=torch.ones(b // L, dtype=torch.int32, device=dev),
             win_row=torch.full((b // L,), -1, dtype=torch.int32, device=dev),
         )
+        # the launch's sort + quant (sort builds); a placeholder pointer otherwise
+        from sgl_amd_mono.kimi_k31.gfx950.stages import moe_front as mf
+
+        if _launch_sort(b):
+            bufs["sort"] = torch.zeros(
+                mf.sort_layout(b)["nbytes"], dtype=torch.uint8, device=dev
+            )
+            mf.sort_init(bufs["sort"], b)
+            bufs["sortv"] = _sort_views(bufs["sort"], b)
+        else:
+            bufs["sort"] = torch.zeros(256, dtype=torch.uint8, device=dev)
+            bufs["sortv"] = None
         self.bufs[b] = bufs
         _say(f"bucket {b}: peer {need / 1e6:.1f} MB, scratch {scratch / 1e6:.1f} MB")
         return bufs
@@ -623,6 +756,7 @@ class Wide:
             self.epoch.data_ptr(),
             slot,
             pre.shape[0] * H * 2 - col0,
+            bufs["sort"].data_ptr(),
         )
 
     def _build_launch(self, pk, b, L, v, cfg):
@@ -646,6 +780,7 @@ class Wide:
             half_bytes=self.half[b],
             front_rows=pk.front_rows,
             up_norm=pk.up_norm,
+            sort=_launch_sort(b),
         )[0]
 
     def warmup(self, buckets=None):
@@ -988,6 +1123,8 @@ class Wide:
                     bufs["ids"][:rows],
                     bufs["w"][:rows],
                     lat_p[:rows],
+                    # the launch sorted all b rows: usable only when the step fills its bucket (pad = M = rows)
+                    sortv=bufs["sortv"] if rows == b else None,
                 )
                 ping = cur
             # leave: the last layer's MoE tail on SGLang
