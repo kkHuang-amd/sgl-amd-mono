@@ -32,13 +32,41 @@ import torch
 # The SGLang names this module reads (test/unit/test_contract.py).
 SGLANG_READS = {
     "srt/runtime_context.py": ("get_spec",),
-    "srt/models/kimi_k3.py": ("KimiK3MoE", "AuxHiddenStateList", "_cdiv"),
+    "srt/models/kimi_k3.py": (
+        "KimiK3MoE",
+        "AuxHiddenStateList",
+        "_cdiv",
+        # the routed experts the launch's top-k / sort feed (_routed, _experts)
+        "_forward_routed",
+        "_route_quant_fuse_eligible",
+    ),
     # the new dev_amd moved KimiK3MoE's ROCm paths into kimi_k3_amd
     "srt/models/kimi_k3_amd/moe.py": (
         "_vector_aligned",
         "_COLUMN_TAIL_MAX_TOKENS",
         "_forward_shared_casting_routed",
+        "_forward_routed_a8w4",
     ),
+    # _launch_topk_ok: when SGLang's top-k post-processing is a no-op
+    "srt/environ.py": (
+        "envs",
+        "SGLANG_SIMULATE_UNIFORM_EXPERTS",
+        "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS",
+    ),
+    "srt/layers/moe/__init__.py": ("get_moe_a2a_backend",),
+    "srt/layers/moe/topk.py": (
+        "TopKOutputFormat",
+        "is_expert_remapping_enabled",
+        "build_precomputed_topk_output",
+        "num_shared_topk_slots",
+        "waterfill_balancer",
+        "enable_waterfill",
+    ),
+    # _experts: the routed experts on the launch's top-k / sort
+    "srt/layers/zero_copy_context.py": ("set_moe_output",),
+    "srt/layers/moe/route_quant_handoff.py": ("stage", "clear"),
+    # _sort_check (debug): SGLang's small sort as the reference
+    "kernels/ops/moe/moe_sorting_small.py": ("_run_small_sort",),
     "srt/layers/attn_residual_hip.py": ("gather_covers",),
     "srt/layers/attention/linear/utils.py": (
         "select_verify_intermediate_state_indices",
@@ -321,12 +349,12 @@ def _routed(moe, lat, logits, ids, w, out, sortv=None):
 
 def _experts(moe, lat, ids, w, out, sortv):
     """SGLang's routed experts on the launch's (ids, w) -> out; with ``sortv``, on the launch's sort + quant."""
-    from sglang.srt.layers import zero_copy_context
-    from sglang.srt.layers.moe import route_quant_handoff
+    from sglang.srt.layers.moe.route_quant_handoff import clear, stage
     from sglang.srt.layers.moe.topk import build_precomputed_topk_output
+    from sglang.srt.layers.zero_copy_context import set_moe_output
 
     if moe._route_quant_fuse_eligible:
-        route_quant_handoff.stage(lat, layer=moe.experts)
+        stage(lat, layer=moe.experts)
     try:
         topk_output = build_precomputed_topk_output(
             w, ids, moe.topk.topk_config, moe.layer_idx
@@ -337,7 +365,7 @@ def _experts(moe, lat, ids, w, out, sortv):
                 from sgl_amd_mono.kimi_k31 import presort
 
                 inj = es.enter_context(presort.injected(sortv, ids.shape[0], ids, out))
-            with zero_copy_context.set_moe_output(out):
+            with set_moe_output(out):
                 y = moe.experts(lat, topk_output)
             if inj is not None and not getattr(moe, "_k31_sort_said", False):
                 moe._k31_sort_said = True
@@ -345,7 +373,7 @@ def _experts(moe, lat, ids, w, out, sortv):
                     f"launch sort {'on' if inj['used'] else 'NOT used'} (layer {moe.layer_idx})"
                 )
     finally:
-        route_quant_handoff.clear()
+        clear()
     if y.data_ptr() != out.data_ptr():
         out.copy_(y)
 

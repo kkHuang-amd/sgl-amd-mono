@@ -11,8 +11,38 @@ the wrapped sort, which is always correct."""
 import contextlib
 import contextvars
 import functools
+import inspect
 
 import torch
+
+# The SGLang names this module reads (test/unit/test_contract.py): the small-sort patch whose
+# mx_quant_wrapper hands the stage-1 quant on through _emitted_quant.
+SGLANG_READS = {
+    "kernels/ops/moe/moe_sorting_small.py": (
+        "_emitted_quant",
+        "apply_aiter_small_moe_sort_patch",
+        "mx_quant_wrapper",
+    ),
+}
+
+# aiter.fused_moe._moe_sorting_impl's parameters as impl() below takes them; aiter is not covered by
+# SGLANG_READS, so ensure_installed() checks them and leaves the sort to SGLang when they change.
+_AITER_SORT_PARAMS = (
+    "topk_ids",
+    "topk_weights",
+    "num_experts",
+    "model_dim",
+    "moebuf_dtype",
+    "block_size",
+    "expert_mask",
+    "num_local_tokens",
+    "dispatch_policy",
+    "use_opus",
+    "return_local_topk_ids",
+    "accumulate",
+    "output_aux",
+    "output",
+)
 
 _INJ = contextvars.ContextVar("k31_launch_sort", default=None)
 _SAID: set = set()
@@ -60,12 +90,17 @@ def _mismatch(
 
 
 def ensure_installed():
-    """Wrap aiter's sorting entry once more if something (SGLang re-applying its patch) replaced ours."""
+    """Wrap aiter's sorting entry once more if something (SGLang re-applying its patch) replaced ours.
+    An aiter whose entry takes other parameters is left unwrapped: the experts then sort as SGLang does."""
     import aiter.fused_moe as fm
-    from sglang.kernels.ops.moe import moe_sorting_small as mss
+    from sglang.kernels.ops.moe.moe_sorting_small import _emitted_quant
 
     cur = fm._moe_sorting_impl
     if getattr(cur, "_k31_presort", False):
+        return
+    params = tuple(inspect.signature(cur).parameters)
+    if params != _AITER_SORT_PARAMS:
+        _say_once(f"launch sort off: aiter _moe_sorting_impl takes {params}")
         return
 
     @functools.wraps(cur)
@@ -101,7 +136,7 @@ def ensure_installed():
             )
             if why is None:
                 # mx_quant_wrapper (SGLang) returns this pair for the stage-1 quant (shape-checked there)
-                mss._emitted_quant.set((inj["q"], inj["qs"].view(torch.float8_e8m0fnu)))
+                _emitted_quant.set((inj["q"], inj["qs"].view(torch.float8_e8m0fnu)))
                 inj["used"] = True
                 return inj["ids"], inj["w"], inj["eids"], inj["nv"], out
             _say_once(f"launch sort skipped: {why}")
