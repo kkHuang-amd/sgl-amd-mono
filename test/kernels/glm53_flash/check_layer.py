@@ -15,7 +15,8 @@ input; ``--check-embed``: the launch from the tokens equals the dense launch on 
 gathered embedding rows, and writes the spec's step tables (``--step-rows``: the
 step's rows, fewer than the width); ``--check-head``: the tail's logits against a
 torch tail and an f32 tail; ``--replays N``: a graph of ``--layers`` launches
-replays the eager step bitwise."""
+replays the eager step bitwise; ``--verify L`` (``kda`` or ``dsa``): an MTP verify
+launch of L rows a request equals its tokens' L decode launches bitwise."""
 
 import argparse
 import os
@@ -32,6 +33,7 @@ from sgl_amd_mono.glm53_flash.gfx950.config import (
     N_EXPERTS,
     VOCAB,
 )
+from sgl_amd_mono.glm53_flash.spec import GROUPED_FROM
 
 N_MIX = HC_MULT * (2 + HC_MULT)
 
@@ -857,6 +859,7 @@ def build(args, kind, rank, tp, group, device, layers=1, shuffled=False):
         dense_shuffled=shuffled and dense,
         tokens=kind == "embed",
         head=kind == "head",
+        grouped=args.rows >= GROUPED_FROM and not dense and kind != "head",
         stop=False,
     )
     rt = FlashRuntime(key, rank, group, device)
@@ -1043,21 +1046,23 @@ def check_embed(args, rank, tp, group, device) -> bool:
     embedding rows (x = the row on every rank; post 1, comb 0, residual 0) on the same
     weights and state: outputs and state writes bitwise equal, the width's rows past
     the step's pads; and the step tables it writes equal the spec's torch tables."""
-    from msgspec.structs import astuple
+
+    def decode_state(s):
+        return (s.conv_state, s.rec_state)
 
     rt, launches, _, ins = build(args, "embed", rank, tp, group, device)
     op, kw = launches[0]
     step = kw["step"]
     n = step["ids"].shape[0]
     _, table = embedding(rank, tp, device)
-    state0 = [t.clone() for t in astuple(kw["state"])]
+    state0 = [t.clone() for t in decode_state(kw["state"])]
     out = [t.clone() for t in op.launch(*ins, **kw)]
     torch.cuda.synchronize()
     kda, rows = spec_tables(step, kw["state_idx"], args.rows)
     tables = torch.equal(step["slots"], kda) and torch.equal(step["rows"], rows)
     ref_rt, ref_launches, _, _ = build(args, "dense", rank, tp, group, device)
     ref_op, ref_kw = ref_launches[0]
-    for t, v in zip(astuple(ref_kw["state"]), state0):
+    for t, v in zip(decode_state(ref_kw["state"]), state0):
         t.copy_(v)
     x = torch.zeros(args.rows, HIDDEN, dtype=torch.bfloat16, device=device)
     x[:n] = table[step["ids"]]
@@ -1066,7 +1071,7 @@ def check_embed(args, rank, tp, group, device) -> bool:
     same = all(torch.equal(a, b) for a, b in zip(out, ref))
     writes = all(
         torch.equal(a, b)
-        for a, b in zip(astuple(kw["state"]), astuple(ref_kw["state"]))
+        for a, b in zip(decode_state(kw["state"]), decode_state(ref_kw["state"]))
     )
     print(
         f"rank {rank}: {n} of {args.rows} rows from the tokens == the dense launch on "
@@ -1127,6 +1132,210 @@ def check_head(args, rank, tp, group, device) -> bool:
     )
     rt.close()
     return rel < 2e-3 and rel32 < 1e-2 and repeat and caught
+
+
+def _max_diff(a: torch.Tensor, b: torch.Tensor) -> float:
+    return float((a.float() - b.float()).abs().max()) if a.numel() else 0.0
+
+
+def check_verify(args, rank, tp, group, device) -> bool:
+    """An MTP verify launch (``--verify`` rows a request, ``--rows`` wide: whole
+    requests, then pad rows) against the requests' draft tokens run one decode
+    launch a token, on the same weights, inputs, state and caches: each row's output
+    equals its token's decode output; with KDA the verify scratch after token j
+    equals the state after j + 1 decode launches and the committed state is
+    unchanged; with sparse attention the MLA cache, the index cache and the kpool
+    rings equal the decode launches' (a chain's pool reads the ring entries its
+    earlier rows wrote)."""
+    from msgspec.structs import replace
+
+    from sgl_amd_mono.common import guard
+    from sgl_amd_mono.glm53_flash.gfx950.config import (
+        INDEX_DIM,
+        KDA_DIM,
+        KDA_HEADS,
+        KDA_PROJ,
+        KPOOL,
+    )
+    from sgl_amd_mono.glm53_flash.gfx950.kernel import FlashBuild
+    from sgl_amd_mono.glm53_flash.gfx950.layout import (
+        ROW_BT,
+        ROW_POOL_SLOT,
+        ROW_POS,
+        ROW_SLOT,
+        ROW_TAIL_SLOT,
+        ROW_WORDS,
+    )
+    from sgl_amd_mono.glm53_flash.gfx950.runner import FlashLayerOp, FlashRuntime
+
+    kind, L, W = args.kind, args.verify, args.rows
+    assert kind in ("kda", "dsa") and 2 <= L <= W
+    R = W // L
+    # the decode launches at the same width (a width's tiles set its sums' order):
+    # the requests' rows, then pads
+    DW = W
+    kda = kind == "kda"
+
+    def runtime(rows, verify):
+        key = FlashBuild(
+            rows=rows,
+            tp=tp,
+            launches_per_step=1,
+            inter=GLOBAL_INTER // tp,
+            kda=kda,
+            dsa=not kda,
+            max_pools=0 if kda else args.max_pools,
+            verify=verify,
+            grouped=rows >= GROUPED_FROM,
+            stop=False,
+        )
+        rt = FlashRuntime(key, rank, group, device)
+        rt.set_deadline(args.deadline)
+        return rt
+
+    vrt, drt = runtime(W, L), runtime(DW, 1)
+    ffn = ffn_weights(rank, tp, device)
+    attn = kda_weights(rank, tp, device) if kda else dsa_weights(rank, tp, device)
+    a = {"kda": attn} if kda else {"dsa": attn}
+    vop, dop = FlashLayerOp(vrt, ffn, 0, **a), FlashLayerOp(drt, ffn, 0, **a)
+    x, res, post, comb = layer_inputs(W, device)
+    ins = (x, res, post, comb)
+
+    def rows_of(t, j):
+        """Decode step j's input rows: request r's row r * L + j, then pads."""
+        out = torch.zeros((DW,) + tuple(t.shape[1:]), dtype=t.dtype, device=device)
+        out[:R] = t[[r * L + j for r in range(R)]]
+        return out
+
+    def run(op, rt, ins, **kw):
+        out = op.launch(*ins, **kw)
+        rt.advance_step()
+        torch.cuda.synchronize()
+        words = rt.epoch[guard.ERR_DEADLINE : guard.ERR_FAULT + 1].tolist()
+        if any(words):
+            print(f"rank {rank}: error words {words}", flush=True)
+            return None
+        return tuple(t.clone() for t in out)
+
+    ok = True
+    if kda:
+        P, H, D = KDA_PROJ // tp, KDA_HEADS // tp, KDA_DIM
+        state, _ = kda_state(R, tp, device)
+        inter_rec = torch.full(
+            (R + 1, L, H, D, D), float("nan"), dtype=torch.float32, device=device
+        )
+        inter_conv = torch.zeros(
+            R + 1, L, 3, 3 * P, dtype=torch.bfloat16, device=device
+        )
+        vstate = replace(
+            state,
+            conv_state=state.conv_state.clone(),
+            rec_state=state.rec_state.clone(),
+            inter_rec=inter_rec,
+            inter_conv=inter_conv,
+        )
+        vidx = torch.zeros(W, dtype=torch.int32, device=device)
+        vidx[: R * L] = torch.arange(1, R + 1, device=device).repeat_interleave(L)
+        vout = run(vop, vrt, ins, state=vstate, state_idx=vidx)
+        dstate = replace(
+            state,
+            conv_state=state.conv_state.clone(),
+            rec_state=state.rec_state.clone(),
+        )
+        didx = torch.zeros(DW, dtype=torch.int32, device=device)
+        didx[:R] = torch.arange(1, R + 1, device=device)
+        if vout is None:
+            return False
+        for name in ("conv_state", "rec_state"):
+            same = torch.equal(getattr(vstate, name), getattr(state, name))
+            ok &= same
+            print(f"rank {rank}: verify keeps the committed {name}: {same}")
+        for j in range(L):
+            dins = tuple(rows_of(t, j) for t in ins)
+            dout = run(dop, drt, dins, state=dstate, state_idx=didx)
+            if dout is None:
+                return False
+            for n, (v, d) in enumerate(zip(vout, dout)):
+                diff = _max_diff(v[[r * L + j for r in range(R)]], d[:R])
+                ok &= diff == 0.0
+                if diff:
+                    print(f"rank {rank}: token {j} output {n} differs by {diff}")
+            # the request's scratch row is its batch position r (slot r + 1)
+            dr = _max_diff(inter_rec[:R, j], dstate.rec_state[1 : R + 1])
+            dc = _max_diff(inter_conv[:R, j], dstate.conv_state[1 : R + 1])
+            ok &= dr == 0.0 and dc == 0.0
+            print(f"rank {rank}: token {j} scratch state diff {dr}, conv {dc}")
+        print(f"rank {rank}: verify vs {L} decode launches ok {ok}", flush=True)
+        return ok
+
+    lens = [int(v) for v in args.lens.split(",")] if args.lens else list(LENS)
+    lens = (lens * R)[:R]
+    caches, _, pt = dsa_caches(R, device, lens)
+    ring = 4 + L
+    g = _gen(11, device)
+    tails = [
+        torch.randn(R + 1, ring, INDEX_DIM, generator=g, device=device).bfloat16()
+        for _ in range(2)
+    ]
+    caches = replace(caches, tail_k=tails[0], tail_g=tails[1])
+
+    def table_row(r, pos):
+        slot = kv_slot(pt, r, pos)
+        return [pos, slot, slot // KPOOL, (r + 1) * KPOOL]
+
+    def clone(c):
+        return replace(
+            c,
+            kv_cache=c.kv_cache.clone(),
+            idx_cache=c.idx_cache.clone(),
+            tail_k=c.tail_k.clone(),
+            tail_g=c.tail_g.clone(),
+        )
+
+    vc, dc = clone(caches), clone(caches)
+    vt = torch.full((W, ROW_WORDS), -1, dtype=torch.int32, device=device)
+    vt[:, ROW_BT] = 0
+    for r, n in enumerate(lens):
+        for j in range(L):
+            s = r * L + j
+            vt[s, [ROW_POS, ROW_SLOT, ROW_POOL_SLOT, ROW_TAIL_SLOT]] = torch.tensor(
+                table_row(r, n - 1 + j), dtype=torch.int32, device=device
+            )
+            vt[s, ROW_BT] = s
+    # SGLang's verify page table: a request's row for each of its rows
+    vpt = pt.repeat_interleave(L, 0).contiguous()
+    vout = run(vop, vrt, ins, caches=vc, rows=vt, page_table=vpt)
+    if vout is None:
+        return False
+    for j in range(L):
+        dt = torch.full((DW, ROW_WORDS), -1, dtype=torch.int32, device=device)
+        dt[:, ROW_BT] = 0
+        for r, n in enumerate(lens):
+            dt[r, [ROW_POS, ROW_SLOT, ROW_POOL_SLOT, ROW_TAIL_SLOT]] = torch.tensor(
+                table_row(r, n - 1 + j), dtype=torch.int32, device=device
+            )
+            dt[r, ROW_BT] = r
+        dout = run(
+            dop,
+            drt,
+            tuple(rows_of(t, j) for t in ins),
+            caches=dc,
+            rows=dt,
+            page_table=pt,
+        )
+        if dout is None:
+            return False
+        for n, (v, d) in enumerate(zip(vout, dout)):
+            diff = _max_diff(v[[r * L + j for r in range(R)]], d[:R])
+            ok &= diff == 0.0
+            if diff:
+                print(f"rank {rank}: token {j} output {n} differs by {diff}")
+    for name in ("kv_cache", "idx_cache", "tail_k", "tail_g"):
+        same = torch.equal(getattr(vc, name), getattr(dc, name))
+        ok &= same
+        print(f"rank {rank}: {name} equals the decode launches' {same}")
+    print(f"rank {rank}: verify vs {L} decode launches ok {ok}", flush=True)
+    return ok
 
 
 def _changed_rows(before: torch.Tensor, after: torch.Tensor) -> set:
@@ -1198,6 +1407,9 @@ def main() -> int:
     ap.add_argument("--pad-rows", type=int, default=0, help="trailing pad rows")
     ap.add_argument("--step-rows", type=int, default=0, help="an embed step's rows")
     ap.add_argument(
+        "--verify", type=int, default=0, help="an MTP verify launch's rows a request"
+    )
+    ap.add_argument(
         "--writes", action="store_true", help="check the rows a launch writes"
     )
     args = ap.parse_args()
@@ -1216,6 +1428,7 @@ def main() -> int:
         (args.check_embed, check_embed),
         (args.check_head, check_head),
         (args.replays, check_replays),
+        (args.verify, check_verify),
     ):
         if flag:
             return 0 if check(args, rank, tp, group, device) else 1
@@ -1227,7 +1440,7 @@ def main() -> int:
             from msgspec.structs import asdict
 
             held = asdict(extra.get("state") or extra["caches"])
-            before = {k: t.clone() for k, t in held.items()}
+            before = {k: t.clone() for k, t in held.items() if t is not None}
         out = run_step(args.kind, launches, ins)
         rt.advance_step()
         torch.cuda.synchronize()

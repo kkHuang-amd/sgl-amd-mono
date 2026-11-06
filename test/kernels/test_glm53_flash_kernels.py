@@ -9,7 +9,9 @@ graph of several launches of each kind replays the eager step bitwise at every w
 the TP size builds. The dense launch's MLP output is within the spec's bound of an f32
 MLP on its own FFN input, on shuffled and row-major FP8 alike; the launch from the
 step's tokens equals the dense launch on the gathered embedding rows and writes the
-spec's step tables, for steps of fewer rows than the width too; sparse-attention
+spec's step tables, for steps of fewer rows than the width too; an MTP verify launch
+equals its draft tokens' decode launches bitwise (outputs, KDA verify scratch,
+caches and kpool rings) and keeps the committed KDA state; sparse-attention
 launches and key selection hold for rows past 65536 pools of a 1M-token context, up
 to 650000 tokens; the tail's logits match a torch tail and an f32 tail, back-to-back
 tails included."""
@@ -107,6 +109,23 @@ class TestMonoGlm53FlashKernels(CustomTestCase):
                         "--step-rows",
                         str(step),
                     )
+
+    def test_a_verify_launch_matches_its_draft_tokens_decode_launches(self):
+        # MTP 2, 3 and 5 (3, 4 and 6 rows a request), whole requests then pad rows;
+        # the lengths complete a pool mid-chain and cross 2048 tokens mid-chain
+        for kind, rows, verify, lens in (
+            ("kda", 4, 4, ""),
+            ("kda", 8, 3, ""),
+            ("kda", 8, 6, ""),
+            ("dsa", 8, 4, "4101,2050"),
+            ("dsa", 8, 3, "4102,2051"),
+            ("dsa", 8, 6, "2047"),
+            ("dsa", 4, 3, "64"),
+        ):
+            args = ["--kind", kind, "--rows", str(rows), "--verify", str(verify)]
+            for tp in (2, 4, 8):
+                if tp > 2 or rows <= 4:
+                    self._run(tp, *args, *(["--lens", lens] if lens else []))
 
     def test_rows_past_65536_pools_of_a_1m_context(self):
         # SGLang's pools for a 1M-token context; 262148 tokens complete pool 65536,

@@ -1,5 +1,5 @@
 """The GLM-5.3-Flash servers that the monokernel serving test launches: MI35x, TP4,
-decode steps (no speculative decoding)."""
+decode steps, and with ``MTP`` the NextN draft's verify steps."""
 
 import os
 
@@ -39,4 +39,16 @@ ARGS = [
     "glm45",
     "--mm-feature-transport",
     "cpu",
+]
+# MTP with one draft chain of 3 tokens: 4 verify rows a request, so verify steps of 1
+# to 4 requests fit the 16-row width
+MTP = [
+    "--speculative-algorithm",
+    "EAGLE",
+    "--speculative-num-steps",
+    "3",
+    "--speculative-eagle-topk",
+    "1",
+    "--speculative-num-draft-tokens",
+    "4",
 ]

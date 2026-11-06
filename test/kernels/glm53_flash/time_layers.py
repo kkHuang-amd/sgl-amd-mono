@@ -1,7 +1,7 @@
 """Kernel-only time of the GLM-5.3-Flash layer launch, under torchrun (TP 2, 4 or 8):
 
     torchrun --nproc-per-node 4 test/kernels/glm53_flash/time_layers.py \\
-        --kind model --rows 2,4,8 [--pos 2047] [--layers 12] [--row-major]
+        --kind model --rows 2,4,8 [--pos 2047] [--layers 12] [--row-major] [--per-row-moe]
 
 One HIP graph holds a step of launches, inputs chained layer to layer, every row
 live. Each layer has its own random weights (``check_layer.py``'s, seeded by layer,
@@ -29,6 +29,8 @@ import torch.distributed as dist
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import check_layer as cl  # noqa: E402
+
+from sgl_amd_mono.glm53_flash.spec import GROUPED_FROM  # noqa: E402
 
 _GEN = cl._gen
 
@@ -77,6 +79,9 @@ def _build(args, kinds: list, rows: int, rank: int, tp: int, group, device):
             dense_shuffled=shuffled and dense,
             tokens=kind == "embed",
             head=head,
+            grouped=not args.per_row_moe
+            and rows >= GROUPED_FROM
+            and not (dense or head),
         )
         runtimes[kind] = FlashRuntime(key, rank, group, device)
         runtimes[kind].set_deadline(60.0)
@@ -209,6 +214,11 @@ def main() -> int:
     ap.add_argument("--pos", type=int, default=2047, help="sparse-attention position")
     ap.add_argument("--max-pools", type=int, default=262144, help="1M-token context")
     ap.add_argument("--row-major", action="store_true", help="row-major FP8 weights")
+    ap.add_argument(
+        "--per-row-moe",
+        action="store_true",
+        help="the per-row MoE at every width, the baseline of the grouped one",
+    )
     args = ap.parse_args()
     cl.MAX_LEN = max(cl.MAX_LEN, (args.pos + 256) // 256 * 256)
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])

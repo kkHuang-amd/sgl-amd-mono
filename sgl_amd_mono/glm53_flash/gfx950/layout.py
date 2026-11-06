@@ -145,6 +145,17 @@ def dn_tile(samples: int) -> int:
     return 32 if samples == 1 or samples > 8 else HIDDEN // BLOCKS
 
 
+# the grouped MoE's rows a weighted-sum task (and its TP reduce tile); a unit's rows
+GROUPED_SUM_TILE = 16
+UNIT_ROWS = 16
+
+
+def grouped_units_max(samples: int) -> int:
+    """A bound on the grouped MoE's units (an expert's picks, 16 a unit)."""
+    routed = samples * TOP_K
+    return min(N_EXPERTS, routed) + routed // UNIT_ROWS + (samples + 15) // 16
+
+
 def sample_wave_batches(samples: int) -> int:
     return (samples + WAVES - 1) // WAVES
 
@@ -183,9 +194,11 @@ def layout(
     dense: bool = False,
     head: bool = False,
     x_in: bool = False,
+    grouped: bool = False,
 ):
     """Byte offsets of the per-rank scratch and the symmetric peer buffer (with
-    ``x_in`` a region for the ranks' partials of the layer input)."""
+    ``x_in`` a region for the ranks' partials of the layer input; with ``grouped``
+    the expert-major MoE's per-pick down partials)."""
     from sgl_amd_mono.common.guard import FLAG_BYTES
 
     pair_bytes = 8
@@ -274,6 +287,9 @@ def layout(
             ("midq", samples * MOE_SLOTS * inter // 4 * pair_bytes),
             ("midqs", samples * MOE_SLOTS * (inter // 32) * pair_bytes),
         ]
+        if grouped:
+            # each (row, slot)'s down output (f32), before its route weight
+            items += [("dpart", samples * MOE_SLOTS * HIDDEN * pair_bytes)]
     assert len({name for name, _ in items}) == len(items), "mailbox names"
     offset, scratch = 0, {}
     for name, size in items:
@@ -308,12 +324,14 @@ def stage_tasks(
     dsa: bool = False,
     dense: bool = False,
     head: bool = False,
+    grouped: bool = False,
 ):
     """``(stage name, CTA slots)`` pairs in execution order: a stage's first task runs
     on the CTA after the previous stages' slots. ``iscore`` is sized per row at run
     time; its count here only places the next stage. The tail splits run ahead of
     the regular splits on their CTAs and take no slots, and the split keeps the slots
-    of 8-head tasks (tasks of 16 heads use the first half)."""
+    of 8-head tasks (tasks of 16 heads use the first half). The grouped MoE's up/gate
+    and down tasks are counted at run time and split over every CTA."""
     shard = FlashShard(npes)
     if head:
         return [("hpost", N_ROW_TILES), ("lmhead", BLOCKS), ("gather", BLOCKS)]
@@ -351,7 +369,16 @@ def stage_tasks(
             ("seam", N_ROW_TILES),
             ("gate", samples),
             ("dug", shard.dense_inter // DUG_TILE),
-            ("down", HIDDEN // dn_tile(samples)),
+            ("down", BLOCKS),
+        ]
+    if grouped:
+        return attention + [
+            ("seam", N_ROW_TILES),
+            ("gate", samples),
+            ("router", samples * N_ROUTER),
+            ("ug", BLOCKS),
+            ("down", BLOCKS),
+            ("dsum", HIDDEN // GROUPED_SUM_TILE),
         ]
     return attention + [
         ("seam", N_ROW_TILES),

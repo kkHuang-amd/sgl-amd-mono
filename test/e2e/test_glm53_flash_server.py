@@ -1,7 +1,8 @@
 """GLM-5.3-Flash with --monokernel-backend amd on MI35x, TP4 (RFC #43949), across the
-switch points: decode steps of 1 to 8 rows run the kernels, wider ones the normal
-path, and requests join and leave a running batch that steps past 8 rows and back
-(a short GSM8K run, for gross failures); the tokens of covered steps scored again by
+switch points: decode steps of 1 to 16 rows run the kernels, wider ones the normal
+path, and requests join and leave a running batch that steps past 16 rows and back
+(a short GSM8K run, for gross failures); with MTP, verify steps of 1 to 4 requests
+(4 to 16 rows) on the kernels (GSM8K and the draft's accept length); the tokens of covered steps scored again by
 the normal prefill path (KL consistency); each layer's launch against SGLang's own
 layer, and the tail's logits against SGLang's, under SGLANG_AMD_MONO_CHECK; the
 hidden states a covered step returns; and a fault on one rank that stops the server
@@ -16,7 +17,7 @@ from types import SimpleNamespace
 
 import requests
 import torch
-from glm53_flash_server import ARGS, ENV, MODEL
+from glm53_flash_server import ARGS, ENV, MODEL, MTP
 from sglang.test.kl_test_utils import (
     test_input_output_logprobs_match_helper as assert_logprobs_match,
 )
@@ -37,6 +38,9 @@ GSM8K_BOUND = 0.90
 # Decode against prefill, one batch of prompts at a time (every decode step covered);
 # the normal path itself averages about 0.04 on 8 prompts
 KL_BOUND = 0.06
+# MTP (3 draft tokens) accepts about 3.3 tokens a step on this GSM8K run at TP4;
+# the bound is for gross failures
+MTP_ACCEPT_BOUND = 2.5
 
 
 def _launch(extra_env=None, extra_args=(), log=None):
@@ -51,6 +55,24 @@ def _launch(extra_env=None, extra_args=(), log=None):
     )
 
 
+def _gsm8k(threads=12):
+    """GSM8K, 200 questions ``threads`` at a time, thinking on."""
+    return run_sgl_eval(
+        SimpleNamespace(
+            base_url=DEFAULT_URL_FOR_TEST,
+            model=MODEL,
+            eval_name="gsm8k",
+            num_examples=200,
+            num_threads=threads,
+            max_tokens=32768,
+            temperature=1.0,
+            top_p=0.95,
+            seed=42,
+            sgl_eval_thinking=True,
+        )
+    )
+
+
 class TestMonokernelDecode(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -62,31 +84,18 @@ class TestMonokernelDecode(CustomTestCase):
             terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k_past_the_largest_width(self):
-        # 12 requests at a time: the batch steps past 8 rows as it fills, and back
+        # 24 requests at a time: the batch steps past 16 rows as it fills, and back
         # as it drains
-        metrics = run_sgl_eval(
-            SimpleNamespace(
-                base_url=DEFAULT_URL_FOR_TEST,
-                model=MODEL,
-                eval_name="gsm8k",
-                num_examples=200,
-                num_threads=12,
-                max_tokens=32768,
-                temperature=1.0,
-                top_p=0.95,
-                seed=42,
-                sgl_eval_thinking=True,
-            )
-        )
+        metrics = _gsm8k(threads=24)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], GSM8K_BOUND)
 
     def test_covered_steps_match_prefill(self):
-        # one graph per batch (ignore_eos keeps its rows): 2, 3, 7 and 8 rows (widths
-        # 2, 4 and 8, pad rows at 3 and 7). Each graph reads its own metadata buffers;
-        # with the cache flushed, a graph replayed first on another's reads none of
-        # this batch's pages
-        for rows in (2, 3, 7, 8):
+        # one graph per batch (ignore_eos keeps its rows): 2, 3, 7, 8, 11 and 16 rows
+        # (widths 2, 4, 8, 12 and 16, pad rows at 3, 7 and 11). Each graph reads its
+        # own metadata buffers; with the cache flushed, a graph replayed first on
+        # another's reads none of this batch's pages
+        for rows in (2, 3, 7, 8, 11, 16):
             requests.post(DEFAULT_URL_FOR_TEST + "/flush_cache").raise_for_status()
             assert_logprobs_match(
                 DEFAULT_URL_FOR_TEST,
@@ -98,12 +107,35 @@ class TestMonokernelDecode(CustomTestCase):
             )
 
 
+class TestMonokernelMtp(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.process = _launch(extra_args=[*MTP, "--watchdog-timeout", "1200"])
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "process", None) is not None:
+            terminate_and_kill_process_tree(cls.process)
+
+    def test_gsm8k_and_accept_length_on_the_kernels(self):
+        # 4 requests at a time, so every verify step fits the 16-row width and runs
+        # the kernels. A verify row that reads the wrong KDA state or keys of its
+        # draft chain lowers the accept length before the score
+        metrics = _gsm8k(threads=4)
+        info = requests.get(DEFAULT_URL_FOR_TEST + "/get_server_info").json()
+        accept = info["internal_states"][0]["avg_spec_accept_length"]
+        print(f"{metrics=} {accept=}")
+        self.assertGreater(metrics["score"], GSM8K_BOUND)
+        self.assertGreater(accept, MTP_ACCEPT_BOUND)
+
+
 class TestMonokernelCheck(CustomTestCase):
     def test_each_covered_layer_within_its_numerics(self):
         # SGLANG_AMD_MONO_CHECK (eager) runs the normal layer next to each layer's
-        # launch, and SGLang's final norm and logits next to the tail; 1, 3 and 8
-        # rows run at widths 2, 4 and 8 (pad rows on the first two), and the long
-        # prompt's positions pass 2048, where the sparse attention selects keys
+        # launch, and SGLang's final norm and logits next to the tail; 1, 3, 8, 11
+        # and 16 rows run at widths 2, 4, 8, 12 and 16 (pad rows at 1, 3 and 11),
+        # and the long prompt's positions pass 2048, where the sparse attention
+        # selects keys
         para = "The river valley archive lists the flood height of every year. "
         with (
             tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
@@ -115,7 +147,7 @@ class TestMonokernelCheck(CustomTestCase):
                 log=(out, err),
             )
             try:
-                for n, repeats in ((1, 2), (3, 2), (8, 2), (1, 200)):
+                for n, repeats in ((1, 2), (3, 2), (8, 2), (11, 2), (16, 2), (1, 200)):
                     r = requests.post(
                         DEFAULT_URL_FOR_TEST + "/generate",
                         json={
@@ -144,10 +176,11 @@ class TestMonokernelCheck(CustomTestCase):
         for name, vs in sorted(values.items()):
             print(f"{name}: min {min(vs):.6g} max {max(vs):.6g} ({len(vs)} checks)")
         seen = {(kind, int(rows)) for kind, rows, _, _ in checks}
-        want = {(kind, rows) for kind in ("kda", "dsa", "dense") for rows in (1, 3, 8)}
+        covered = (1, 3, 8, 11, 16)
+        want = {(kind, rows) for kind in ("kda", "dsa", "dense") for rows in covered}
         self.assertTrue(want <= seen, seen)
         tails = re.findall(r"monokernel check tail \((\d+) rows\): (.*)", log)
-        self.assertEqual({int(rows) for rows, _ in tails} & {1, 3, 8}, {1, 3, 8})
+        self.assertEqual({int(rows) for rows, _ in tails} & set(covered), set(covered))
         self.assertTrue(any(k == "dsa" and int(hi) >= 2048 for k, _, hi, _ in checks))
         violations = re.findall(r"monokernel check violation: .*", log)
         self.assertEqual(violations, [], "\n".join(violations[:20]))
