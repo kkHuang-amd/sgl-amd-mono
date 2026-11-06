@@ -571,6 +571,12 @@ def mla_pre_launch(
     latent, k_nope, gate, idx_q, idx_k, idx_w (and q_lora, unused here) as the
     module docstring shapes them. ``prefix`` is read, not written, unless the
     layer is a block-write layer (its bank row)."""
+    # A block-write layer stores its row at block write_idx; a bank without that
+    # block puts the last token's row past the allocation.
+    assert key.write_idx < blocks.shape[1], (
+        f"mla_pre layer {layer} writes bank block {key.write_idx}, the bank has "
+        f"{blocks.shape[1]}"
+    )
     shapes = {
         "w_qkv": (LATW, HIDDEN), "w_g": (GATE, HIDDEN), "w_k": (IK, HIDDEN),
         "w_p": (IW, HIDDEN), "w_qb": (QB, QL), "w_iq": (IQ, QL),

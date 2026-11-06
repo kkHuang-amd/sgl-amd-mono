@@ -355,6 +355,12 @@ def warmup(runner, packed: K1Layer, prefix, blocks) -> None:
         f"K1 layer {packed.i} needs {need} B of scratch, the runner has "
         f"{runner.scratch.numel()}"
     )
+    # A block-write layer stores its bank row at block write_idx: the bank must
+    # hold that block, or the last token's row lands past the allocation.
+    assert packed.key.write_idx < blocks.shape[1], (
+        f"K1 layer {packed.i} writes bank block {packed.key.write_idx}, the "
+        f"bank has {blocks.shape[1]}"
+    )
     rows, device = packed.key.qlen, runner.device
     ring, slots = None, rows
     if packed.key.ring:
