@@ -28,6 +28,7 @@ from sgl_amd_mono.common.ops import (
     CM_SYS,
     bf2_f32,
     bf16_pair,
+    div_rn,
     hw_exp2,
     hw_rcp,
     read_lane_i32,
@@ -135,6 +136,14 @@ def _sigmoid(x):
     return hw_rcp(1.0 + hw_exp2(x * (-LOG2E)))
 
 
+def _sigmoid_aiter(x):
+    """aiter topk_reg_kernel's sigmoid bit for bit: ``rcpf(1.0f + exp2f(-C_LOG2E * x))`` with C_LOG2E a double
+    literal, so the exponent is an fp64 product rounded once to f32 (an f32 product of the rounded constant
+    differs by an ulp now and then: a weight off by ~1e-7 and, at a near tie, another expert)."""
+    a = fx.Float32(fx.Float64(x) * fx.Float64(-1.44269504088896340736))
+    return hw_rcp(1.0 + hw_exp2(a))
+
+
 def _batcher(n):
     """Batcher's odd-even merge sort network on n (a power of two) slots: (a, b) pairs."""
     pairs = []
@@ -159,6 +168,17 @@ def _okey(v):
     """An order-preserving uint32 key of an f32 (larger float, larger key)."""
     b = v.bitcast(fx.Int32)
     return fx.Uint32((b < fx.Int32(0)).select(~b, b ^ fx.Int32(-2147483648)))
+
+
+def _tie_rank(e):
+    """aiter's ``legacy_topk_tie_rank`` (csrc/kernels/topk_softmax_kernels_group.cu): the order SGLang's top-k
+    (``topk_reg_kernel``) breaks an exact score tie in, lower first; a bijection on 0 .. 895 into 0 .. 2047."""
+    v4 = e >> 2
+    ln = v4 & 63
+    low2 = (ln & 3) ^ ((ln & 4) != 0).select(fx.Int32(3), fx.Int32(0))
+    bit2 = (((ln >> 2) ^ (ln >> 3)) & 1) << 2
+    lrank = ((~ln) & 0x38) | bit2 | low2
+    return (lrank << 5) | (((v4 >> 6) << 2) | (e & 3))
 
 
 @flyc.jit
@@ -192,34 +212,44 @@ def route_row(
             bo.buffer_store(_ld_sys(rg, row * E + e), rsrc(logits_out), row * E + e)
     if wave == 0:
         # max-extraction (as the K3 K2 launch, mono/kimi-k31 05dfa48): each lane sorts its 14 candidates (expert
-        # lane + 64 i; key descending, the lower expert first on a tie), then 16 rounds of a wave max pop the heads;
-        # pick k lands in lane k, ranked. Same picks, order and weights as one rescan a pick.
+        # lane + 64 i; key descending, an exact tie by aiter's legacy tie rank, as SGLang's topk_reg_kernel), then
+        # 16 rounds of a wave max pop the heads; pick k lands in lane k, ranked. Weights: sigmoid / sum in pick
+        # order with an IEEE 1 / sum, as aiter's emit_legacy_ordered_topk.
         per = E // 64
-        ks, ids, sg = [], [], []
+        ks, ids, sg, rk = [], [], [], []
         for i in range_constexpr(per):
             e = lane + 64 * i
-            s = _sigmoid(_ld_sys(rg, row * E + e))
+            s = _sigmoid_aiter(_ld_sys(rg, row * E + e))
             ks.append(_okey(s + ld_f32(bias, e)))
             ids.append(fx.Int32(e))
             sg.append(s.bitcast(fx.Int32))
+            rk.append(_tie_rank(fx.Int32(e)))
         ks += [fx.Uint32(0)] * (SLOTS - per)
         ids += [fx.Int32(1023)] * (SLOTS - per)
         sg += [fx.Int32(0)] * (SLOTS - per)
+        rk += [fx.Int32(4095)] * (SLOTS - per)
         for x, y in NET:
-            first = (ks[x] > ks[y]) | ((ks[x] == ks[y]) & (ids[x] < ids[y]))
+            first = (ks[x] > ks[y]) | ((ks[x] == ks[y]) & (rk[x] < rk[y]))
             kx, ky, ix, iy, sx, sy = ks[x], ks[y], ids[x], ids[y], sg[x], sg[y]
+            rx, ry = rk[x], rk[y]
             ks[x], ks[y] = first.select(kx, ky), first.select(ky, kx)
             ids[x], ids[y] = first.select(ix, iy), first.select(iy, ix)
             sg[x], sg[y] = first.select(sx, sy), first.select(sy, sx)
+            rk[x], rk[y] = first.select(rx, ry), first.select(ry, rx)
         ks = [fx.Int32(k) for k in ks] + [fx.Int32(0)]
         ids = ids + [fx.Int32(1023)]
         sg = sg + [fx.Int32(0)]
+        rk = rk + [fx.Int32(4095)]
         tot, sel_i, sel_s = fx.Float32(0.0), fx.Int32(0), fx.Int32(0)
         for k in range_constexpr(TOPK):
             mx = wave_umax(ks[0])
-            expert = fx.Int32(1023) - wave_umax(
-                (ks[0] == mx).select(fx.Int32(1023) - ids[0], fx.Int32(0))
+            # among the heads at the max key, the lowest tie rank; rank and expert packed in one word
+            best = wave_umax(
+                (ks[0] == mx).select(
+                    ((fx.Int32(4095) - rk[0]) << 10) | ids[0], fx.Int32(0)
+                )
             )
+            expert = best & 1023
             sig = read_lane_i32(
                 sg[0], expert % 64
             )  # the winner's sigmoid, before its lane pops its head
@@ -227,10 +257,13 @@ def route_row(
             ks = [hit.select(ks[i + 1], ks[i]) for i in range(SLOTS)] + [ks[-1]]
             ids = [hit.select(ids[i + 1], ids[i]) for i in range(SLOTS)] + [ids[-1]]
             sg = [hit.select(sg[i + 1], sg[i]) for i in range(SLOTS)] + [sg[-1]]
+            rk = [hit.select(rk[i + 1], rk[i]) for i in range(SLOTS)] + [rk[-1]]
             tot = tot + sig.bitcast(fx.Float32)
             sel_i = write_lane_i32(expert, k, sel_i)
             sel_s = write_lane_i32(sig, k, sel_s)
-        inv = hw_rcp(tot)
+        inv = div_rn(
+            fx.Float32(1.0), tot, hw_rcp(tot)
+        )  # IEEE 1 / sum (aiter: routed_scaling_factor / total)
         if lane < TOPK:
             bo.buffer_store(sel_i, rsrc(topk_ids), row * TOPK + lane)
             bo.buffer_store(

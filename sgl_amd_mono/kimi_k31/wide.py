@@ -189,6 +189,115 @@ def _say(msg):
         print(f"[k31 wide] {msg}", flush=True)
 
 
+def _launch_topk_ok(moe) -> bool:
+    """Whether the routed experts may take the launch's own top-16 (ids, w) instead of SGLang's
+    ``self.topk``: the launch's route stage is sigmoid + bias, ungrouped top-16, renormalized (10.18), so only a
+    STANDARD output whose post-processing is a no-op (no padding mask / EPLB remap / waterfill) qualifies."""
+    if os.environ.get("SGLANG_AMD_MONO_K31_WIDE_LAUNCH_TOPK", "0") != "1":
+        return False
+    ok = getattr(moe, "_k31_launch_topk_ok", None)
+    if ok is None:
+        # SGLang's precomputed_topk_postprocess_is_noop is CUDA-only. On HIP, select_experts' post-processing
+        # (_post_process_topk_ids) is a no-op for K3's call (no num_token_non_padded, no shared slots) unless
+        # EPLB remapping, megamoe or a routing simulation is on, so check exactly those.
+        bad = []
+        try:
+            from sglang.srt.environ import envs
+            from sglang.srt.layers.moe import get_moe_a2a_backend
+            from sglang.srt.layers.moe.topk import (
+                TopKOutputFormat,
+                is_expert_remapping_enabled,
+            )
+
+            cfg = moe.topk.topk_config
+            checks = {
+                "output_format": cfg.output_format in (None, TopKOutputFormat.STANDARD),
+                "sigmoid": cfg.scoring_func == "sigmoid",
+                "bias": cfg.correction_bias is not None,
+                "ungrouped": (cfg.num_expert_group or 1) == 1
+                and (cfg.topk_group or 1) == 1,
+                "top16": cfg.top_k == 16,
+                "no_shared_slots": cfg.num_shared_topk_slots == 0,
+                "no_waterfill": moe.topk.waterfill_balancer is None
+                and not moe.topk.enable_waterfill,
+                "no_eplb_remap": not is_expert_remapping_enabled(),
+                "no_megamoe": not get_moe_a2a_backend().is_megamoe(),
+                "no_sim": not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+                and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get(),
+            }
+            bad = [k for k, v in checks.items() if not v]
+        except Exception as e:
+            bad = [f"{type(e).__name__}: {e}"]
+        ok = not bad
+        moe._k31_launch_topk_ok = ok
+        _say(
+            f"launch top-k {'on' if ok else 'off'} (layer {moe.layer_idx})"
+            + ("" if ok else f": {', '.join(bad)}")
+        )
+    return ok
+
+
+_TOPK_CHECK = dict(calls=0, rows=0, bad_rows=0, max_w=0.0)
+
+
+def _topk_check(moe, lat, logits, ids, w):
+    """Debug (``SGLANG_AMD_MONO_K31_WIDE_TOPK_CHECK=1``, eager only): the launch's top-16 vs SGLang's
+    ``self.topk`` on the same logits; a summary line every 2000 calls."""
+    ref = moe.topk(lat, logits)
+    a, ia = ids.long().sort(-1)
+    b, ib = ref.topk_ids.long().sort(-1)
+    same = (a == b).all(-1)
+    st = _TOPK_CHECK
+    st["calls"] += 1
+    st["rows"] += ids.shape[0]
+    st["bad_rows"] += int((~same).sum())
+    if bool(same.any()):
+        dw = (w.float().gather(-1, ia) - ref.topk_weights.float().gather(-1, ib))[same]
+        st["max_w"] = max(st["max_w"], float(dw.abs().max()))
+    if st["calls"] % 2000 == 0:
+        _say(
+            f"topk check: calls {st['calls']} rows {st['rows']} mismatched rows {st['bad_rows']} "
+            f"max |w diff| {st['max_w']:.3e}"
+        )
+
+
+def _routed(moe, lat, logits, ids, w, out):
+    """SGLang's ``KimiK3MoE._forward_routed(lat, logits, lat, out)``, with the launch's (ids, w) in place of
+    ``self.topk`` when ``SGLANG_AMD_MONO_K31_WIDE_LAUNCH_TOPK=1`` (saves aiter's topk kernel a layer)."""
+    if not _launch_topk_ok(moe):
+        return moe._forward_routed(lat, logits, lat, out)
+    if hasattr(moe, "_forward_routed_a8w4") and moe._forward_routed_a8w4(
+        lat, logits, lat, out
+    ):
+        return
+    if (
+        os.environ.get("SGLANG_AMD_MONO_K31_WIDE_TOPK_CHECK", "0") == "1"
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        _topk_check(moe, lat, logits, ids, w)
+    _experts(moe, lat, ids, w, out)
+
+
+def _experts(moe, lat, ids, w, out):
+    """SGLang's routed experts on the launch's (ids, w) -> out."""
+    from sglang.srt.layers import zero_copy_context
+    from sglang.srt.layers.moe import route_quant_handoff
+    from sglang.srt.layers.moe.topk import build_precomputed_topk_output
+
+    if moe._route_quant_fuse_eligible:
+        route_quant_handoff.stage(lat, layer=moe.experts)
+    try:
+        topk_output = build_precomputed_topk_output(
+            w, ids, moe.topk.topk_config, moe.layer_idx
+        )
+        with zero_copy_context.set_moe_output(out):
+            y = moe.experts(lat, topk_output)
+    finally:
+        route_quant_handoff.clear()
+    if y.data_ptr() != out.data_ptr():
+        out.copy_(y)
+
+
 class _Layer:
     """A covered layer's weights as the launch reads them (views where SGLang's
     layout already fits; the front rows and the folded up projection are copies)."""
@@ -872,10 +981,12 @@ class Wide:
                         )
                     )
                 lat_p = bufs["lat_p"][cur]
-                pk.moe._forward_routed(
+                _routed(
+                    pk.moe,
                     bufs["lat"][:rows],
                     bufs["logits"][:rows],
-                    bufs["lat"][:rows],
+                    bufs["ids"][:rows],
+                    bufs["w"][:rows],
                     lat_p[:rows],
                 )
                 ping = cur
