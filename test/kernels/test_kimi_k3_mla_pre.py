@@ -143,6 +143,23 @@ class TestMlaPre(CustomTestCase):
     def test_eight_rows_absorb(self):
         self._run(8, qn=True)
 
+    def test_bank_without_the_write_block_is_refused(self):
+        # A block-write layer stores its row at block write_idx; a bank of exactly
+        # write_idx blocks would put the last token's row past the allocation.
+        from sgl_amd_mono.kimi_k3.gfx950.attention import mla_pre as mp
+
+        dev = torch.device("cuda", 0)
+        key = mp.MlaPreBuild(
+            tokens=8, nblocks=NVB, eps=EPS, out_eps=EPS, q_eps=1e-6, kv_eps=1e-6,
+            write_idx=NVB,
+        )  # fmt: skip
+        blocks = torch.zeros(8, NVB, 7168, dtype=BF, device=dev)
+        with self.assertRaisesRegex(AssertionError, "writes bank block"):
+            mp.mla_pre_launch(
+                key, prefix=None, blocks=blocks, w=None, out=None, scratch=None,
+                layer=3, epoch=None,
+            )  # fmt: skip
+
 
 if __name__ == "__main__":
     unittest.main()
