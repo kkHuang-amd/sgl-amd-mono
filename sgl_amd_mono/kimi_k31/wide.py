@@ -225,8 +225,8 @@ def _launch_sort(b) -> bool:
     from sgl_amd_mono.kimi_k31.gfx950.stages import moe_front as mf
 
     return (
-        os.environ.get("SGLANG_AMD_MONO_K31_WIDE_LAUNCH_SORT", "0") == "1"
-        and os.environ.get("SGLANG_AMD_MONO_K31_WIDE_LAUNCH_TOPK", "0") == "1"
+        os.environ.get("SGLANG_AMD_MONO_K31_WIDE_LAUNCH_SORT", "1") == "1"
+        and os.environ.get("SGLANG_AMD_MONO_K31_WIDE_LAUNCH_TOPK", "1") == "1"
         and b <= mf.SORT_MAX_ROWS
     )
 
@@ -256,7 +256,7 @@ def _launch_topk_ok(moe) -> bool:
     """Whether the routed experts may take the launch's own top-16 (ids, w) instead of SGLang's
     ``self.topk``: the launch's route stage is sigmoid + bias, ungrouped top-16, renormalized (10.18), so only a
     STANDARD output whose post-processing is a no-op (no padding mask / EPLB remap / waterfill) qualifies."""
-    if os.environ.get("SGLANG_AMD_MONO_K31_WIDE_LAUNCH_TOPK", "0") != "1":
+    if os.environ.get("SGLANG_AMD_MONO_K31_WIDE_LAUNCH_TOPK", "1") != "1":
         return False
     ok = getattr(moe, "_k31_launch_topk_ok", None)
     if ok is None:
