@@ -145,6 +145,29 @@ def sort_check(m, nl, tk_ids, tk_w, lat_out, moe_out, sortb, rank):
     return bad
 
 
+def sort_check_aux16(m, nl, tk_ids, tk_w, moe_out, sortb, rank):
+    """The launch's aux16 sort (``--sort aux16``) vs aiter's own BM16 aux sort on the launch's ids / weights,
+    bit for bit below num_valid (``presort.check_aux16``), and the MoE output zeroed."""
+    from sgl_amd_mono.kimi_k31.presort import check_aux16
+    from sgl_amd_mono.kimi_k31.wide import _sort_views
+
+    bad = 0
+    for i in range(nl):
+        v = _sort_views(sortb[i], m, "aux16")
+        e = check_aux16(v, tk_ids[i], tk_w[i])
+        nv = e.pop("nv")
+        e["out"] = int((moe_out[i] != 0).sum())
+        n_bad = sum(e.values())
+        bad += n_bad
+        if rank == 0 and (i == 0 or n_bad):
+            print(
+                f"sort check aux16 m {m} launch {i}: num_valid {nv} mismatches {e}"
+                + (" PASS" if n_bad == 0 else " FAIL"),
+                flush=True,
+            )
+    return bad
+
+
 def run(args, m, rank, dev, cpu):
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
@@ -414,10 +437,10 @@ def run(args, m, rank, dev, cpu):
         moe_out = moe_sh[:, : m * LAT].view(nl, m, LAT)
         sh_out = moe_sh[:, m * LAT :].view(nl, m, H)
         moe_out.fill_(1.0)
-        sort_lay = mf.sort_layout(m)
+        sort_lay = mf.sort_layout(m, args.sort)
         sortb = torch.zeros(nl, sort_lay["nbytes"], dtype=torch.uint8, device=dev)
         for i in range(nl):
-            mf.sort_init(sortb[i], m)
+            mf.sort_init(sortb[i], m, args.sort)
     else:
         sh_out = torch.zeros(nl, m, H, dtype=BF, device=dev)
         sortb = torch.zeros(nl, 256, dtype=torch.uint8, device=dev)
@@ -475,11 +498,13 @@ def run(args, m, rank, dev, cpu):
     for i in range(nl):
         one(i)
     torch.cuda.synchronize()
-    sort_bad = (
-        sort_check(m, nl, tk_ids, tk_w, lat_out, moe_out, sortb, rank)
-        if args.sort
-        else 0
-    )
+
+    def check(sb):
+        if args.sort == "aux16":
+            return sort_check_aux16(m, nl, tk_ids, tk_w, moe_out, sb, rank)
+        return sort_check(m, nl, tk_ids, tk_w, lat_out, moe_out, sb, rank)
+
+    sort_bad = check(sortb) if args.sort else 0
     if args.sort and nl > 1:
         # again with each sort buffer holding another launch's rows (the reset-to-pad path serving runs: one
         # buffer a bucket, a different routing every layer)
@@ -488,7 +513,7 @@ def run(args, m, rank, dev, cpu):
             one(i, (i + 1) % nl)
         torch.cuda.synchronize()
         rot = torch.stack([sortb[(i + 1) % nl] for i in range(nl)])
-        sort_bad += sort_check(m, nl, tk_ids, tk_w, lat_out, moe_out, rot, rank)
+        sort_bad += check(rot)
         # back to each launch's own buffer for the timing loop
         for i in range(nl):
             one(i)
@@ -656,9 +681,12 @@ def main():
     )
     p.add_argument(
         "--sort",
-        action="store_true",
-        help="the launch makes the routed experts' sort + mxfp8 quant + output zeroing; checked bit for bit "
-        "against SGLang's small-sort kernel",
+        nargs="?",
+        const="sgl",
+        default=None,
+        choices=("sgl", "aux16"),
+        help="the launch makes the routed experts' sort + output zeroing; sgl (default): + mxfp8 quant, checked "
+        "bit for bit against SGLang's small-sort kernel; aux16: aiter's BM16 aux sort, checked against aiter's",
     )
     p.add_argument(
         "--inp",

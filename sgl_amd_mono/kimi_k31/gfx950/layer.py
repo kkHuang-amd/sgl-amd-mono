@@ -199,6 +199,9 @@ def kda_layer(
     ``wf`` holds this rank's [router | latent down | shared gate_up] rows contiguously. ``up_norm``: ``w_up`` is
     SGLang's up projection rows as is and ``bias`` continues with the latent norm weight (f32 [LAT]), which the
     MoE tail scales the gathered latent by (else ``w_up`` is ``pre.fold_up``'s copy)."""
+    # sort: False / None (off), True or "sgl" (SGLang's BM32 small sort + mxfp8 quant), "aux16" (aiter's BM16 aux sort)
+    sort = ("sgl" if sort is True else sort) or None
+    assert sort is None or sort in mf.SORT_KINDS, sort
     keyed = key_tuple({**locals(), "front_rows": str(front_rows)}, SOURCES)
     key = (
         m,
@@ -234,8 +237,9 @@ def kda_layer(
         and (not write_a or nvb_m <= nvb_a + 1)
         and (not write_m or nvb_m < nbk)
     )
-    # sort: the routed experts' sort + mxfp8 quant + output zeroing made here (mf.sort_rows), SGLang's small-sort
-    # range only; sort_buf holds mf.sort_layout(m), the MoE output sits right before sh_out (wide's flat ping)
+    # sort: the routed experts' sort (+ "sgl": mxfp8 quant) + output zeroing made here (mf.sort_rows), m <= 64
+    # (a 64-bit token mask an expert); sort_buf holds mf.sort_layout(m, sort), the MoE output sits right before
+    # sh_out (wide's flat ping)
     assert not sort or m <= mf.SORT_MAX_ROWS, m
     # the up and in_proj finishes read and zero linbf tiles
     assert gu.ks > 1 and gi.ks > 1
@@ -276,7 +280,8 @@ def kda_layer(
         cnt_end * CNT_STRIDE,
         (cnt_end + 1) * CNT_STRIDE,
     )  # sort: rows routed / sort launches
-    lay_s = mf.sort_layout(m) if sort else None
+    lay_s = mf.sort_layout(m, sort) if sort else None
+    sort_q = sort == "sgl"  # the launch also quantizes (place_codes helpers)
     sort_cta = BLOCKS - m - 1
     help0 = sort_cta - mf.SORT_HELPERS  # place_codes CTAs: help0 .. sort_cta - 1
     wrow_f = None
@@ -344,7 +349,7 @@ def kda_layer(
         + ("_tl" if timeline else "")
         + ("_fr" + "x".join(map(str, front_rows)) if front_rows else "")
         + ("_un" if up_norm else "")
-        + ("_srt" if sort else "")
+        + ({"sgl": "_srt", "aux16": "_srt16"}.get(sort, ""))
         + "_cs_pH_rp"
     )
 
@@ -782,8 +787,16 @@ def kda_layer(
                         a7.topk_ids,
                         a7.topk_w,
                         a7.logits_out,
-                        qout=a7.sort_buf + fx.Int64(lay_s["offs"]["q"]),
-                        tscale=a7.sort_buf + fx.Int64(lay_s["offs"]["ts"]),
+                        qout=(
+                            a7.sort_buf + fx.Int64(lay_s["offs"]["q"])
+                            if sort_q
+                            else None
+                        ),
+                        tscale=(
+                            a7.sort_buf + fx.Int64(lay_s["offs"]["ts"])
+                            if sort_q
+                            else None
+                        ),
                         moe_out=a7.sh_out - fx.Int64(m * mf.LAT * 2),
                         cnt=a7.cnt,
                         cnt_word=w_rt,
@@ -826,11 +839,18 @@ def kda_layer(
                         sl.sa.ptr,
                         sl.sb.ptr,
                     )
-                if (bid >= help0) & (bid < sort_cta):
-                    a7h = ka("sort_buf", "scratch")
-                    mf.place_codes(
-                        cf, tid, bid - help0, m, a7h.sort_buf, lay_s, sr(a7h, "srtmk")
-                    )
+                if const_expr(sort_q):
+                    if (bid >= help0) & (bid < sort_cta):
+                        a7h = ka("sort_buf", "scratch")
+                        mf.place_codes(
+                            cf,
+                            tid,
+                            bid - help0,
+                            m,
+                            a7h.sort_buf,
+                            lay_s,
+                            sr(a7h, "srtmk"),
+                        )
             stamp(timeline, tls, tid, 10)
             for row in range(first_task(bid, max(BLOCKS - m, 0)), m, BLOCKS):
                 a8 = ka("scratch")

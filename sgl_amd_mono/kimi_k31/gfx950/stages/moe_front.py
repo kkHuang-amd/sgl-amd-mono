@@ -62,18 +62,52 @@ def gathered_tiles(bn):
     return (S0 + bn - 1) // bn
 
 
-# ---- the routed experts' sort + mxfp8 quant made in the launch (``sort`` builds), bit for bit what SGLang's
-# small-sort Triton kernel (sglang/kernels/ops/moe/moe_sorting_small.py, _moe_sorting_small_kernel_sorted with
-# EMIT_MX) hands aiter's 2-stage MoE: BM = 32 blocks, experts ascending, a token's pair once per expert.
-SORT_BM = 32
+# ---- the routed experts' sort made in the launch (``sort`` builds), two kinds:
+# "sgl"   bit for bit what SGLang's small-sort Triton kernel (sglang/kernels/ops/moe/moe_sorting_small.py,
+#         _moe_sorting_small_kernel_sorted with EMIT_MX) hands aiter's 2-stage MoE: BM = 32 blocks, experts
+#         ascending, a token's pair once per expert, plus the mxfp8 quant of the latent (pad id (TOPK << 24) | m).
+# "aux16" aiter's BM = 16 aux sort (aiter.presorted_moe.register_presorted_moe, upstream mxmoe rows): the same
+#         order in BM = 16 blocks, pad id m, plus m_indices (sorted row -> token, pad m) and reverse_sorted
+#         ((token, slot) -> sorted row, = ``dest``); no quant (aiter's stage 1 quantizes the bf16 latent inline).
+SORT_KINDS = ("sgl", "aux16")
+SORT_BM = 32  # "sgl"
 SORT_MAX_ROWS = 64  # a 64-bit token mask an expert (SGLang's patch covers M x 16 <= 1024 pairs: M <= 64)
 SCALE_COLS = (
     (LAT // 32 + 7) // 8
 ) * 8  # 112 e8m0 bytes a sorted row (SGLang's SCALEN_PAD)
 
 
-def sort_layout(m):
-    """Byte offsets in the sort buffer of bucket m, and its size. SGLang's buffer sizes for M = m."""
+def sort_bm(kind):
+    assert kind in SORT_KINDS, kind
+    return 16 if kind == "aux16" else SORT_BM
+
+
+def sort_pad(kind, m):
+    """The sorted-id word of a pad row."""
+    return m if kind == "aux16" else (TOPK << 24) | m
+
+
+def sort_layout(m, kind="sgl"):
+    """Byte offsets in the sort buffer of bucket m, and its size. "sgl": SGLang's buffer sizes for M = m;
+    "aux16": aiter's (``aux_sort_capacity``: every pair + BM - 1 pad rows an active expert)."""
+    if kind == "aux16":
+        p = m * TOPK
+        bm = sort_bm(kind)
+        maxp = (p + min(E, p) * (bm - 1) + bm - 1) // bm * bm
+        sizes = dict(
+            ids=4 * maxp,  # int32 (slot << 24) | token, pad m
+            w=4 * maxp,  # f32, pad 0
+            eids=4 * (maxp // bm),  # int32 expert a block
+            nv=8,  # int32 [blocks x 16, m]
+            mi=4 * maxp,  # int32 m_indices: token, pad m
+            dest=4
+            * p,  # int32 reverse_sorted: sorted row of pair p (the next launch resets those rows)
+        )
+        offs, at = {}, 0
+        for k, n in sizes.items():
+            offs[k] = at
+            at += (n + 255) // 256 * 256
+        return dict(offs=offs, maxp=maxp, nblk=maxp // bm, nbytes=at, kind=kind)
     p = m * TOPK
     maxp = p + E * SORT_BM - TOPK  # max_num_tokens_padded
     nblk = (maxp + SORT_BM - 1) // SORT_BM
@@ -94,22 +128,24 @@ def sort_layout(m):
     for k, n in sizes.items():
         offs[k] = at
         at += (n + 255) // 256 * 256
-    return dict(offs=offs, maxp=maxp, nblk=nblk, srows=srows, nbytes=at)
+    return dict(offs=offs, maxp=maxp, nblk=nblk, srows=srows, nbytes=at, kind=kind)
 
 
 SORT_HELPERS = 32  # CTAs that place the e8m0 codes (21.5 K byte stores at m = 12: too many for one CTA)
 
 
-def sort_init(buf, m):
-    """The sort buffer's resting state (host, once): every sorted row a pad row (TOPK << 24) | m, weight 0.
-    Each launch then turns its pairs' rows real and the next one turns them back (``sort_rows``), so the
-    rows below num_valid are always this launch's pairs or pads, with no pad pass."""
+def sort_init(buf, m, kind="sgl"):
+    """The sort buffer's resting state (host, once): every sorted row a pad row (``sort_pad``), weight 0
+    (aux16: m_indices m). Each launch then turns its pairs' rows real and the next one turns them back
+    (``sort_rows``), so the rows below num_valid are always this launch's pairs or pads, with no pad pass."""
     import torch
 
-    ly = sort_layout(m)
+    ly = sort_layout(m, kind)
     o = ly["offs"]
     buf.zero_()
-    buf[o["ids"] : o["ids"] + 4 * ly["maxp"]].view(torch.int32).fill_((TOPK << 24) | m)
+    buf[o["ids"] : o["ids"] + 4 * ly["maxp"]].view(torch.int32).fill_(sort_pad(kind, m))
+    if kind == "aux16":
+        buf[o["mi"] : o["mi"] + 4 * ly["maxp"]].view(torch.int32).fill_(m)
 
 
 def _quant8(v):
@@ -278,9 +314,10 @@ def route_row(
 ):
     """The row's gathered latent -> the experts' input; top-16 of the gathered logits
     (and the logits themselves -> ``logits_out`` f32 [m, 896], for SGLang's own top-k).
-    ``qout`` (sort builds): also the row's mxfp8 quant -> ``qout`` fp8 [m, 3584] and its e8m0 codes ->
-    ``tscale`` [m, 112] by token, the row of ``moe_out`` bf16 [m, 3584] zeroed (stage 2 accumulates), ids /
-    weights at device scope, then one count in ``cnt`` word ``cnt_word`` (``sort_rows`` waits for m)."""
+    ``moe_out`` (sort builds): also the row of ``moe_out`` bf16 [m, 3584] zeroed (stage 2 accumulates), ids /
+    weights at device scope, then one count in ``cnt`` word ``cnt_word`` (``sort_rows`` waits for m).
+    ``qout`` ("sgl" sort builds): also the row's mxfp8 quant -> ``qout`` fp8 [m, 3584] and its e8m0 codes ->
+    ``tscale`` [m, 112] by token."""
     tid = c["tid"]
     lane, wave = tid % 64, tid // 64
     nt = gathered_tiles(bn)
@@ -290,7 +327,7 @@ def route_row(
     gpu.barrier()
     lg = rsrc(c["lgat_own"].value)
     rg = rsrc(c["rgat_own"].value)
-    sorted_build = qout is not None
+    sorted_build = moe_out is not None
     cm_rt = CM_DEV if const_expr(sorted_build) else 0
     for u in range(tid, LAT // 8, THREADS):
         v = fx.Vector(
@@ -303,7 +340,7 @@ def route_row(
             )
         )
         bo.buffer_store(v, rsrc(lat_out), (row * LAT + 8 * u) // 2)
-        if const_expr(sorted_build):
+        if const_expr(qout is not None):
             # LAT // 8 = 448 lanes, one round: a 32-column group is 4 consecutive lanes of one wave
             w0, w1, code = _quant8(v)
             bo.buffer_store(
@@ -318,6 +355,7 @@ def route_row(
                     row * SCALE_COLS + u // 4,
                     cache_modifier=CM_DEV,
                 )
+        if const_expr(sorted_build):
             z = fx.Int32(0)
             bo.buffer_store(
                 fx.Vector.from_elements([z, z, z, z], fx.Int32),
@@ -486,17 +524,22 @@ def sort_rows(
     SORT_BM, m]. Pads are never written in bulk: the buffer rests all pad (``sort_init``), this launch first
     turns the previous launch's pair rows (``dest``) back to pad, then writes its own and their rows -> ``dest``,
     then puts ``srtmk`` for ``place_codes``. Every global word it reads is loaded up front (m is static).
+    ``lay["kind"]`` "aux16": aiter's BM16 aux sort instead (``sort_layout``): blocks of 16, pad id m, and
+    m_indices (``mi``) real / reset alongside the ids; ``dest`` is its reverse_sorted; no ``srtmk``.
     LDS: ``masks`` 2 x E words (an expert's 64-bit token mask), ``bbl`` E words, ``scan_a`` / ``scan_b``
     WAVES words each."""
     lane, wave = tid % 64, tid // 64
     p_n = m * TOPK
     o = lay["offs"]
+    aux16 = lay["kind"] == "aux16"
+    bm = sort_bm(lay["kind"])
     a_ids = sbuf + fx.Int64(o["ids"])
     a_w = sbuf + fx.Int64(o["w"])
     a_eids = sbuf + fx.Int64(o["eids"])
     a_nv = sbuf + fx.Int64(o["nv"])
     a_dest = sbuf + fx.Int64(o["dest"])
-    pad = fx.Int32((TOPK << 24) | m)
+    a_mi = sbuf + fx.Int64(o.get("mi", 0))  # aux16 only
+    pad = fx.Int32(sort_pad(lay["kind"], m))
     pr = (p_n + THREADS - 1) // THREADS  # pair rounds (static)
     # the previous launch's pair rows: loaded (and reset) while this launch's rows are still being routed
     old_d = [
@@ -507,6 +550,8 @@ def sort_rows(
         if tid + k * THREADS < p_n:
             bo.buffer_store(pad, rsrc(a_ids), old_d[k])
             bo.buffer_store(fx.Float32(0.0), rsrc(a_w), old_d[k])
+            if const_expr(aux16):
+                bo.buffer_store(fx.Int32(m), rsrc(a_mi), old_d[k])
     for i in range(tid, 2 * E, THREADS):
         fx.ptr_store(fx.Int32(0), masks + i)
     # 1. every row of this launch routed
@@ -553,8 +598,8 @@ def sort_rows(
     has1 = e1 < E
     c0 = count(tid)
     c1 = has1.select(count(fx.min(e1, E - 1)), fx.Int32(0))
-    b0 = (c0 + SORT_BM - 1) // SORT_BM
-    b1 = (c1 + SORT_BM - 1) // SORT_BM
+    b0 = (c0 + bm - 1) // bm
+    b1 = (c1 + bm - 1) // bm
     x0, n0 = block_excl_scan(b0, lane, wave, scan_a)
     x1, n1 = block_excl_scan(b1, lane, wave, scan_b)
     bb0, bb1 = x0, n0 + x1
@@ -567,7 +612,7 @@ def sort_rows(
         for k in range(b1):
             bo.buffer_store(fx.Int32(e1), rsrc(a_eids), bb1 + k)
     if tid == 0:
-        bo.buffer_store((n0 + n1) * SORT_BM, rsrc(a_nv), 0)
+        bo.buffer_store((n0 + n1) * bm, rsrc(a_nv), 0)
         bo.buffer_store(fx.Int32(m), rsrc(a_nv), 1)
     # the resets above land before any of this launch's rows (one CTA: drained, then a barrier)
     rocdl.s_waitcnt(vmcnt=0)
@@ -587,15 +632,18 @@ def sort_rows(
                 fx.Int32(0), (fx.Int32(1) << fx.max(t - 32, 0)) - fx.Int32(1)
             )
             rank = popcount(fx.Uint32(lo & ml)) + popcount(fx.Uint32(hi & mh))
-            dest = fx.ptr_load(bbl + e) * SORT_BM + rank
+            dest = fx.ptr_load(bbl + e) * bm + rank
             bo.buffer_store((s << 24) | t, rsrc(a_ids), dest)
             bo.buffer_store(ws[k], rsrc(a_w), dest)
+            if const_expr(aux16):
+                bo.buffer_store(t, rsrc(a_mi), dest)
             bo.buffer_store(dest, rsrc(a_dest), p, cache_modifier=CM_DEV)
-    # 6. the rows out (device scope), then place_codes may read them
+    # 6. the rows out (device scope), then place_codes may read them ("sgl"; aux16 has no codes to place)
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
-    if tid == 0:
-        c["put"](srtmk, 0, fx.Int32(1))
+    if const_expr(not aux16):
+        if tid == 0:
+            c["put"](srtmk, 0, fx.Int32(1))
 
 
 @flyc.jit
