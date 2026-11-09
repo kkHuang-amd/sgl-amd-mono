@@ -66,8 +66,6 @@ SGLANG_READS = {
     # _experts: the routed experts on the launch's top-k / sort
     "srt/layers/zero_copy_context.py": ("set_moe_output",),
     "srt/layers/moe/route_quant_handoff.py": ("stage", "clear"),
-    # _sort_check (debug): SGLang's small sort as the reference
-    "kernels/ops/moe/moe_sorting_small.py": ("_run_small_sort",),
     "srt/layers/attn_residual_hip.py": ("gather_covers",),
     "srt/layers/attention/linear/utils.py": (
         "select_verify_intermediate_state_indices",
@@ -85,7 +83,6 @@ SGLANG_READS = {
         "tensor_model_parallel_all_reduce",
         "tensor_model_parallel_all_gather",
     ),
-    "srt/distributed/parallel_state.py": ("get_tp_group",),
     "srt/utils/common.py": ("BumpAllocator",),
     # the layer's place in the state pool
     "srt/layers/attention/hybrid_linear_attn_backend.py": ("state_layer",),
@@ -226,8 +223,7 @@ def _launch_sort(b):
     """The sort kind bucket b's launches also make (with the output zeroing), or None
     (``SGLANG_AMD_MONO_K31_WIDE_LAUNCH_SORT=1``, needs ``..._LAUNCH_TOPK=1``; m <= 64):
     "aux16" (aiter's BM16 aux sort, handed over by ``aiter.presorted_moe.register_presorted_moe``) when aiter
-    has that API, else "sgl" (SGLang's BM32 small sort + mxfp8 quant, ``presort.injected``).
-    ``SGLANG_AMD_MONO_K31_WIDE_SORT_KIND=sgl|aux16`` forces one."""
+    has that API, else "sgl" (SGLang's BM32 small sort + mxfp8 quant, ``presort.injected``)."""
     from sgl_amd_mono.kimi_k31 import presort
     from sgl_amd_mono.kimi_k31.gfx950.stages import moe_front as mf
 
@@ -322,30 +318,6 @@ def _launch_topk_ok(moe) -> bool:
     return ok
 
 
-_TOPK_CHECK = dict(calls=0, rows=0, bad_rows=0, max_w=0.0)
-
-
-def _topk_check(moe, lat, logits, ids, w):
-    """Debug (``SGLANG_AMD_MONO_K31_WIDE_TOPK_CHECK=1``, eager only): the launch's top-16 vs SGLang's
-    ``self.topk`` on the same logits; a summary line every 2000 calls."""
-    ref = moe.topk(lat, logits)
-    a, ia = ids.long().sort(-1)
-    b, ib = ref.topk_ids.long().sort(-1)
-    same = (a == b).all(-1)
-    st = _TOPK_CHECK
-    st["calls"] += 1
-    st["rows"] += ids.shape[0]
-    st["bad_rows"] += int((~same).sum())
-    if bool(same.any()):
-        dw = (w.float().gather(-1, ia) - ref.topk_weights.float().gather(-1, ib))[same]
-        st["max_w"] = max(st["max_w"], float(dw.abs().max()))
-    if st["calls"] % 2000 == 0:
-        _say(
-            f"topk check: calls {st['calls']} rows {st['rows']} mismatched rows {st['bad_rows']} "
-            f"max |w diff| {st['max_w']:.3e}"
-        )
-
-
 def _routed(moe, lat, logits, ids, w, out, sortv=None):
     """SGLang's ``KimiK3MoE._forward_routed(lat, logits, lat, out)``, with the launch's (ids, w) in place of
     ``self.topk`` when ``SGLANG_AMD_MONO_K31_WIDE_LAUNCH_TOPK=1`` (saves aiter's topk kernel a layer)."""
@@ -354,21 +326,6 @@ def _routed(moe, lat, logits, ids, w, out, sortv=None):
     if hasattr(moe, "_forward_routed_a8w4") and moe._forward_routed_a8w4(
         lat, logits, lat, out
     ):
-        return
-    if (
-        os.environ.get("SGLANG_AMD_MONO_K31_WIDE_TOPK_CHECK", "0") == "1"
-        and not torch.cuda.is_current_stream_capturing()
-    ):
-        _topk_check(moe, lat, logits, ids, w)
-    if (
-        sortv is not None
-        and os.environ.get("SGLANG_AMD_MONO_K31_WIDE_SORT_CHECK", "0") == "1"
-        and not torch.cuda.is_current_stream_capturing()
-    ):
-        if sortv["kind"] == "aux16":
-            _sort_check_aux16(moe, lat, ids, w, out, sortv)
-        else:
-            _sort_check(moe, lat, ids, w, out, sortv)
         return
     _experts(moe, lat, ids, w, out, sortv)
 
@@ -410,116 +367,6 @@ def _experts(moe, lat, ids, w, out, sortv):
         out.copy_(y)
 
 
-_SORT_CHECK = dict(calls=0, bad=0)
-
-
-def _sort_check_aux16(moe, lat, ids, w, out, sortv):
-    """Debug (``SGLANG_AMD_MONO_K31_WIDE_SORT_CHECK=1``, eager, "aux16"): on the served data, (1) the launch's
-    sort vs aiter's own BM16 sort on the same ids / weights (``presort.check_aux16``), (2) the MoE output
-    zeroed by the launch, (3) the experts' output with the launch's sort vs with aiter's own."""
-    from sgl_amd_mono.kimi_k31 import presort
-
-    m = ids.shape[0]
-    st = _SORT_CHECK
-    st["calls"] += 1
-    e = presort.check_aux16(sortv, ids, w)
-    e["out_nonzero"] = int((out != 0).sum())
-    ref = torch.empty_like(out)
-    ref2 = torch.empty_like(out)
-    _experts(moe, lat, ids, w, ref, None)
-    _experts(
-        moe, lat, ids, w, ref2, None
-    )  # aiter's own run to run spread (atomic stage 2)
-    _experts(moe, lat, ids, w, out, sortv)
-
-    def rel(a, b):
-        return float((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-30))
-
-    e["out_rel"] = rel(out, ref)
-    e["ref_rel"] = rel(ref2, ref)
-    bad = (
-        any(v for k, v in e.items() if k not in ("out_rel", "ref_rel", "nv"))
-        or e["out_rel"] > 1e-2
-    )
-    st["bad"] += int(bad)
-    st["out_rel"] = st.get("out_rel", 0.0) + e["out_rel"]
-    st["ref_rel"] = st.get("ref_rel", 0.0) + e["ref_rel"]
-    if bad or st["calls"] <= 3 or st["calls"] % 100 == 0:
-        _say(
-            f"sort check aux16 mean over {st['calls']} calls: out_rel {st['out_rel'] / st['calls']:.2e} "
-            f"ref_rel (aiter vs itself) {st['ref_rel'] / st['calls']:.2e}"
-        )
-        _say(
-            f"sort check aux16 call {st['calls']} layer {moe.layer_idx} m {m}: {e} bad so far {st['bad']}"
-        )
-
-
-def _sort_check(moe, lat, ids, w, out, sortv):
-    """Debug (``SGLANG_AMD_MONO_K31_WIDE_SORT_CHECK=1``, eager): on the served data, (1) the launch's sort
-    buffers vs SGLang's small-sort kernel on the same ids / weights / latent (as layer_bench --sort), (2) the
-    MoE output zeroed by the launch, (3) the experts' output with the launch's sort vs with SGLang's own."""
-    from sglang.kernels.ops.moe.moe_sorting_small import _run_small_sort
-
-    m = ids.shape[0]
-    st = _SORT_CHECK
-    st["calls"] += 1
-    pad = (16 << 24) | m
-    maxp, nblk = sortv["ids"].numel(), sortv["eids"].numel()
-    dev = ids.device
-    r_ids = torch.empty(maxp, dtype=torch.int32, device=dev)
-    r_w = torch.empty(maxp, dtype=torch.float32, device=dev)
-    r_e = torch.empty(nblk, dtype=torch.int32, device=dev)
-    r_nv = torch.empty(2, dtype=torch.int32, device=dev)
-    r_buf = torch.empty(m, LAT, dtype=torch.bfloat16, device=dev)
-    r_q, r_qs = _run_small_sort(
-        ids.contiguous(), w.contiguous(), r_ids, r_w, r_e, r_nv, r_buf, 32, lat, E
-    )
-    nv = int(r_nv[0])
-    e = dict(
-        nv=int((sortv["nv"] != r_nv).sum()),
-        ids=int((sortv["ids"][:nv] != r_ids[:nv]).sum()),
-        w=int((sortv["w"][:nv].view(torch.int32) != r_w[:nv].view(torch.int32)).sum()),
-        eids=int((sortv["eids"][: nv // 32] != r_e[: nv // 32]).sum()),
-        q=int((sortv["q"].view(torch.uint8) != r_q.view(torch.uint8)).sum()),
-        out_nonzero=int((out != 0).sum()),
-    )
-    d = torch.nonzero(r_ids[:nv] != pad).flatten()
-    y = torch.arange(112, device=dev)
-    base = (d // 32) * (112 * 32) + (d % 16) * 4 + (d % 32) // 16
-    sw = base[:, None] + ((y // 8) * 256 + (y % 4) * 64 + ((y % 8) // 4) * 2)[None, :]
-    e["qs"] = int(
-        (sortv["qs"].flatten()[sw] != r_qs.view(torch.uint8).flatten()[sw]).sum()
-    )
-    ref = torch.empty_like(out)
-    ref2 = torch.empty_like(out)
-    _experts(moe, lat, ids, w, ref, None)
-    _experts(
-        moe, lat, ids, w, ref2, None
-    )  # SGLang's own run to run spread (stage 2 accumulates atomically)
-    _experts(moe, lat, ids, w, out, sortv)
-
-    def rel(a, b):
-        return float((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-30))
-
-    e["out_rel"] = rel(out, ref)
-    e["ref_rel"] = rel(ref2, ref)
-    bad = (
-        any(v for k, v in e.items() if k not in ("out_rel", "ref_rel"))
-        or e["out_rel"] > 1e-2
-    )
-    st["bad"] += int(bad)
-    st["out_rel"] = st.get("out_rel", 0.0) + e["out_rel"]
-    st["ref_rel"] = st.get("ref_rel", 0.0) + e["ref_rel"]
-    if bad or st["calls"] <= 3 or st["calls"] % 100 == 0:
-        _say(
-            f"sort check mean over {st['calls']} calls: out_rel {st['out_rel'] / st['calls']:.2e} "
-            f"ref_rel (SGLang vs itself) {st['ref_rel'] / st['calls']:.2e}"
-        )
-        _say(
-            f"sort check call {st['calls']} layer {moe.layer_idx} m {m} nv {nv}: {e} bad so far {st['bad']}"
-        )
-
-
 class _Layer:
     """A covered layer's weights as the launch reads them (views where SGLang's
     layout already fits; the front rows and the folded up projection are copies)."""
@@ -556,10 +403,7 @@ class _Layer:
         if self.t1:
             prev = backbone.layers[i - 1].mlp
             up = prev.routed_expert_up_proj.weight[r * SL : (r + 1) * SL]
-            if (
-                os.environ.get("SGLANG_AMD_MONO_K31_WIDE_UP_COPY") != "1"
-                and up.is_contiguous()
-            ):
+            if up.is_contiguous():
                 # SGLang's rows as is; the launch scales the gathered latent by the norm weight
                 self.w["w_up"], self.up_norm = up, True
                 self.w["bias"] = torch.cat(
@@ -598,10 +442,8 @@ def _front_weight(moe, rank):
         moe.shared_experts.gate_up_proj.weight,
     )
     st = {p.untyped_storage().data_ptr() for p in parts}
-    if (
-        os.environ.get("SGLANG_AMD_MONO_K31_WIDE_FRONT_COPY") != "1"
-        and len(st) == 1
-        and all(p.dtype == torch.bfloat16 and p.stride() == (H, 1) for p in parts)
+    if len(st) == 1 and all(
+        p.dtype == torch.bfloat16 and p.stride() == (H, 1) for p in parts
     ):
         storage = parts[0].untyped_storage()
         base = torch.empty(0, dtype=torch.bfloat16, device=parts[0].device).set_(
@@ -632,10 +474,6 @@ def _tail_fusable(layer) -> bool:
     )
 
 
-def _check_steps() -> int:
-    return int(os.environ.get("SGLANG_AMD_MONO_K31_WIDE_ENTRY_CHECK", "0"))
-
-
 class Wide:
     def __init__(self, model, rank, group, device, L=8):
         from sgl_amd_mono.common import guard
@@ -651,22 +489,16 @@ class Wide:
         cov = set(idx)
         # standard layers whose MoE tail runs in the next run's first launch (t1 on):
         # SGLang runs them up to the routed / shared partials only
-        self.entry = set()
-        if os.environ.get("SGLANG_AMD_MONO_K31_WIDE_ENTRY_T1", "1") == "1":
-            self.entry = {
-                i - 1
-                for i in idx
-                if (i - 1) not in cov
-                and i - 1 >= bb.start_layer
-                and _tail_fusable(bb.layers[i - 1])
-            }
+        self.entry = {
+            i - 1
+            for i in idx
+            if (i - 1) not in cov
+            and i - 1 >= bb.start_layer
+            and _tail_fusable(bb.layers[i - 1])
+        }
         a0 = torch.cuda.memory_allocated()
         self.layers = {i: _Layer(bb, i, rank, cov | self.entry) for i in idx}
         a1 = torch.cuda.memory_allocated()
-        self.check_left = _check_steps()
-        self.column_exit = (
-            os.environ.get("SGLANG_AMD_MONO_K31_WIDE_COLUMN_EXIT", "1") == "1"
-        )
         self.slots = {i: n for n, i in enumerate(idx)}  # a launch's slot in the step
         caps = set(bb.dspark_layers_to_capture or ())
         self.peers, self.bufs, self.half = {}, {}, {}
@@ -767,13 +599,9 @@ class Wide:
         flat = [z(b * (LAT + H)), z(b * (LAT + H))]
         # the launch's hand-off mailboxes uncached (as the K3 launches): a consumer reads a line at its home memory,
         # not through the producer XCD's L2. A one-rank peer buffer, never freed while the process lives.
-        scr_pb = None
-        if os.environ.get("SGLANG_AMD_MONO_K31_WIDE_UNCACHED_SCRATCH", "1") == "1":
-            scr_pb = PeerBuffer(scratch, self.group, self.rank, 1, dev)
-            scr = scr_pb.bytes
-            scr.zero_()
-        else:
-            scr = torch.zeros(scratch, dtype=torch.uint8, device=dev)
+        scr_pb = PeerBuffer(scratch, self.group, self.rank, 1, dev)
+        scr = scr_pb.bytes
+        scr.zero_()
         bufs = dict(
             cfg=cfg,
             mid=z(b, SL),
@@ -1045,7 +873,7 @@ class Wide:
         else:
             moe._forward_shared(gate_up, sh)
         moe._forward_routed(x, logits, routed, bufs["lat_p"][ping][:rows])
-        return x, prefix
+        return prefix
 
     def _column_exit(self, moe, b, rows, bufs, ping):
         """A run's exit as SGLang's column tail (up to its row cap): one all-reduce of the
@@ -1059,8 +887,7 @@ class Wide:
 
         read = moe.next_attn_read
         if (
-            not self.column_exit
-            or read is None
+            read is None
             # _column_tail_and_next_read's own cap: past it, it would decline after the all-reduce
             or rows > envs.SGLANG_ROCM_K3_COLUMN_TAIL_MAX_TOKENS.get()
             or not moe._fused_latent_tail_eligible
@@ -1078,17 +905,6 @@ class Wide:
         )
         assert stream is not None
         return stream
-
-    def _rel(self, got, ref):
-        """rel L2 over the TP group of tensors each rank holds a part of."""
-        import torch.distributed as dist
-        from sglang.srt.distributed import get_tp_group
-
-        t = torch.stack(
-            [(got.float() - ref.float()).square().sum(), ref.float().square().sum()]
-        )
-        dist.all_reduce(t, group=get_tp_group().device_group)
-        return (t[0] / t[1]).sqrt().item()
 
     def backbone(self, built, input_ids, fb, input_embeds):
         from sglang.srt.distributed import tensor_model_parallel_all_gather
@@ -1125,16 +941,13 @@ class Wide:
         ks = self._kda_step(fb, R, L, bufs)
         self.epoch[0].add_(1)
         cols = self.cols
-        check = self.check_left > 0 and not torch.cuda.is_current_stream_capturing()
-        self.check_left -= int(check)
         i = m.start_layer
         ping = 0
-        ref_mid = None
         entry_prefix = None  # SGLang's prefix the next run's first launch reads (kept alive until it is enqueued)
         bank_synced = False
         while i < m.end_layer:
             if i in self.entry:
-                x, prefix = self._tail_front(
+                prefix = self._tail_front(
                     m.layers[i],
                     hidden,
                     built._positions,
@@ -1148,8 +961,6 @@ class Wide:
                     entry_prefix = prefix
                 else:
                     bufs["pout"][ping][:rows, cols] = prefix[:, cols]
-                if check:  # SGLang's whole MoE on the same input, this rank's columns
-                    ref_mid = m.layers[i].mlp(x, prefix_sum=prefix)[:, cols].clone()
                 i += 1
                 continue
             if i not in self.layers:
@@ -1177,13 +988,6 @@ class Wide:
             if not bank_synced:
                 bufs["bank"][:rows, :nvb] = res.block_residual[:rows, :nvb, cols]
                 bank_synced = True
-            elif check:
-                d = (
-                    (bufs["bank"][:rows, :nvb] != res.block_residual[:rows, :nvb, cols])
-                    .sum()
-                    .item()
-                )
-                assert d == 0, f"wide bank out of sync at layer {i}: {d} values"
             run = []
             while i in self.layers:
                 run.append(i)
@@ -1206,12 +1010,6 @@ class Wide:
                 )
                 if n == 0:
                     entry_prefix = None
-                if n == 0 and ref_mid is not None:
-                    e = self._rel(bufs["mid"][:rows], ref_mid)
-                    _say(
-                        f"entry check layer {li - 1} -> {li} rows {rows}: mid rel {e:.2e}"
-                    )
-                    ref_mid = None
                 if v["capture"]:
                     aux.append(bufs["cap"][:rows].clone())
                 if pk.write:
@@ -1235,13 +1033,6 @@ class Wide:
             # leave: the last layer's MoE tail on SGLang
             last = self.layers[run[-1]]
             sh = bufs["sh"][ping][:rows]
-            if check:  # the gathered-prefix tail
-                full = tensor_model_parallel_all_gather(
-                    bufs["pout"][ping][:rows, cols].contiguous(), dim=-1
-                )
-                ref = last.moe._column_split_tail(
-                    bufs["lat_p"][ping][:rows].clone(), sh.clone(), full, cols=cols
-                )
             stream = self._column_exit(last.moe, b, rows, bufs, ping)
             if stream is None:
                 # this rank's prefix columns ride in its columns of the shared partial, so
@@ -1249,11 +1040,6 @@ class Wide:
                 sh[:, cols] += bufs["pout"][ping][:rows, cols]
                 stream = last.moe._column_split_tail(
                     bufs["lat_p"][ping][:rows], sh, None, cols=cols
-                )
-            if check:
-                _say(
-                    f"exit check layer {run[-1]} rows {rows}: stream rel "
-                    f"{((stream.float() - ref.float()).norm() / ref.float().norm()).item():.2e}"
                 )
             hidden = set_written(stream, fb)
             if run[-1] in captures:

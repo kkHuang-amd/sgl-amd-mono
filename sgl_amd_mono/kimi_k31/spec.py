@@ -43,10 +43,10 @@ NUMERICS = Numerics(
     k3.NUMERICS.kind,
     {
         **k3.NUMERICS.bounds,
-        # SGLANG_AMD_MONO_K31_WIDE_ENTRY_CHECK on the real model (DFLASH, DCP8, rows
-        # 12 .. 288): a run's first launch's prefix after the MoE tail vs SGLang's
-        # whole MoE on the same input, median 3.6e-3; and a run's exit stream vs the
-        # gathered-prefix tail, median 3.2e-3. bf16 rounding in another order.
+        # Measured with the (since removed) entry check on the real model (DFLASH,
+        # DCP8, rows 12 .. 288): a run's first launch's prefix after the MoE tail vs
+        # SGLang's whole MoE on the same input, median 3.6e-3; and a run's exit stream
+        # vs the gathered-prefix tail, median 3.2e-3. bf16 rounding in another order.
         "layer.mid.rel": 0.006,
         "run.stream.rel": 0.006,
     },
@@ -120,8 +120,6 @@ def _build(model, hf_config, ctx):
     bucket, compiled by running each once (``warmup``) before graph capture."""
     from sglang.srt.runtime_context import get_parallel
 
-    from sgl_amd_mono.kimi_k31 import wide_check
-
     narrow_widths = tuple(w for w in ctx.widths if w <= wide.NARROW)
     narrow = k3.SPEC.build(
         model, hf_config, msgspec.structs.replace(ctx, widths=narrow_widths)
@@ -141,8 +139,6 @@ def _build(model, hf_config, ctx):
             *((x - y) / 2**30 for x, y in ((a[0], b[0]), (b[1], a[1]), (b[2], a[2])))
         )
 
-    # an eager check of the wide layer launch on this model (off unless asked)
-    wide_check.install(model)
     p = get_parallel()
     device = k3._backbone(model).layers[0].input_layernorm.weight.device
     m0 = mem()

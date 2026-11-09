@@ -16,7 +16,6 @@ import contextvars
 import functools
 import importlib.util
 import inspect
-import os
 
 import torch
 
@@ -193,12 +192,7 @@ _E, _TOPK, _LAT = 896, 16, 3584
 
 
 def sort_kind():
-    """The launch sort kind for this aiter: "aux16" iff it has ``aiter.presorted_moe``, else "sgl";
-    ``SGLANG_AMD_MONO_K31_WIDE_SORT_KIND=sgl|aux16`` forces one."""
-    env = os.environ.get("SGLANG_AMD_MONO_K31_WIDE_SORT_KIND", "")
-    if env:
-        assert env in ("sgl", "aux16"), env
-        return env
+    """The launch sort kind for this aiter: "aux16" iff it has ``aiter.presorted_moe``, else "sgl"."""
     return "aux16" if importlib.util.find_spec("aiter.presorted_moe") else "sgl"
 
 
