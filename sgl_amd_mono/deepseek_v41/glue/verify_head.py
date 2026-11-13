@@ -3,7 +3,10 @@
 accept SGLang's graph folds, and the all-sampled accept (accept_sampling_sharded, its
 simulated bonus) SGLang runs eagerly after the graph, in four launches inside the graph
 with the ranks' partials swapped through peer buffers. Checked against SGLang's greedy
-tail at its first eager call on every rank. ``SGLANG_AMD_MONO_DSV41_HEAD=1`` turns it on."""
+tail at its first eager call on full logits on every rank. ``SGLANG_AMD_MONO_DSV41_HEAD=1``
+turns it on; ``SGLANG_AMD_MONO_DSV41_HEAD_SHARDS=1`` also has the steps it serves verify
+on this rank's vocab shard (no logits all-gather; SGLang gives shards only without a
+softcap, so the head reads them as they are)."""
 
 from __future__ import annotations
 
@@ -16,6 +19,7 @@ from sgl_amd_mono.deepseek_v41.glue import agreed, flag, route
 _LOGGER = logging.getLogger(__name__)
 
 ENV = "SGLANG_AMD_MONO_DSV41_HEAD"
+SHARDS_ENV = ENV + "_SHARDS"
 VERIFY = "sglang.srt.speculative.dspark_components.dspark_verify"
 DEADLINE_S = 10.0
 
@@ -26,6 +30,9 @@ SGLANG_READS = {
         "_accept_static_greedy",
         "serves_sampled_fold",
         "begin_fold",
+        "wants_vocab_shards",
+        "serves_shards",
+        "shard_step",
         "max_bs",
         "stride",
         "gamma",
@@ -85,9 +92,11 @@ class _Head:
         device = io.logits.device
         self.ops = head.ops()
         self.rank, self.tp = int(group.rank_in_group), int(group.world_size)
-        self.vocab = int(io.logits.shape[1])
         shard = None
         ctx = epi.commit_ctx
+        lm_head = getattr(ctx.draft_model, "lm_head", None) if ctx is not None else None
+        # the first eager call may be on vocab shards: the vocabulary from the LM head
+        self.vocab = int(getattr(lm_head, "org_vocab_size", io.logits.shape[1]))
         if ctx is not None:
             markov = getattr(ctx.draft_model, "markov_head", None)
             shard = getattr(markov, "vocab_shard", None)
@@ -100,25 +109,37 @@ class _Head:
         assert self.start % 4 == 0 and self.start + self.width <= self.vocab
         self.max_bs, self.slots = int(epi.max_bs), int(epi.stride)
         assert self.max_bs <= head.MAX_BS and self.slots <= head.MAX_SLOTS
-        lm_head = getattr(ctx.draft_model, "lm_head", None) if ctx is not None else None
         self.padded = int(getattr(lm_head, "num_embeddings_per_partition", self.width))
         f32 = dict(dtype=torch.float32, device=device)
         self.part = torch.empty(head.part_words(self.max_bs, self.slots, self.width), **f32)
         self.temps = torch.zeros(self.max_bs, **f32)
         self.sim_temps = torch.zeros(self.max_bs, **f32)
         self.draft = torch.zeros(self.max_bs, self.slots - 1, self.padded, **f32)
+        # the head reads the draft's logits where they are: their address, kept alive in _draft_ref
+        self._draft_ptr = self.draft.data_ptr()
+        self._draft_ref = self.draft
+        self.draft_addr = torch.full((1,), self._draft_ptr, dtype=torch.int64, device=device)
         self.key = torch.zeros(1, dtype=torch.int64, device=device)
         self.offset = torch.zeros(1, dtype=torch.int64, device=device)
         self._key = None
         self._greedy_bs: int | None = None
         self.exchange = head.Exchange(group.cpu_group, self.rank, self.tp, device)
 
+    def on_shard(self, io) -> bool:
+        """Whether the target logits are this rank's vocab shard (else the full row)."""
+        cols = int(io.logits.shape[1])
+        if cols == self.vocab:
+            return False
+        assert cols == self.width, (cols, self.width, self.vocab)
+        return True
+
     def run(self, epi, io, verify_lens, gate, gated: bool):
         bs = io.candidates.shape[0]
         e = epi
+        col0 = 0 if self.on_shard(io) else self.start
         self.ops.verify_head(
-            io.logits, self.start, self.start, self.width, self.vocab, 0.0, self.draft,
-            io.candidates, self.temps, self.sim_temps, epi.simulated_correct_len,
+            io.logits, col0, self.start, self.width, self.vocab, 0.0, self.draft,
+            self.draft_addr, io.candidates, self.temps, self.sim_temps, epi.simulated_correct_len,
             epi.sim_seed_buf, self.key, self.offset, io.seq_lens, verify_lens, gate,
             self.part, e.correct_len_buf, e.bonus_buf, e.cap_trim_lens_buf,
             e.commit_lens_buf, e.new_seq_lens_buf, e.out_tokens_buf,
@@ -144,6 +165,7 @@ class _Head:
             or logits.shape[1] != self.slots - 1
             or logits.shape[2] != self.padded
             or logits.shape[0] > self.max_bs
+            or not logits.is_contiguous()
         ):
             return "draft logits not [bs, gamma, padded] f32"
         info = sampling_info
@@ -166,7 +188,11 @@ class _Head:
         self.temps[:bs].copy_(draft_block.temperatures.view(-1)[:bs])
         if sim_info is not None:
             self.sim_temps[:bs].copy_(sim_info.temperatures.view(-1)[:bs])
-        self.draft[:bs].copy_(draft_block.corrected_logits[:bs])
+        logits = draft_block.corrected_logits
+        if logits.data_ptr() != self._draft_ptr:
+            self._draft_ptr = logits.data_ptr()
+            self.draft_addr.fill_(self._draft_ptr)
+        self._draft_ref = logits
         key = int(draft_block.noise.key)
         if key != self._key:
             self.key.fill_(key)
@@ -200,8 +226,11 @@ def _accept_static_greedy(orig, self, io, *, verify_lens, gate, gated):
     h = _ensure(self, io)
     if h is None:
         return orig(self, io, verify_lens=verify_lens, gate=gate, gated=gated)
-    if not torch.cuda.is_current_stream_capturing() and not self.__dict__.get(
-        _KEY + "_checked"
+    # SGLang's tail reads full logits: the check waits for a full-logits call
+    if (
+        not torch.cuda.is_current_stream_capturing()
+        and not self.__dict__.get(_KEY + "_checked")
+        and not h.on_shard(io)
     ):
         self.__dict__[_KEY + "_checked"] = True
         bs = io.candidates.shape[0]
@@ -274,6 +303,27 @@ def _begin_fold(orig, self, bs, *, sampled, draft_block, simulate_bonus_sampling
     h = _head(self)
     if h is not None:
         h.stage(bs, sampled, draft_block, simulate_bonus_sampling_info)
+        if self.__dict__.get(_KEY + "_shards"):
+            k = "shards" if self.shard_step else "full"
+            _VARIANTS[k] += 1
+            total = _VARIANTS["shards"] + _VARIANTS["full"]
+            if h.rank == 0 and (_VARIANTS[k] == 1 or total % 1000 == 0):
+                _LOGGER.info(
+                    "DSpark verify head: verify logits variant shards %d / full %d folded steps",
+                    _VARIANTS["shards"], _VARIANTS["full"],
+                )  # fmt: skip
+
+
+_VARIANTS = {"shards": 0, "full": 0}
+
+
+def _wants_vocab_shards(orig, self) -> bool:
+    self.__dict__[_KEY + "_shards"] = True
+    return True
+
+
+def _serves_shards(orig, self) -> bool:
+    return _head(self) is not None and self.__dict__.get(_KEY + "_checked") is True
 
 
 _CHECK = {"left": 0, "steps": 0, "same": 0, "sampled": 0}
@@ -286,6 +336,8 @@ def _accept_and_finalize(orig, self, **kw):
     epi = self.verify_epilogue
     if not kw["folded_accept"] or _CHECK["left"] <= 0 or epi is None or _head(epi) is None:
         return got
+    if getattr(epi, "shard_step", False):
+        return got  # SGLang's eager accept reads full logits
     _CHECK["left"] -= 1
     want = orig(self, **{**kw, "folded_accept": False})
     names = ("correct_len", "bonus", "commit_lens", "new_seq_lens", "out_tokens")
@@ -319,6 +371,12 @@ def install() -> None:
     route(epi, "_accept_static_greedy", _accept_static_greedy)
     route(epi, "serves_sampled_fold", _serves_sampled_fold)
     route(epi, "begin_fold", _begin_fold)
+    if flag(SHARDS_ENV, "0"):
+        if hasattr(epi, "wants_vocab_shards"):
+            route(epi, "wants_vocab_shards", _wants_vocab_shards)
+            route(epi, "serves_shards", _serves_shards)
+        else:
+            _LOGGER.info("DSV4.1 glue verify_head: SGLang has no vocab-shard hooks")
     _CHECK["left"] = int(os.environ.get(ENV + "_CHECK", "0"))
     if _CHECK["left"] > 0:
         route(verify.TargetVerifyExecutor, "accept_and_finalize", _accept_and_finalize)
