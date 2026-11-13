@@ -52,7 +52,8 @@ struct Params {
     int            width; // this rank's ids
     int            vocab; // the simulated bonus's counter stride and "no index" (simulated_bonus.py's vocab)
     float          cap;   // > 0: the logits are softcapped here (cap * tanh(x / cap))
-    const float   *draft; // [bs, gamma, padded] the draft's corrected logits on this rank's shard
+    const float   *draft;      // [bs, gamma, padded] the draft's corrected logits on this rank's shard
+    const int64_t *draft_addr; // [1] or null: the address of the draft's logits, read at run time instead of draft
     int64_t        draft_padded;
     int            gamma;
     const int64_t *cand; // [bs, slots] the anchor and the drafts
@@ -251,6 +252,10 @@ __device__ inline int64_t slot_of(int round, int req, uint32_t call, int src, in
     return round * ROUND_PACKETS + ((int64_t(req) * 2 + call % 2) * MAX_TP + src) * PACKETS + packet;
 }
 
+__device__ inline const float *draft_of(const Params &p) {
+    return p.draft_addr != nullptr ? reinterpret_cast<const float *>(p.draft_addr[0]) : p.draft;
+}
+
 // a block a (row, vocab chunk): a thread's SPT contiguous columns in registers
 __global__ __launch_bounds__(SCAN_THREADS) void head_scan_kernel(const Params p) {
     __shared__ float sv[SCAN_THREADS];
@@ -267,7 +272,7 @@ __global__ __launch_bounds__(SCAN_THREADS) void head_scan_kernel(const Params p)
     const uint32_t   seed    = static_cast<uint32_t>(p.sim_seed[0]);
     const uint32_t   seed_hi = p.sim_seed[0] < 0 ? 0xFFFFFFFFu : 0u;
     const int        lo = c * CHUNK, hi = min(lo + CHUNK, p.width);
-    const float     *drow = p.draft + (static_cast<int64_t>(b) * p.gamma + i) * p.draft_padded;
+    const float     *drow = draft_of(p) + (static_cast<int64_t>(b) * p.gamma + i) * p.draft_padded;
     // column of x[k]: lo + (threadIdx.x + (k / 4) * SCAN_THREADS) * 4 + k % 4
     const auto col = [&](int k) { return lo + (threadIdx.x + (k / 4) * SCAN_THREADS) * 4 + k % 4; };
 
@@ -521,7 +526,7 @@ __global__ __launch_bounds__(SCAN_THREADS) void head_race_kernel(const Params p)
         const float    inv_t    = 1.0f / fmaxf(t_acc, 1e-5f);
         const int64_t  row      = static_cast<int64_t>(b) * S + accepted;
         const bool     residual = accepted < S - 1;
-        const float   *drow     = p.draft + (static_cast<int64_t>(b) * p.gamma + accepted) * p.draft_padded;
+        const float   *drow     = draft_of(p) + (static_cast<int64_t>(b) * p.gamma + accepted) * p.draft_padded;
         const uint32_t k0       = static_cast<uint32_t>(static_cast<uint64_t>(p.key[0]) & 0xFFFFFFFFull);
         const uint32_t k1       = static_cast<uint32_t>(static_cast<uint64_t>(p.key[0]) >> 32);
         const uint32_t c3       = static_cast<uint32_t>(p.offset[0] & 0xFFFFFFFF);
@@ -639,9 +644,12 @@ void check(const at::Tensor &t, const at::Tensor &ref, at::ScalarType dtype, con
 // target [rows, >= col0 + width] f32 / bf16, draft [bs, gamma, padded] f32, cand [bs, slots] int64, temps / sim_temps
 // [>= bs] f32, sim_len [1] int64 or none, sim_seed [1] int32, key / offset [1] int64, seq_lens [>= bs] int64 / int32,
 // verify_lens [>= bs] int64, gate [1] int32, part f32 scratch (head.py's part_words), the outputs [>= bs] (out_tokens
-// [>= bs, slots]), gated / block int32 or none, calls [64] int32, peers [tp] int64 on the host
+// [>= bs, slots]), gated / block int32 or none, calls [64] int32, peers [tp] int64 on the host. draft_addr [1] int64
+// or none: the address of a tensor shaped and laid out as draft, read by the launch instead of draft's (the caller
+// keeps that tensor alive)
 void verify_head(const at::Tensor &target, int64_t col0, int64_t start, int64_t width, int64_t vocab, double cap,
-                 const at::Tensor &draft, const at::Tensor &cand, const at::Tensor &temps, const at::Tensor &sim_temps,
+                 const at::Tensor &draft, const std::optional<at::Tensor> &draft_addr, const at::Tensor &cand,
+                 const at::Tensor &temps, const at::Tensor &sim_temps,
                  const std::optional<at::Tensor> &sim_len, const at::Tensor &sim_seed, const at::Tensor &key,
                  const at::Tensor &offset, const at::Tensor &seq_lens, const at::Tensor &verify_lens,
                  const at::Tensor &gate, at::Tensor &part, at::Tensor &correct_out, at::Tensor &bonus_out,
@@ -659,6 +667,9 @@ void verify_head(const at::Tensor &target, int64_t col0, int64_t start, int64_t 
                     draft.is_contiguous(),
                 "draft [bs, gamma, padded] contiguous");
     check(draft, target, at::kFloat, "draft");
+    if (draft_addr) {
+        check(*draft_addr, target, at::kLong, "draft_addr");
+    }
     check(cand, target, at::kLong, "cand");
     check(temps, target, at::kFloat, "temps");
     check(sim_temps, target, at::kFloat, "sim_temps");
@@ -690,6 +701,7 @@ void verify_head(const at::Tensor &target, int64_t col0, int64_t start, int64_t 
     p.vocab         = static_cast<int>(vocab);
     p.cap           = static_cast<float>(cap);
     p.draft         = draft.data_ptr<float>();
+    p.draft_addr    = draft_addr ? draft_addr->data_ptr<int64_t>() : nullptr;
     p.draft_padded  = draft.size(2);
     p.gamma         = static_cast<int>(draft.size(1));
     p.cand          = cand.data_ptr<int64_t>();
@@ -758,6 +770,7 @@ void verify_head(const at::Tensor &target, int64_t col0, int64_t start, int64_t 
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
     m.def("verify_head(Tensor target, int col0, int start, int width, int vocab, float cap, Tensor draft, "
+          "Tensor? draft_addr, "
           "Tensor cand, Tensor temps, Tensor sim_temps, Tensor? sim_len, Tensor sim_seed, Tensor key, Tensor offset, "
           "Tensor seq_lens, Tensor verify_lens, Tensor gate, Tensor(a!) part, Tensor(b!) correct_out, "
           "Tensor(c!) bonus_out, Tensor(d!) cap_trim_out, Tensor(e!) commit_out, Tensor(f!) new_seq_out, "
