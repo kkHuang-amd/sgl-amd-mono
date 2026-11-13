@@ -59,6 +59,23 @@ def build_layer(i, tp, rank, dev, cos_sin):
     return _Layer(i, k1, k2, ffn)
 
 
+def real_key_lists(M, n_req, swa_pages, comp_pages, g):
+    """Long-context key lists: every token a full window (contiguous slots in its request's
+    region) and a full top-k, shared by its request's rows, from a large pool."""
+    from sgl_amd_mono.deepseek_v41.gfx950.attention.plan import TOPK, WINDOW
+
+    lists = []
+    per_req = swa_pages * SWA_BLOCK // n_req
+    for r in range(n_req):
+        rows = range(r * M // n_req, (r + 1) * M // n_req)
+        comp = torch.randperm(comp_pages * COMP_BLOCK, generator=g)[:TOPK].tolist()
+        base = r * per_req + int(torch.randint(0, per_req - WINDOW - len(rows), (1,), generator=g))
+        for j, _ in enumerate(rows):
+            swa = list(range(base + j + WINDOW - 1, base + j - 1, -1))
+            lists.append((swa, comp))
+    return lists
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--widths", default="6,12")
@@ -69,6 +86,13 @@ def main():
     ap.add_argument(
         "--timeline", action="store_true", help="the last layer's stage marks"
     )
+    ap.add_argument(
+        "--tok-par", action="store_true", help="K1 / K2 token parallel where token_par"
+    )
+    ap.add_argument(
+        "--real-keys", type=int, default=0, metavar="REQS",
+        help="full window + top-k per token, REQS requests sharing top-k, per-layer keys, large caches",
+    )  # fmt: skip
     args = ap.parse_args()
     if args.timeline:  # the launches build with stage marks
         os.environ["SGLANG_AMD_MONO_TIMELINE"] = "1"
@@ -80,31 +104,42 @@ def main():
     cos_sin = rope_table(dev)
     layers = [build_layer(i, tp, rank, dev, cos_sin) for i in range(args.layers)]
     gc = torch.Generator(device=dev).manual_seed(5)
-    swa_raw, _ = make_cache(SWA_PAGES, SWA_BLOCK, gc, dev)
-    comp_raw, _ = make_cache(COMP_PAGES, COMP_BLOCK, gc, dev)
+    swa_pages, comp_pages = (512, 2048) if args.real_keys else (SWA_PAGES, COMP_PAGES)
+    swa_raw, _ = make_cache(swa_pages, SWA_BLOCK, gc, dev)
+    comp_raw, _ = make_cache(comp_pages, COMP_BLOCK, gc, dev)
+    torch.cuda.empty_cache()
     from sgl_amd_mono.deepseek_v41.gfx950.runner import DSV41MonoRunner
 
     runner = DSV41MonoRunner(tp, rank, cpu, dev)
     for M in (int(m) for m in args.widths.split(",")):
         gk = torch.Generator().manual_seed(1000 + M)
-        _, _, lists = key_lists(M, gk, dev)
-        slot, keys = source_keys(M, lists, dev)
-        slot = slot.clamp(min=0)
+        if args.real_keys:
+            for L in layers:
+                lists = real_key_lists(M, min(args.real_keys, M), swa_pages, comp_pages, gk)
+                L.slot, L.keys = source_keys(M, lists, dev)
+        else:
+            _, _, lists = key_lists(M, gk, dev)
+            slot, keys = source_keys(M, lists, dev)
+            for L in layers:
+                L.slot, L.keys = slot.clamp(min=0), keys
         pos = torch.randint(0, 4096, (M,), generator=gk).to(dev)
         x0 = (torch.randn(M, HIDDEN, device=dev) * 0.1).bfloat16()
         _, res0, post0, comb0, pre0 = seam_inputs(M, tp, rank, dev)
+        from sgl_amd_mono.deepseek_v41.gfx950.token_par import token_par
+
+        tpar = args.tok_par and token_par(M, tp)
 
         def chain():
             x, res, post, comb, pre = x0, res0, post0, comb0, pre0
             for _ in range(args.repeat):
                 for L in layers:
                     runner.k1(
-                        L.k1, x, res, post.view(M, HC), comb, pre, pos, slot,
-                        swa_raw, SWA_BLOCK, keys,
+                        L.k1, x, res, post.view(M, HC), comb, pre, pos, L.slot,
+                        swa_raw, SWA_BLOCK, L.keys, tok_par=tpar,
                     )  # fmt: skip
                     x, res, post, comb, pre = runner.k2(
                         L.k2, L.ffn, M, pos, swa_raw, SWA_BLOCK, comp_raw,
-                        COMP_BLOCK, slot=slot, keys=keys,
+                        COMP_BLOCK, slot=L.slot, keys=L.keys, tok_par=tpar,
                     )  # fmt: skip
             return x
 
@@ -139,6 +174,12 @@ def main():
                 f"{out.float().abs().mean().item():.4g}, graph "
                 f"{gout.float().abs().mean().item():.4g})",
                 flush=True,
+            )
+        if args.timeline and os.environ.get("TL_SAVE_DIR"):
+            # every rank's raw marks (clock ticks, [CTA, point]) for cross-rank analysis
+            torch.save(
+                runner.timeline(M).cpu(),
+                os.path.join(os.environ["TL_SAVE_DIR"], f"rank{rank}_M{M}.pt"),
             )
         if args.timeline and rank == 0:
             tl = runner.timeline(M).cpu()

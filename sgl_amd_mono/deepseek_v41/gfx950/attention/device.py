@@ -102,8 +102,9 @@ def mfma_scaled(a, b, c, sa, sb, a_fmt=FP8, b_fmt=FP8):
 class Mailbox:
     """Poll tagged CTA hand-offs; the caller supplies the launch tag."""
 
-    def __init__(self, tag):
+    def __init__(self, tag, nowait=False):
         self.tag = tag
+        self.nowait = nowait  # ABLATION ONLY: one load, tags ignored
 
     def put(self, base, i, v):
         bits = v.bitcast(fx.Int32) if isinstance(v, fx.Float32) else fx.Int32(v)
@@ -169,7 +170,7 @@ class Mailbox:
                 bad = bad | (v[e] != tag)
             return bad
 
-        v = _spin(load_all, pending)
+        v = load_all() if const_expr(self.nowait) else _spin(load_all, pending)
         outs, e = [], 0
         for _, _, n in specs:
             outs.append([v[e + 2 * q] for q in range(n)])

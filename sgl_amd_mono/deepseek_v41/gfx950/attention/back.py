@@ -45,6 +45,8 @@ from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
     lds_row,
 )
 
+from sgl_amd_mono.common.sync import abl_keys
+
 from .device import Mailbox, fp8x8_bf16, ld_i32, mx_code, mx_mul, pow2
 from .gemv import (
     RED,
@@ -90,6 +92,7 @@ class BackBuild(msgspec.Struct, frozen=True):
     ratio: int  # 0: window only; 1 / 2: top-k over a compressed cache
     timeline: bool = False
     shuffled: bool = False  # wo_b in aiter's (16, 16) preshuffle (wo_a stays row-major)
+    woa_spread2: bool = False  # ``woa_spread2``: up to two wo_a tiles of one task a CTA
 
 
 def plus(t0, v):
@@ -141,7 +144,15 @@ def key_rec(c, t, k):
     a, ratio = c["args"], c["ratio"]
     # a table this launch wrote (``krdy``: an index source's) is read past the CU's cache
     cm = CM_DEV if const_expr("krdy" in c) else 0
-    val = ld_i32(a["kt"], t * KEYS + fx.min(fx.max(k, 0), KEYS - 1), cm)
+    if const_expr("ktfree" in abl_keys()):
+        # ABLATION ONLY: a hashed slot inside time_layer --real-keys pools, no table load
+        h = (fx.Int32(t) * KEYS + k) * fx.Int32(-1640531535)
+        if const_expr(ratio > 0):
+            val = ((h >> 8) & 0x3FFFF) | fx.Int32(-(2**31))
+        else:
+            val = (h >> 8) & 0x7FFF
+    else:
+        val = ld_i32(a["kt"], t * KEYS + fx.min(fx.max(k, 0), KEYS - 1), cm)
     ok = val != fx.Int32(-1)
     slot = ok.select(val & fx.Int32(0x7FFFFFFF), fx.Int32(0))
     if const_expr(ratio > 0):
@@ -189,6 +200,7 @@ def stage_split(c, unit):
     tid, lane, wave, d, s = c["tid"], c["lane"], c["wave"], c["d"], c["S"]
     a, sl = c["args"], c["sl"]
     nchunk = c["nchunk"]
+    abl = abl_keys()
     t = unit // nchunk
     ch = unit % nchunk
     ck = chunk_keys(d, s)
@@ -224,15 +236,21 @@ def stage_split(c, unit):
     data, sc, okv = key_rec(c, t, key)
     if k0 < kv_len:
         # lane g's 16 B slices: e4m3 dims 64 c + 16 g .., bf16 rope dims 32 c + 8 g ..
-        scw = global_load(sc, words=2)
-        nope = [
-            global_load(data + fx.Int64(64 * c4 + 16 * g), words=4)
-            for c4 in range(NOPE // 64)
-        ]
-        rope = [
-            global_load(data + fx.Int64(NOPE + (cc * 32 + 8 * g) * 2), words=4)
-            for cc in range(ROPE // 32)
-        ]
+        if const_expr("keyfree" in abl):
+            # ABLATION ONLY: no record loads
+            scw = fx.Vector.filled(2, 0, fx.Int32)
+            nope = [fx.Vector.filled(4, 0, fx.Int32) for _ in range(NOPE // 64)]
+            rope = [fx.Vector.filled(4, 0, fx.Int32) for _ in range(ROPE // 32)]
+        else:
+            scw = global_load(sc, words=2)
+            nope = [
+                global_load(data + fx.Int64(64 * c4 + 16 * g), words=4)
+                for c4 in range(NOPE // 64)
+            ]
+            rope = [
+                global_load(data + fx.Int64(NOPE + (cc * 32 + 8 * g) * 2), words=4)
+                for cc in range(ROPE // 32)
+            ]
         for i in range_constexpr(cdiv(qrow, THREADS)):
             u = fresh(tid) + THREADS * i
             if u < qrow:
@@ -257,7 +275,7 @@ def stage_split(c, unit):
         scale = a["qk_scale"].bitcast(fx.Float32)
         st = sl["st"]
         accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(nht)]
-        for c4 in range_constexpr(NOPE // 64):
+        for c4 in range_constexpr(0 if const_expr("nomath" in abl) else NOPE // 64):
             ksc = pow2(_scale_byte(scw, c4))
             for h2 in range_constexpr(2):
                 kw = fp8x8_bf16(nope[c4][2 * h2], nope[c4][2 * h2 + 1], ksc).bitcast(
@@ -270,7 +288,7 @@ def stage_split(c, unit):
                         result_type=fx.Vector.make_type(4, fx.Int32),
                     )
                     accs[ht] = mfma_bf16(kw, qw.bitcast(fx.BFloat16), accs[ht])
-        for cc in range_constexpr(ROPE // 32):
+        for cc in range_constexpr(0 if const_expr("nomath" in abl) else ROPE // 32):
             kw = rope[cc].bitcast(fx.BFloat16)
             for ht in range_constexpr(nht):
                 qb = sl["q"] + ((hgi * nht + ht) * HEAD_TILE + r16) * Q_ROW
@@ -338,7 +356,7 @@ def stage_split(c, unit):
             [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(4)]
             for _ in range(d.head_tiles)
         ]
-        for kt2 in range_constexpr(nkt):
+        for kt2 in range_constexpr(0 if const_expr("nomath" in abl) else nkt):
             rb0 = sl["raw"] + (kt2 * 16 + 4 * g) * (REC // 4)
             vv = fx.Vector.filled(16, 0.0, fx.Float32)  # [dt][j]
             if is_rope:
@@ -397,7 +415,7 @@ def stage_split(c, unit):
                 w2 = v4.to(fx.BFloat16).bitcast(fx.Int32)
                 words += [w2[0], w2[1]]
             off = (((t * nchunk + ch) * d.heads + hh) * HEAD_DIM + dbase + 16 * g) // 2
-            for hlf in range_constexpr(2):
+            for hlf in range_constexpr(0 if const_expr("storefree" in abl) else 2):
                 bo.buffer_store(
                     fx.Vector.from_elements(words[4 * hlf : 4 * hlf + 4], fx.Int32),
                     rsrc(c["part"]),
@@ -577,8 +595,9 @@ def stage_wob(c, task, ops, task2, ops2, has2, t0, n, mark=False):
     tid, red = c["tid"], c["red"]
     o_rows = c["d"].o_rows
     a = c["args"]
-    gemv_mfmas(c, o_rows, c["xl"], c["xsl"], red, ops, rows=n)
-    gemv_mfmas(c, o_rows, c["xl"], c["xsl"], red + RED, ops2, rows=n)
+    if const_expr("nowob" not in abl_keys()):
+        gemv_mfmas(c, o_rows, c["xl"], c["xsl"], red, ops, rows=n)
+        gemv_mfmas(c, o_rows, c["xl"], c["xsl"], red + RED, ops2, rows=n)
     gpu.barrier()
     if const_expr(mark):
         stamp(c, 15)
@@ -601,14 +620,24 @@ def stage_wob(c, task, ops, task2, ops2, has2, t0, n, mark=False):
 # ---------------------------------------------------------------- kernel
 
 
-def woa_units(s: int, d: Dims) -> int:
+def woa_spread2(s: int, d: Dims) -> bool:
+    """Whether wo_a's (task, tile) units overflow the CTAs at most twice over with
+    unit u and u + BLOCKS of one task, so a CTA runs a second tile on the weights
+    it holds (``MonoBuild.woa_spread2``)."""
+    units = d.woa_tasks * len(token_tiles(s))
+    return BLOCKS < units <= 2 * BLOCKS and BLOCKS % d.woa_tasks == 0
+
+
+def woa_units(s: int, d: Dims, spread2: bool = False) -> int:
     """wo_a's units: past one token tile, a (task, tile) each where they fit the
-    CTAs, else a task each.
+    CTAs (or, ``spread2``, fit twice), else a task each.
 
     ROCm/ATOM's tile tasks: a task's tiles in series on one CTA would leave most
     CTAs idle through wo_a, and a tile's reread of its task's weights hits L2."""
     nt = len(token_tiles(s))
-    return d.woa_tasks * nt if nt > 1 and d.woa_tasks * nt <= BLOCKS else d.woa_tasks
+    if nt > 1 and (d.woa_tasks * nt <= BLOCKS or (spread2 and woa_spread2(s, d))):
+        return d.woa_tasks * nt
+    return d.woa_tasks
 
 
 def back_plan(key):
@@ -623,9 +652,10 @@ def back_plan(key):
     assert BLOCKS < d.wob_tasks <= 2 * BLOCKS
     # GEMV units past the attention units, so CTAs without attention load weights first
     WOA0 = (n_split + n_comb) % BLOCKS
-    WOB0 = (WOA0 + woa_units(s, d)) % BLOCKS
+    units = woa_units(s, d, key.woa_spread2)
+    WOB0 = (WOA0 + units) % BLOCKS
     # loads complete in issue order, so wo_b's weights go early only if wo_a CTAs do no attention
-    early_wob = n_split + n_comb + woa_units(s, d) <= BLOCKS
+    early_wob = n_split + n_comb + units <= BLOCKS
     return nchunk, n_split, n_comb, COMB0, WOA0, WOB0, early_wob
 
 
@@ -707,24 +737,25 @@ def run_back(c, key, bid):
     a = c["args"]
     tiles = token_tiles(s)
     _, n_split, n_comb, COMB0, WOA0, WOB0, early_wob = back_plan(key)
-    stamp(c, 0)
-    for unit in range(first_task(bid, 0), n_split, BLOCKS):
-        stage_split(c, unit)
-    stamp(c, 1)
-    for unit in range(first_task(bid, COMB0), n_comb, BLOCKS):
-        stage_combine(c, unit)
-    gpu.barrier()
-    stamp(c, 2)
+    # ABLATION ONLY: nosplit = no split units (combine reads once); nowoa = no wo_a tiles
+    # (nor their crdy wait); nowob = no wo_b MFMAs (partials still pushed)
+    abl = abl_keys()
     # the GEMV weights right after the attention work: the wo_a unit's (if any), then wo_b's
     nt = len(tiles)
-    units = woa_units(s, dd)
+    units = woa_units(s, dd, key.woa_spread2)
     woa_spread = units > woa_tasks
     woa_unit = first_task(bid, WOA0)
     has_woa = woa_unit < units
     woa_t = fx.min(woa_unit % woa_tasks, woa_tasks - 1)
-    ops = bf16_gemv_loads(
-        c, a["woa"], a["woa_s"], group_k, woa_t * WOA_ROWS, WOA_SPLIT_K, pred=has_woa
-    )
+    # ABLATION ONLY: woafree / wobfree = weight loads masked (zeros, no traffic);
+    # woaearly / wobearly = weight loads issued before the split units
+    w_off = fx.Int32(bid) < 0  # a false only the hardware knows
+
+    def woa_loads():
+        pw = (has_woa & w_off) if "woafree" in abl else has_woa
+        return bf16_gemv_loads(
+            c, a["woa"], a["woa_s"], group_k, woa_t * WOA_ROWS, WOA_SPLIT_K, pred=pw
+        )
     wob_unit = first_task(bid, WOB0)
     if const_expr(nt == 1):
         # one or two wo_b tasks a CTA, every one on the step's rows
@@ -737,8 +768,20 @@ def run_back(c, key, bid):
         most = -(-wob_tasks // (BLOCKS // nt))
         wob_ts = [wob_unit // nt + k * per_tile for k in range(most)]
 
+    # ABLATION ONLY (spread2): wobfree2t / wobfree1t = wo_b weight loads masked on the CTAs
+    # running two wo_a tiles / one; wobmid = wo_b weights issued between a CTA's two tiles
+    two_tiles = woa_unit < units - BLOCKS
+
     def wob_weights():
         # one tile: the first task is every CTA's (BLOCKS < wob_tasks), unmasked
+        if const_expr("wobfree" in abl):
+            return [wob_loads(c, fx.min(t, wob_tasks - 1), pred=w_off) for t in wob_ts]
+        if const_expr("wobfree2t" in abl or "wobfree1t" in abl):
+            keep = (woa_unit >= units - BLOCKS) if "wobfree2t" in abl else two_tiles
+            return [
+                wob_loads(c, fx.min(t, wob_tasks - 1), pred=(t < wob_tasks) & keep)
+                for t in wob_ts
+            ]
         return [
             wob_loads(c, t)
             if nt == 1 and k == 0
@@ -746,7 +789,24 @@ def run_back(c, key, bid):
             for k, t in enumerate(wob_ts)
         ]
 
-    if const_expr(early_wob):
+
+    if const_expr("woaearly" in abl):
+        ops = woa_loads()
+    if const_expr("wobearly" in abl):
+        wops = wob_weights()
+    stamp(c, 0)
+    if const_expr("nosplit" not in abl):
+        for unit in range(first_task(bid, 0), n_split, BLOCKS):
+            stage_split(c, unit)
+    stamp(c, 1)
+    cc = {**c, "mb": Mailbox(c["mb"].tag, nowait=True)} if "nosplit" in abl else c
+    for unit in range(first_task(bid, COMB0), n_comb, BLOCKS):
+        stage_combine(cc, unit)
+    gpu.barrier()
+    stamp(c, 2)
+    if const_expr("woaearly" not in abl):
+        ops = woa_loads()
+    if const_expr(early_wob and "wobearly" not in abl):
         wops = wob_weights()
     if const_expr(c.get("tl") is not None):
         rocdl.s_waitcnt(vmcnt=0)
@@ -754,8 +814,10 @@ def run_back(c, key, bid):
     stamp(c, 8)
     half_w = group_k // 4
 
-    def woa_tile(ti, n_tokens):
+    def woa_tile(ti, n_tokens, mark=False):
         # wo_a on token tile ``ti`` (its first ``n_tokens`` rows' flags awaited)
+        if const_expr("nowoa" in abl):
+            return
         t0, n = tiles[ti]
         grp = woa_t // (woa_tasks // groups)
         await_flags(
@@ -764,7 +826,8 @@ def run_back(c, key, bid):
             n_tokens,
             lambda u: (t0 + u) * (heads // COMB_HEADS) + grp,
         )
-        stamp(c, 9)
+        if const_expr(mark):
+            stamp(c, 9)
         # the group's XO rows a K half at a time, the next half's loads in flight
         off = [(grp * group_k + h * group_k // 2) // 2 for h in range(2)]
         regs = words_loads(c, c["xo"], q_rows // 2, off[0], half_w, t0, n)
@@ -777,22 +840,51 @@ def run_back(c, key, bid):
             gpu.barrier()  # the next half's rows overwrite the LDS
         stage_woa(c, woa_t, acc, t0, n)
 
-    if has_woa:
+    wob_mid = "wobmid" in abl and woa_spread and units > BLOCKS
+    if const_expr(wob_mid):
+        # every CTA has a first unit (units > BLOCKS)
+        for ti in range_constexpr(nt):
+            if woa_unit // woa_tasks == ti:
+                woa_tile(ti, tiles[ti][1], mark=True)
+        publish(c, c["ardy"], woa_unit)
+        wops = wob_weights()
+        woa_u2 = woa_unit + BLOCKS
+        if woa_u2 < units:
+            for ti in range_constexpr(nt):
+                if woa_u2 // woa_tasks == ti:
+                    woa_tile(ti, tiles[ti][1])
+            publish(c, c["ardy"], woa_u2)
+        stamp(c, 10)
+    # wob_mid ran its units above: its copy of this branch never runs
+    woa_gate = (woa_unit < 0) if wob_mid else has_woa
+    if woa_gate:
         if const_expr(woa_spread):
             # this unit's tile of its task
             for ti in range_constexpr(nt):
                 if woa_unit // woa_tasks == ti:
-                    woa_tile(ti, tiles[ti][1])
-            stamp(c, 10)
-            publish(c, c["ardy"], woa_unit)
+                    woa_tile(ti, tiles[ti][1], mark=True)
+            if const_expr(units > BLOCKS):
+                # spread2: unit + BLOCKS (where there is one) is the same task's, its
+                # weights in registers already
+                publish(c, c["ardy"], woa_unit)
+                woa_unit2 = woa_unit + BLOCKS
+                if woa_unit2 < units:
+                    for ti in range_constexpr(nt):
+                        if woa_unit2 // woa_tasks == ti:
+                            woa_tile(ti, tiles[ti][1])
+                    publish(c, c["ardy"], woa_unit2)
+                stamp(c, 10)
+            else:
+                stamp(c, 10)
+                publish(c, c["ardy"], woa_unit)
         else:
             # every token tile in turn, the first waiting on every row's flags
             for ti in range_constexpr(nt):
-                woa_tile(ti, s if ti == 0 else 0)
+                woa_tile(ti, s if ti == 0 else 0, mark=ti == 0)
             stamp(c, 10)
             publish(c, c["ardy"], woa_t)
     stamp(c, 3)
-    if const_expr(not early_wob):
+    if const_expr(not early_wob and "wobearly" not in abl and not wob_mid):
         wops = wob_weights()
     stamp(c, 11)
     if const_expr(woa_spread):

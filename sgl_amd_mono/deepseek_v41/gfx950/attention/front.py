@@ -23,7 +23,7 @@ from sgl_amd_mono.common.ops import (
 )
 from sgl_amd_mono.common.plan import first_task
 from sgl_amd_mono.common.stamps import stamp
-from sgl_amd_mono.common.sync import preg
+from sgl_amd_mono.common.sync import abl_keys, preg
 from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
     ld_f32,
     lds_row,
@@ -577,6 +577,9 @@ def run_front(
         kt_step = BLOCKS - kt_from
 
     def wqb_weights(pred=None):
+        if const_expr("wqbfree" in abl_keys()):
+            # ABLATION ONLY (wqbfree): the wq_b weight loads masked (zeros, no traffic)
+            pred = fx.Int32(bid) < 0
         return [
             gemv_loads(
                 c,
@@ -707,12 +710,15 @@ def run_front(
             )
             publish(c, c["iqrdy"], ti * index_query.IQ_TASKS + bid)
 
+    # ABLATION ONLY: qwait = the q latents read once; nowqb = no wq_b GEMV
+    abl = abl_keys()
+    qc = {**c, "poll": Mailbox(c["mb"].tag, nowait=True).poll} if "qwait" in abl else c
     if const_expr(c.get("tok_par", False)):
         # every row's q latent from QG / QGS, where its owner's qkv put it
         for ti in range_constexpr(len(tiles)):
             t0, n = tiles[ti]
             poll_copy(
-                c,
+                qc,
                 c["tid"],
                 THREADS,
                 [
@@ -735,7 +741,8 @@ def run_front(
             gpu.barrier()
             if const_expr(ti == 0):
                 stamp(c, 38)
-            stage_wqb(c, wqb_task, bops, t0, n, ropes[ti])
+            if const_expr("nowqb" not in abl):
+                stage_wqb(c, wqb_task, bops, t0, n, ropes[ti])
             index_tile(ti, t0, n)
     else:
         await_flags(c, c["qrdy"], s, lambda u: u)
@@ -747,7 +754,8 @@ def run_front(
             rows_store(c, regs, QX_WORDS, Q_RANK // 32, c["qxl"], c["qxsl"], n)
             if const_expr(ti + 1 < len(tiles)):
                 regs = rows_loads(c, *qx, *tiles[ti + 1])
-            stage_wqb(c, wqb_task, bops, t0, n, ropes[ti])
+            if const_expr("nowqb" not in abl):
+                stage_wqb(c, wqb_task, bops, t0, n, ropes[ti])
             index_tile(ti, t0, n)
     if const_expr(chains is not None):
         index_query.run_iquant(c, a, s)

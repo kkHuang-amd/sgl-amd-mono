@@ -5,6 +5,7 @@
 # atom/mono/device/sync.py
 """The tagged mailbox between CTAs (device scope) and GPUs (system scope)."""
 
+import os
 from enum import Enum
 
 import flydsl.compiler as flyc
@@ -23,6 +24,11 @@ from sgl_amd_mono.common.ops import (
     rsrc,
     uniform,
 )
+
+def abl_keys() -> frozenset:
+    """ABLATION ONLY: the SGLANG_AMD_MONO_ABL keys (read at build time)."""
+    return frozenset(os.environ.get("SGLANG_AMD_MONO_ABL", "").split(","))
+
 
 POLL_MAX = 12  # mailbox specs polled per batch (bounds live registers)
 MASK_OOB = 0x7FFFFFF0  # a masked poll's buffer size (bytes): its skipped loads' offset
@@ -269,6 +275,15 @@ class Mailbox:
             return fx.Vector.from_elements(words, fx.Int32)
 
         return unpack(_spin_masked(load, pending, gap))
+
+    def peek(self, specs, batch=POLL_MAX):
+        """ABLATION ONLY (SGLANG_AMD_MONO_ABL): ``poll`` with one load and the tags ignored."""
+        if const_expr(len(specs) == 0):
+            return []
+        if const_expr(len(specs) > batch):
+            return self.peek(specs[:batch], batch) + self.peek(specs[batch:], batch)
+        load_all, _, unpack = self._batch(specs)
+        return unpack(load_all())
 
     def poll_issue(self, specs):
         """Issue the first loads of ``poll(specs)`` (at most ``POLL_MAX``) now, ahead of
