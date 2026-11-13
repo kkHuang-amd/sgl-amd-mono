@@ -252,6 +252,20 @@ def put_mxfp8_group_vllm(c, words_mb, codes_mb, t, g, v, amax):
 
 
 # ---------------------------------------------------------------- router
+# ABLATION ONLY (SGLANG_AMD_MONO_ABL=wcm0): expert scale loads with the default cache policy
+W_CM = 0 if "wcm0" in __import__("os").environ.get("SGLANG_AMD_MONO_ABL", "").split(",") else CM_NT
+
+
+def _abl_pool(prefix):
+    """ABLATION ONLY: SGLANG_AMD_MONO_ABL=<prefix>N -> N, else BLOCKS."""
+    for k in __import__("os").environ.get("SGLANG_AMD_MONO_ABL", "").split(","):
+        if k.startswith(prefix) and k[len(prefix):].isdigit():
+            return int(k[len(prefix):])
+    return BLOCKS
+
+
+# ABLATION ONLY (moepoolN): ug / down / reduce run on the first N CTAs of each stage's placement
+MOE_POOL = _abl_pool("moepool")
 ROUTER_EARLY_FROM = 12  # rows from which the router loads its gate rows early
 
 
@@ -323,6 +337,7 @@ def stage_route(c, t):
     lane, wave = c["lane"], c["wave"]
     experts, topk = c["rs"].experts, c["rs"].topk
     a = c["args"]
+    pool = int(c.get("abl_fixroute", 0))  # ABLATION ONLY: fixroute expert pool, 0 = off
     if wave == 0:
         ept = experts // 64
         # the bias in flight before the logits' wait
@@ -382,6 +397,8 @@ def stage_route(c, t):
             my_w = (lane == k).select(w, my_w)
             my_id = (lane == k).select(win_id, my_id)
         scale = fx.Float32(SCALE) / fx.max(total, fx.Float32(1e-20))
+        # ABLATION ONLY: x-independent picks from ``pool`` experts (distinct within a token)
+        my_id = (t * 5 + lane * (pool // 6)) % pool if pool else my_id
         if lane < topk:
             for r in range_constexpr(ROUTE_COPIES):
                 at = (r * c["S"] + t) * 2 * topk + lane
@@ -637,7 +654,7 @@ def fp4_pair_loads(c, w, ws, e, n_rows, k, rg0, scale_cols, sc0, st0, n, sc_step
         block + 32 * sc0 + lane * words,
         vec_width=words,
         dtype=T.i32,
-        cache_modifier=CM_NT,
+        cache_modifier=W_CM,
     )
     sv = fx.Vector(sv) if words > 1 else fx.Int32(sv)
     return sv, [fp4_tile_weights(c, w, e, n_rows, k, rg0 + t, st0, n) for t in range(2)]
@@ -655,7 +672,7 @@ def scale_block_loads(c, ws, first_row, scale_cols):
                 block + fx.min(256 * i + lane * 4, words - 4),
                 vec_width=4,
                 dtype=T.i32,
-                cache_modifier=CM_NT,
+                cache_modifier=W_CM,
             )
         )
         for i in range((words + 255) // 256)
@@ -822,7 +839,7 @@ def stage_ug_tile(c, task, total):
     e, part0, first, count = ug_tile_task(c, task)
     gather_x8r(c, first, count)
     ug_pass(c, e, part0, first, count, fx.min(lane % 16, count - 1))
-    nxt = (total > BLOCKS).select(take_ug_task(c) + BLOCKS, total)
+    nxt = (total > MOE_POOL).select(take_ug_task(c) + MOE_POOL, total)
     # the epilogue's MID stores done before the flag
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
@@ -837,6 +854,10 @@ def ug_pass(c, e, part0, first, count, col):
     tid, lane, wave, red = c["tid"], c["lane"], c["wave"], c["red"]
     a, d, rs = c["args"], c["d"], c["rs"]
     p, rg0, ks, real = ug_wave_pair(c, part0)
+    # ABLATION ONLY (augN): experts 96 - N .. 95 read experts 0 .. N - 1's weights (cache hits)
+    aug = int(c.get("abl_aug", 0))
+    # aug -1 (augodd): an odd expert reads the even one before it
+    ew = e - (e & 1) if aug == -1 else ((e >= 96 - aug).select(e - (96 - aug), e) if aug else e)
     # a group in the padding has zero weights: skip its GEMV, still write its zero MID
     acc = fx.Vector.filled(8, 0.0, fx.Float32)
     if real:
@@ -844,7 +865,7 @@ def ug_pass(c, e, part0, first, count, col):
             c,
             a["w13"],
             a["w13_s"],
-            e,
+            ew,
             2 * d.inter,
             HIDDEN,
             rg0,
@@ -1029,6 +1050,12 @@ def down_weights(c, tasks, rnd, slots, nu):
     s, wave, tab, a, d = c["S"], c["wave"], c["tab"], c["args"], c["d"]
     us = [wave + WAVES * (slots * rnd + i) for i in range(slots)]
     es = [c["rs"].union_expert(tab, s, fx.min(u, nu - 1)) for u in us]
+    # ABLATION ONLY (adnN): as augN for the down weights
+    adn = int(c.get("abl_adn", 0))
+    if adn == -1:
+        es = [e - (e & 1) for e in es]
+    elif adn:
+        es = [(e >= 96 - adn).select(e - (96 - adn), e) for e in es]
     svs = [
         scale_block_loads(c, a["w2_s"], e * HIDDEN + task * 16, d.down_scale_cols)
         for task in tasks
@@ -1050,15 +1077,27 @@ def mid_operands(c, first, count):
     j = lane // 16
     row = first + fx.min(lane % 16, count - 1)
     steps = d.inter // 128
+    if const_expr(c.get("abl_nomid", False)):
+        # ABLATION ONLY (nomid): no MID / MIDS loads, zero operands and unit scales
+        zero = fx.Vector.filled(4, 0, fx.Int32)
+        return [fp8_operand([zero, zero]) for _ in range(steps)], [
+            fx.Int32(UNIT_SCALE) for _ in range(steps)
+        ]
     # a constant offset after an opaque lane word folds into the immediate (no extra VGPR)
     lane_word = fresh(row * d.mid_words + j * 4)
+    mid_r = rsrc(c["mid"].value)
+    if const_expr(c.get("abl_midmask", False)):
+        # ABLATION (midmask): a lane past the slot's picks loads past MID's end (zeros, no traffic)
+        mid_end = c["rs"].picks * d.mid_words
+        lane_word = fresh((lane % 16 < count).select(row * d.mid_words + j * 4, mid_end))
+        mid_r = rsrc(c["mid"].value, mid_end * 4)
     bvs = []
     for st in range_constexpr(steps):
         halves = []
         for h in range_constexpr(2):
             v = fx.Vector(
                 bo.buffer_load(
-                    rsrc(c["mid"].value),
+                    mid_r,
                     lane_word + (st * 32 + 16 * h),
                     vec_width=4,
                     dtype=T.i32,
@@ -1233,8 +1272,10 @@ def contrib_load(c, j, i):
 def load_smid_tile(c, t0, n, groups):
     """Load the shared expert's MXFP8 intermediate of tokens t0 .. t0 + n into LDS."""
     tid, words = c["tid"], c["d"].sh_inter // 4
+    # ABLATION ONLY (noshared): the shared intermediate read once, tags ignored
+    pc = {**c, "poll": c["peek"]} if c.get("abl_noshared", False) else c
     poll_copy(
-        c,
+        pc,
         tid,
         THREADS,
         [
@@ -1366,25 +1407,38 @@ def run_moe(c, key, bid, before_ug=None):
     route0, shared0 = c["rs"].route0, c["rs"].shared0
     shared_tasks = c["d"].shared_tasks
     ug_tasks = c["rs"].max_u * c["rs"].ug_parts
+    # ABLATION ONLY (noxq): no x quantize, X8RDY still published
+    no_xq = c.get("abl_noxq", False)
     for t in range(first_task(bid, XQ0), s, BLOCKS):
-        await_x(c, [t])
-        stage_xq(c, t)
+        if const_expr(not no_xq):
+            await_x(c, [t])
+            stage_xq(c, t)
         publish(c["put"], c["x8rdy"], t, 1, tid == 0)
     stamp(c, 19)
     multi = len(token_tiles(s)) > 1
-    for task in range(first_task(bid, c["rs"].router0), router_tasks, BLOCKS):
+    abl_chain = c.get("abl_chain", False)  # ABLATION ONLY: the router does not wait on x
+    # ABLATION ONLY (norouter): no router tasks, route reads the logits once
+    no_router = c.get("abl_norouter", False)
+    r_end = 0 if const_expr(no_router) else router_tasks
+    for task in range(first_task(bid, c["rs"].router0), r_end, BLOCKS):
         # wide, the gate rows go out before x's wait (narrower it is slower: ROCm/ATOM)
         wvs = router_weights(c, task) if const_expr(s >= ROUTER_EARLY_FROM) else None
-        await_x(c, list(range(s)))
+        if const_expr(not abl_chain):
+            await_x(c, list(range(s)))
         stage_router(c, task, wvs)
     stamp(c, 20)
+    rc = {**c, "poll": c["peek"]} if const_expr(no_router) else c
     for t in range(first_task(bid, route0), s, BLOCKS):
-        stage_route(c, t)
+        stage_route(rc, t)
     stamp(c, 21)
     c["xl"], c["xsl"] = c["x8l"], c["x8sl"]
     # one shared unit a CTA at most: straight-line code, so LLVM does not hoist its loads
     assert c["rs"].shared_units <= BLOCKS
     unit = first_task(bid, shared0)
+    # ABLATION ONLY (noshared): no shared gate / up
+    no_shared = c.get("abl_noshared", False)
+    if const_expr(no_shared):
+        unit = c["rs"].shared_units
     if unit < c["rs"].shared_units:
         # the gate weights in flight before x's wait
         a = c["args"]
@@ -1409,6 +1463,8 @@ def run_moe(c, key, bid, before_ug=None):
         n_tiles = c["rs"].tile_first(c["tab"], c["rs"].n_union(c["tab"], s))
         ug_total = mplan.ug_tasks(n_tiles, c["rs"].ug_parts)
         task = first_task(bid, c["rs"].ug0)
+        if const_expr(MOE_POOL < BLOCKS):
+            task = (task < MOE_POOL).select(task, ug_total)
         while task < ug_total:
             task = stage_ug_tile(c, task, ug_total)
     else:
@@ -1430,15 +1486,28 @@ def run_moe(c, key, bid, before_ug=None):
     assert BLOCKS < DOWN_TASKS <= 2 * BLOCKS
     # every CTA its tile; the first DOWN_TASKS - BLOCKS CTAs to arrive take the extra tiles
     down_task = first_task(bid, DOWN0)
-    rank = take_down_rank(c)
-    if rank < DOWN_TASKS - BLOCKS:
-        stage_down(c, [down_task, BLOCKS + rank])
+    if const_expr(MOE_POOL < BLOCKS):
+        assert multi, "moepool: multi-tile widths only"
+        k_max = (DOWN_TASKS + MOE_POOL - 1) // MOE_POOL
+        full = DOWN_TASKS - (k_max - 1) * MOE_POOL
+        for k_n, cond in ((k_max, down_task < full), (k_max - 1, (down_task >= full) & (down_task < MOE_POOL))):
+            if cond:
+                ts = [down_task + k * MOE_POOL for k in range(k_n)]
+                for i in range_constexpr(0, k_n, 2):
+                    stage_down(c, ts[i : i + 2])
     else:
-        stage_down(c, [down_task])
+        rank = take_down_rank(c)
+        if rank < DOWN_TASKS - BLOCKS:
+            stage_down(c, [down_task, BLOCKS + rank])
+        else:
+            stage_down(c, [down_task])
     stamp(c, 25)
     # token parallel: this rank's rows' sums alone, ``out`` from its first row
     cr = c if const_expr(c["own"] is None) else c["own_view"]
-    for task in range(first_task(bid, RED0), RED_TASKS, BLOCKS):
+    red0 = first_task(bid, RED0)
+    if const_expr(MOE_POOL < BLOCKS):
+        red0 = (red0 < MOE_POOL).select(red0, RED_TASKS)
+    for task in range(red0, RED_TASKS, MOE_POOL):
         stage_reduce(cr, task)
     stamp(c, 26)
 

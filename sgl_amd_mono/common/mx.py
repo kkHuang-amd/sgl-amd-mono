@@ -5,6 +5,8 @@
 # atom/mono/device/mx.py
 """FP8 / MX arithmetic shared by the mono kernels."""
 
+import os
+
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import rocdl
@@ -44,6 +46,10 @@ def scale_index(row, col, cols):
     return ((((r32 * (cols // 8) + c8) * 4 + e) * 16 + b) * 2 + d) * 2 + a
 
 
+# ABLATION ONLY (SGLANG_AMD_MONO_ABL=wcm0): weight loads with the default cache policy
+_W_CM = 0 if "wcm0" in os.environ.get("SGLANG_AMD_MONO_ABL", "").split(",") else CM_NT
+
+
 def fp4_tile_load(r_w, base, rg, k, st, at):
     """Load a lane's 16 B of an FP4 weight's (16, 16)-shuffled row group at step ``st``."""
     return fx.Vector(
@@ -52,7 +58,7 @@ def fp4_tile_load(r_w, base, rg, k, st, at):
             base + rg * (2 * k) + st * 256 + at,
             vec_width=4,
             dtype=T.i32,
-            cache_modifier=CM_NT,
+            cache_modifier=_W_CM,
         )
     )
 

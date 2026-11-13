@@ -294,6 +294,7 @@ class DSV41MonoRunner:
             )
         self.ug_groups = ug_groups
         self.timeline_on = os.environ.get("SGLANG_AMD_MONO_TIMELINE") == "1"
+        self.woa_spread2_on = os.environ.get("SGLANG_AMD_MONO_DSV41_WOA_SPREAD2") == "1"
         self.token_par_on = os.environ.get("SGLANG_AMD_MONO_TOKEN_PAR", "1") == "1"
         # K1 / K2 read wqkv, wq_b and wo_b in aiter's (16, 16) preshuffle
         self.shuffled = shuffled
@@ -507,6 +508,7 @@ class DSV41MonoRunner:
                     fault_after=self.fault_after,
                     timeline=self.timeline_on,
                     tok_par=tok_par,
+                    woa_spread2=self.woa_spread2_on,
                     **self.route_at(tokens),
                 )
             )

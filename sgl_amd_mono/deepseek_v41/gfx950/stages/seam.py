@@ -191,33 +191,39 @@ def stage_slice(c, task, pre=None):
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     rl, fl = c["rl"], c["fl"]
     c0 = task * COLS
+    # ABLATION ONLY (SGLANG_AMD_MONO_ABL): parts of the slice skipped
+    norow, noin, nosq, nomix = (k in c.get("abl", ()) for k in ("norow", "noin", "nosq", "nomix"))
     first, fn = (None, slice_fn_loads(c, task)) if pre is None else pre
-    batched_rounds(
-        tid,
-        s * KT,
-        lambda e: slice_loads(c, c0, e),
-        lambda e, got: slice_row(c, c0, e, got),
-        first=first,
-    )
+    if const_expr(not norow):
+        batched_rounds(
+            tid,
+            s * KT,
+            lambda e: slice_loads(c, c0, e),
+            lambda e, got: slice_row(c, c0, e, got),
+            first=first,
+        )
     for i in range_constexpr(len(fn)):
         e = tid + THREADS * i
         if e < MIX * KT:
             fx.ptr_store(fn[i], fl + e)
     gpu.barrier()
     # layer input: bf16 R_new times pre, products rounded, summed in order (as the Triton collapse)
-    for pas in range_constexpr(0, s * COLS // 2, THREADS):
-        slice_input(c, task, plus(pas, tid))
+    if const_expr(not noin):
+        for pas in range_constexpr(0, s * COLS // 2, THREADS):
+            slice_input(c, task, plus(pas, tid))
     # sum of squares: token t on wave t % WAVES, two columns a lane
-    for t in range_constexpr(s):
-        if wave == t % WAVES:
-            x0 = fx.ptr_load(rl + (t * KT + 2 * lane))
-            x1 = fx.ptr_load(rl + (t * KT + 2 * lane + 1))
-            sq = butterfly(x0 * x0 + x1 * x1, (32, 16, 8, 4, 2, 1))
-            if lane == 0:
-                c["put"](c["pmix"], (task * s + t) * PART + MIX, sq)
+    if const_expr(not nosq):
+        for t in range_constexpr(s):
+            if wave == t % WAVES:
+                x0 = fx.ptr_load(rl + (t * KT + 2 * lane))
+                x1 = fx.ptr_load(rl + (t * KT + 2 * lane + 1))
+                sq = butterfly(x0 * x0 + x1 * x1, (32, 16, 8, 4, 2, 1))
+                if lane == 0:
+                    c["put"](c["pmix"], (task * s + t) * PART + MIX, sq)
     # mixes: fp32 MFMA 16x16x4, A = fn rows, B = R_new^T, a token tile at a time
-    for t0, n in token_tiles(s):
-        slice_mix(c, task, t0, n)
+    if const_expr(not nomix):
+        for t0, n in token_tiles(s):
+            slice_mix(c, task, t0, n)
 
 
 @flyc.jit
@@ -381,6 +387,22 @@ def stage_norm(c, t, store):
     for ch in range_constexpr(3):
         ys = [bf16_round((xs[ch][j] * r) * wts[ch][j]) for j in range(8)]
         store(t, at[ch], ys, mine & (cols[ch] < HIDDEN))
+    gpu.barrier()
+
+
+@flyc.jit
+def stage_norm_femu(c, t, store):
+    """ABLATION ONLY (femu): a fused slice-norm's cost on the norm path -- wait on every
+    slice's sum-of-squares partial of token t, then store zeros (no LIN, no compute)."""
+    tid = c["tid"]
+    sl = fx.min(tid, SLICES - 1)
+    c["poll"]([(c["pmix"], (sl * c["S"] + t) * PART + MIX, 1)])
+    gpu.barrier()
+    tt = fx.min(tid, 255)
+    for ch in range_constexpr(3):
+        col = tt * 8 + 2048 * ch
+        at = fx.min(col, HIDDEN - 8)
+        store(t, at, [fx.Float32(0.0)] * 8, (tid < 256) & (col < HIDDEN))
     gpu.barrier()
 
 
