@@ -28,7 +28,8 @@ class Case:
         gamma = slots - 1
         per = vocab // tp
         self.start, self.width = rank * per, per
-        target = torch.randn(bs * slots, vocab, generator=g, device=device) * 4
+        # bf16 values: the shard case reads the same logits as the bf16 LM head output
+        target = (torch.randn(bs * slots, vocab, generator=g, device=device) * 4).bfloat16().float()
         draft = target[: bs * slots].view(bs, slots, vocab)[:, :gamma] + torch.randn(
             bs, gamma, vocab, generator=g, device=device
         )
@@ -40,6 +41,7 @@ class Case:
         keep = torch.rand(bs, gamma, generator=g, device=device) < hit
         cand[:, 1:] = torch.where(keep, best[:, :gamma], pick)
         self.target, self.cand = target, cand
+        self.shard = target[:, self.start : self.start + per].bfloat16().contiguous()
         self.draft = draft[:, :, self.start : self.start + per].contiguous()
         temps = torch.tensor([1.0, 0.7, 1.3, 1.0, 0.9, 1.1, 1.0, 0.8] * 8, device=device)[:bs]
         self.temps = torch.zeros(bs, device=device) if greedy else temps
@@ -104,6 +106,9 @@ class Head:
         self.ex, self.ops = ex, head.ops()
         n = head.part_words(max_bs, slots, width)
         self.part = torch.empty(n, dtype=torch.float32, device=device)
+        # the case's draft is read through draft_addr; this buffer only carries the layout
+        self.draft = torch.zeros(max_bs, slots - 1, width, dtype=torch.float32, device=device)
+        self.draft_addr = torch.zeros(1, dtype=torch.int64, device=device)
         self.out = dict(
             correct=torch.zeros(max_bs, dtype=torch.int64, device=device),
             bonus=torch.zeros(max_bs, dtype=torch.int64, device=device),
@@ -115,11 +120,15 @@ class Head:
         )
         self.key = torch.zeros(1, dtype=torch.int64, device=device)
 
-    def run(self, c: Case):
+    def run(self, c: Case, stage: bool = True, shard: bool = False):
+        """shard: the target logits as this rank's bf16 vocab shard (column 0 = c.start)."""
         o = self.out
-        self.key.fill_(c.key)
+        if stage:
+            self.key.fill_(c.key)
+            self.draft_addr.fill_(c.draft.data_ptr())
+        target, col0 = (c.shard, 0) if shard else (c.target, c.start)
         self.ops.verify_head(
-            c.target, c.start, c.start, c.width, c.vocab, 0.0, c.draft, c.cand,
+            target, col0, c.start, c.width, c.vocab, 0.0, self.draft, self.draft_addr, c.cand,
             c.temps, c.sim_temps, c.sim_len, c.sim_seed, self.key, c.offset,
             c.seq_lens, c.verify_lens, c.gate, self.part, o["correct"], o["bonus"],
             o["trim"], o["commit"], o["new_seq"], o["tokens"], o["gated"], None,
@@ -149,7 +158,7 @@ def main() -> None:
     S, V = 6, args.vocab
     h = Head(ex, device, max_bs=8, slots=S, width=V // tp)
     g = torch.Generator(device=device).manual_seed(7)
-    fails, sampled_agree, sampled_total = [], 0, 0
+    fails, shard_fails, sampled_agree, sampled_total = [], [], 0, 0
     for t in range(args.trials):
         for bs in (1, 3, 8):
             for greedy in (True, False):
@@ -157,8 +166,13 @@ def main() -> None:
                     c = Case(g, bs, S, V, rank, tp, device, greedy=greedy, sim_len=sim,
                              hit=0.7)  # fmt: skip
                     want, got = reference(c), h.run(c)
+                    got = {k: v.clone() for k, v in got.items()}
+                    on_shard = h.run(c, shard=True)
                     torch.cuda.synchronize()
                     bad = same(want, got)
+                    # the shard read gives the full read's outputs, sampled included
+                    if same(got, on_shard):
+                        shard_fails.append((t, bs, greedy, sim, same(got, on_shard)))
                     if greedy or sim is not None:
                         if bad:
                             fails.append((t, bs, greedy, sim, bad))
@@ -200,10 +214,26 @@ def main() -> None:
     torch.cuda.synchronize()
     head_us = ev[0].elapsed_time(ev[1]) * 1e3 / 20
     ref_us = ev[1].elapsed_time(ev[2]) * 1e3 / 20
+    # the head's launches alone in a graph (as in the verify graph): 20 calls a replay
+    graph = torch.cuda.CUDAGraph()
+    dist.barrier()
+    with torch.cuda.graph(graph):
+        for _ in range(20):
+            h.run(c, stage=False)
+    graph.replay()
+    torch.cuda.synchronize()
+    dist.barrier()
+    ev[0].record()
+    for _ in range(10):
+        graph.replay()
+    ev[1].record()
+    torch.cuda.synchronize()
+    graph_us = ev[0].elapsed_time(ev[1]) * 1e3 / 200
     print(
-        f"rank {rank}: exact fails {len(fails)} {fails[:3]} | sampled agree "
+        f"rank {rank}: exact fails {len(fails)} {fails[:3]} | shard fails "
+        f"{len(shard_fails)} {shard_fails[:3]} | sampled agree "
         f"{sampled_agree}/{sampled_total} | replay {replay_bad or 'ok'} | "
-        f"bs8 head {head_us:.1f} us, reference {ref_us:.1f} us",
+        f"bs8 head {head_us:.1f} us (graph {graph_us:.1f} us), reference {ref_us:.1f} us",
         flush=True,
     )
     ex.close()
