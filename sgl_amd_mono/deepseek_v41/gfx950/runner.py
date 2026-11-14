@@ -34,7 +34,34 @@ from .layer import (
 from .stages.dims import Dims as MoeDims
 from .stages.moe_shape import EXPERTS
 from .stages.moe_shape import TOPK as ROUTE_TOPK
-from .token_par import token_par
+from .token_par import TOKEN_PAR_FROM, token_par
+
+# the index split pays from TP4: at TP2 a bs8 step's indexer sheds ~90 us and the exchange
+# costs ~65
+INDEX_SPLIT_MIN_TP = 4
+
+
+def _report_index_check(exchange, rank: int, every_s: float = 60.0) -> None:
+    """Log the index split check's counts every ``every_s`` (rank 0, and any rank with a
+    mismatch) from a daemon thread that reads host memory only."""
+    import logging
+    import threading
+    import time
+
+    log = logging.getLogger(__name__)
+
+    def loop():
+        while True:
+            time.sleep(every_s)
+            own, peers, seen = exchange.checked()
+            if rank == 0 or own or peers:
+                log.info(
+                    "DSV4.1 index split check (rank %d): %d own + %d peers' / %d 16 B "
+                    "vectors differ",
+                    rank, own, peers, seen,
+                )  # fmt: skip
+
+    threading.Thread(target=loop, name="index-split-check", daemon=True).start()
 
 __all__ = [
     "BLOCKS",
@@ -296,6 +323,13 @@ class DSV41MonoRunner:
         self.timeline_on = os.environ.get("SGLANG_AMD_MONO_TIMELINE") == "1"
         self.woa_spread2_on = os.environ.get("SGLANG_AMD_MONO_DSV41_WOA_SPREAD2") == "1"
         self.token_par_on = os.environ.get("SGLANG_AMD_MONO_TOKEN_PAR", "1") == "1"
+        # the index sources' rows split by request across ranks (``index_rows``): "1", or
+        # "emulate" (timing only: a rank scores its own rows and exchanges nothing)
+        self.index_split = os.environ.get("SGLANG_AMD_MONO_DSV41_INDEX_SPLIT", "0")
+        if self.index_split not in ("0", "1", "emulate"):
+            raise ValueError(
+                f"SGLANG_AMD_MONO_DSV41_INDEX_SPLIT is 0, 1 or emulate, got {self.index_split}"
+            )
         # K1 / K2 read wqkv, wq_b and wo_b in aiter's (16, 16) preshuffle
         self.shuffled = shuffled
         self.d = Dims(tp)
@@ -347,6 +381,20 @@ class DSV41MonoRunner:
         half = peer_half_bytes(tp)
         self.peer = PeerBuffer(2 * half + guard.FLAG_BYTES, group, rank, tp, dev)
         self.peer.bytes.zero_()
+        # the index sources' rows from their owner ranks (``index_rows``), collective
+        self.index_exchange = None
+        # SGLANG_AMD_MONO_DSV41_INDEX_SPLIT_CHECK=1: a replicated selection beside the split
+        # one (``k2i_check``), compared row by row in the exchange
+        # ("full": the split path scores every row too, isolating the reference and the exchange)
+        self.index_check_mode = os.environ.get("SGLANG_AMD_MONO_DSV41_INDEX_SPLIT_CHECK", "0")
+        self.index_check = self.index_check_mode in ("1", "full")
+        self.k2i_check = None
+        if self.index_split == "1" and tp >= INDEX_SPLIT_MIN_TP:
+            from .index_exchange import IndexExchange
+
+            self.index_exchange = IndexExchange(
+                group, rank, tp, dev, DEFAULT_DEADLINE_S, check=self.index_check
+            )
         self._kernels: dict = {}
         # the index sources' indexer (``enable_k2i``): the target's runner only
         self.k2i = None
@@ -358,11 +406,22 @@ class DSV41MonoRunner:
 
         no_capture("the K2i buffers")
         self.k2i = K2iRunner(device=self.device, bound_max=bound_max)
+        if self.index_exchange is not None and self.index_check:
+            self.k2i_check = K2iRunner(device=self.device, bound_max=bound_max)
+            i32 = dict(dtype=torch.int32, device=self.device)
+            self.index_ref = (
+                torch.empty(MAX_TOKENS, 512, **i32),
+                torch.empty(MAX_TOKENS, 512, **i32),
+            )
+            _report_index_check(self.index_exchange, self.rank)
         return self.k2i
 
     def set_deadline(self, seconds: float) -> None:
         """Every wait's deadline (below the server's watchdog timeout)."""
         ticks = guard.deadline_ticks(seconds)
+        exchange = getattr(self, "index_exchange", None)  # None before __init__ builds it
+        if exchange is not None:
+            exchange.deadline_s = seconds
         lo = ticks & 0xFFFFFFFF
         self.epoch[guard.GUARD_DEADLINE] = lo - (1 << 32) if lo >= 1 << 31 else lo
         self.epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
@@ -412,6 +471,28 @@ class DSV41MonoRunner:
     @staticmethod
     def supports(tokens: int) -> bool:
         return 1 <= tokens <= MAX_TOKENS
+
+    def index_ranges(self, tokens: int, per_req: int) -> list[tuple[int, int]] | None:
+        """Every rank's rows [lo, hi) of an index source's top-k when they split by
+        request (whole requests a rank, so a request's rows share one key load), or None."""
+        if (
+            self.index_split == "0"
+            or self.tp < INDEX_SPLIT_MIN_TP
+            or tokens < TOKEN_PAR_FROM
+        ):
+            return None
+        nreq = tokens // per_req
+        if nreq * per_req != tokens or nreq < self.tp:
+            return None
+        return [
+            (q * nreq // self.tp * per_req, (q + 1) * nreq // self.tp * per_req)
+            for q in range(self.tp)
+        ]
+
+    def index_rows(self, tokens: int, per_req: int) -> tuple[int, int] | None:
+        """This rank's rows of ``index_ranges``, or None."""
+        ranges = self.index_ranges(tokens, per_req)
+        return None if ranges is None else ranges[self.rank]
 
     def iq_fused(self, tokens: int, tok_par: bool = False) -> bool:
         """Whether an index source's K1 at this width computes its index query
