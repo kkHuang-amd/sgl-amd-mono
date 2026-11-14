@@ -844,37 +844,64 @@ def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> No
         if bounds.dtype != torch.int32 or not bounds.is_contiguous():
             bounds = bounds.to(torch.int32).contiguous()
         plan.state["k2i bounds", r] = bounds
-    k2i, per_req = runner.k2i, plan.key.tokens_per_request
-    if kind != "reindex" and ("k2i plan", r) not in plan.state:
-        # the step's walk plan of this ratio: its FULL and producer layers share it
-        k2i.walk_plan(ratio=r, bounds=bounds, rows=M, per_req=per_req)
-        plan.state["k2i plan", r] = True
+    per_req = plan.key.tokens_per_request
     if L.k1.iq_w is not None and runner.iq_fused(M, plan.state["tok_par"]):
         query = (runner.iq[:M], runner.iqs[:M], runner.iw[:M])  # K1 computed it
     else:
         query = _index_query(
             attn=attn, x=runner.normed[:M], q_lora=runner.qr[:M], positions=pos
         )
+    rows = dict(
+        kind=kind, plan=plan, ratio=r, per_req=per_req, query=query, plane=L.plane,
+        page_table=meta.page_table, bounds=bounds,
+    )  # fmt: skip
+    # split by request: this rank's rows only, the others' from the exchange
+    ranges = runner.index_ranges(M, per_req)
+    ref = None
+    if ranges is not None and runner.k2i_check is not None:
+        ref = tuple(t[:M] for t in runner.index_ref)
+        _select_rows(runner.k2i_check, "check ", 0, M, raw=ref[0], page=ref[1], **rows)
+    lo, hi = (0, M) if ranges is None else ranges[runner.rank]
+    if runner.index_check_mode == "full":
+        lo, hi = 0, M
+    _select_rows(runner.k2i, "", lo, hi, raw=raw_idx, page=page_idx, **rows)
+    if ranges is not None and runner.index_exchange is not None:
+        runner.index_exchange(raw_idx, page_idx, ranges)
+        if ref is not None:
+            runner.index_exchange.compare((raw_idx, page_idx), ref, M, ranges[runner.rank])
+
+
+def _select_rows(
+    k2i, tag, lo, hi, *, kind, plan, ratio, per_req, query, plane, page_table, bounds,
+    raw, page,
+) -> None:  # fmt: skip
+    """``_select``'s top-512 of rows [lo, hi) into ``raw`` / ``page`` with ``k2i``; the
+    step's walk plan and candidates under ``tag`` in ``plan.state``."""
+    r = ratio
+    if kind != "reindex" and (tag + "k2i plan", r) not in plan.state:
+        # the step's walk plan of this ratio: its FULL and producer layers share it
+        k2i.walk_plan(ratio=r, bounds=bounds[lo:hi], rows=hi - lo, per_req=per_req)
+        plan.state[tag + "k2i plan", r] = True
     published = k2i.select(
         kind=kind,
-        rows=M,
+        rows=hi - lo,
         per_req=per_req,
         ratio=r,
-        query=query,
-        plane=L.plane,
-        page_table=meta.page_table,
-        bounds=bounds,
-        raw_out=raw_idx,
-        page_out=page_idx,
+        query=tuple(q[lo:hi] for q in query),
+        plane=plane,
+        page_table=page_table[lo:hi],
+        bounds=bounds[lo:hi],
+        raw_out=raw[lo:hi],
+        page_out=page[lo:hi],
         # the candidate source's blocks of this step, for the layers after it
-        candidates=plan.state["k2i candidates"] if kind == "reindex" else None,
+        candidates=plan.state[tag + "k2i candidates"] if kind == "reindex" else None,
         # the step's REINDEX layers share one table (same blocks, page table, bounds)
-        reindex_table_built=kind == "reindex" and ("k2i reindex", r) in plan.state,
+        reindex_table_built=kind == "reindex" and (tag + "k2i reindex", r) in plan.state,
     )
     if kind == "reindex":
-        plan.state["k2i reindex", r] = True
+        plan.state[tag + "k2i reindex", r] = True
     if kind == "producer":
-        plan.state["k2i candidates"] = published
+        plan.state[tag + "k2i candidates"] = published
 
 
 def _index_query(*, attn, x, q_lora, positions) -> tuple:
