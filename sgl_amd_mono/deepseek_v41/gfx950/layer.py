@@ -4,6 +4,7 @@
 all-reduces) and the FFN launch (seam, MoE and TP all-reduce)."""
 
 import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import msgspec
@@ -772,7 +773,10 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
     # ABLATION ONLY (hemu): candidate H's data flow on a token-parallel build -- every rank
     # runs the seam and norm on all rows (the peer's half as 160 more slice tasks, its
     # partial waits on this rank's own pairs), no row gather
-    hemu = "hemu" in set(os.environ.get("SGLANG_AMD_MONO_ABL", "").split(",")) and key.tok_par
+    hemu = (
+        "hemu" in set(os.environ.get("SGLANG_AMD_MONO_ABL", "").split(","))
+        and key.tok_par
+    )
     ca_full = ca
     if const_expr(key.tok_par):
         t0 = rank * own_n
@@ -784,7 +788,9 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
     if const_expr(hemu):
         t0p = (rank + 1) % tp * own_n
         ca_peer = own_view(ca_full, t0p, own_n)
-        ca_peer["lin"] = sreg(scratch, layout["lin"][0] + own_n * HIDDEN // 2 * 8, "lin")
+        ca_peer["lin"] = sreg(
+            scratch, layout["lin"][0] + own_n * HIDDEN // 2 * 8, "lin"
+        )
         ca_peer["pmix"] = sreg(
             scratch, layout["pmix"][0] + SLICES * own_n * seam.PART * 8, "pmix"
         )
@@ -856,7 +862,11 @@ def run_ffn(key: MonoBuild, lds, a: dict, amb, bases, own, rank, ep, part=None):
     cb["abl_nomid"] = "nomid" in abl
     cb["abl_midmask"] = "midmask" in abl
     for key_, pre_ in (("abl_aug", "aug"), ("abl_adn", "adn")):
-        ns_ = [int(k[len(pre_):]) for k in abl if k.startswith(pre_) and k[len(pre_):].isdigit()]
+        ns_ = [
+            int(k[len(pre_) :])
+            for k in abl
+            if k.startswith(pre_) and k[len(pre_) :].isdigit()
+        ]
         cb[key_] = -1 if pre_ + "odd" in abl else (ns_[0] if ns_ else 0)
     if const_expr("chain" in abl or "routerwait" in abl):
         cb["abl_chain"] = True
@@ -1226,7 +1236,13 @@ def build_mono_k2(key: MonoBuild):
 
             cp = {"put_bf": amb.put_bf, "rank": rank}
             c["wob_out"] = lambda t, col, v0, v1: push_attn_pair(
-                cp, bases, s // tp if key.tok_par else None, s, t, col, [v0, v1],
+                cp,
+                bases,
+                s // tp if key.tok_par else None,
+                s,
+                t,
+                col,
+                [v0, v1],
                 hemu="hemu" in os.environ.get("SGLANG_AMD_MONO_ABL", "").split(","),
             )
             epoch_begin({"bid": bid, "tid": fx.thread_idx.x}, epoch, ep)

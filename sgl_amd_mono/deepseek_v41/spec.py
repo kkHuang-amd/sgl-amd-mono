@@ -868,7 +868,9 @@ def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> No
     if ranges is not None and runner.index_exchange is not None:
         runner.index_exchange(raw_idx, page_idx, ranges)
         if ref is not None:
-            runner.index_exchange.compare((raw_idx, page_idx), ref, M, ranges[runner.rank])
+            runner.index_exchange.compare(
+                (raw_idx, page_idx), ref, M, ranges[runner.rank]
+            )
 
 
 def _select_rows(
@@ -896,7 +898,8 @@ def _select_rows(
         # the candidate source's blocks of this step, for the layers after it
         candidates=plan.state[tag + "k2i candidates"] if kind == "reindex" else None,
         # the step's REINDEX layers share one table (same blocks, page table, bounds)
-        reindex_table_built=kind == "reindex" and (tag + "k2i reindex", r) in plan.state,
+        reindex_table_built=kind == "reindex"
+        and (tag + "k2i reindex", r) in plan.state,
     )
     if kind == "reindex":
         plan.state[tag + "k2i reindex", r] = True

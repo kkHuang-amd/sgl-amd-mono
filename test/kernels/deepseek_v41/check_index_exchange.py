@@ -21,8 +21,12 @@ def ranges_of(bs: int, per_req: int, tp: int):
 
 def expected(rows: int, seed: int, device) -> tuple[torch.Tensor, torch.Tensor]:
     g = torch.Generator(device=device).manual_seed(seed)
-    raw = torch.randint(0, 2**30, (rows, 512), generator=g, device=device, dtype=torch.int32)
-    page = torch.randint(0, 2**30, (rows, 512), generator=g, device=device, dtype=torch.int32)
+    raw = torch.randint(
+        0, 2**30, (rows, 512), generator=g, device=device, dtype=torch.int32
+    )
+    page = torch.randint(
+        0, 2**30, (rows, 512), generator=g, device=device, dtype=torch.int32
+    )
     return raw, page
 
 
@@ -54,9 +58,14 @@ def main() -> None:
             raw[lo:hi].copy_(want_raw[lo:hi]), page[lo:hi].copy_(want_page[lo:hi])
             ex(raw, page, rg)
             torch.cuda.synchronize()
-            if not (torch.equal(raw[:rows], want_raw) and torch.equal(page[:rows], want_page)):
+            if not (
+                torch.equal(raw[:rows], want_raw)
+                and torch.equal(page[:rows], want_page)
+            ):
                 fails.append((t, bs))
-            if not (bool((raw_buf[:, 512:] == -1).all()) and bool((raw[rows:] == -7).all())):
+            if not (
+                bool((raw_buf[:, 512:] == -1).all()) and bool((raw[rows:] == -7).all())
+            ):
                 fails.append((t, bs, "wrote outside"))
     # a graph replay: the call tags advance on the device
     bs = 8
@@ -76,7 +85,8 @@ def main() -> None:
         graph.replay()
         torch.cuda.synchronize()
         replay_bad += not (
-            torch.equal(raw[:rows], want_raw + n) and torch.equal(page[:rows], want_page + n)
+            torch.equal(raw[:rows], want_raw + n)
+            and torch.equal(page[:rows], want_page + n)
         )
     # the check: a matching replicated selection counts no mismatch, one wrong row its vectors
     bs = 8

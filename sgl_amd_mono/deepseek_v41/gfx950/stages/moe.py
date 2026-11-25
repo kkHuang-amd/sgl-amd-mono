@@ -253,14 +253,18 @@ def put_mxfp8_group_vllm(c, words_mb, codes_mb, t, g, v, amax):
 
 # ---------------------------------------------------------------- router
 # ABLATION ONLY (SGLANG_AMD_MONO_ABL=wcm0): expert scale loads with the default cache policy
-W_CM = 0 if "wcm0" in __import__("os").environ.get("SGLANG_AMD_MONO_ABL", "").split(",") else CM_NT
+W_CM = (
+    0
+    if "wcm0" in __import__("os").environ.get("SGLANG_AMD_MONO_ABL", "").split(",")
+    else CM_NT
+)
 
 
 def _abl_pool(prefix):
     """ABLATION ONLY: SGLANG_AMD_MONO_ABL=<prefix>N -> N, else BLOCKS."""
     for k in __import__("os").environ.get("SGLANG_AMD_MONO_ABL", "").split(","):
-        if k.startswith(prefix) and k[len(prefix):].isdigit():
-            return int(k[len(prefix):])
+        if k.startswith(prefix) and k[len(prefix) :].isdigit():
+            return int(k[len(prefix) :])
     return BLOCKS
 
 
@@ -857,7 +861,11 @@ def ug_pass(c, e, part0, first, count, col):
     # ABLATION ONLY (augN): experts 96 - N .. 95 read experts 0 .. N - 1's weights (cache hits)
     aug = int(c.get("abl_aug", 0))
     # aug -1 (augodd): an odd expert reads the even one before it
-    ew = e - (e & 1) if aug == -1 else ((e >= 96 - aug).select(e - (96 - aug), e) if aug else e)
+    ew = (
+        e - (e & 1)
+        if aug == -1
+        else ((e >= 96 - aug).select(e - (96 - aug), e) if aug else e)
+    )
     # a group in the padding has zero weights: skip its GEMV, still write its zero MID
     acc = fx.Vector.filled(8, 0.0, fx.Float32)
     if real:
@@ -1089,7 +1097,9 @@ def mid_operands(c, first, count):
     if const_expr(c.get("abl_midmask", False)):
         # ABLATION (midmask): a lane past the slot's picks loads past MID's end (zeros, no traffic)
         mid_end = c["rs"].picks * d.mid_words
-        lane_word = fresh((lane % 16 < count).select(row * d.mid_words + j * 4, mid_end))
+        lane_word = fresh(
+            (lane % 16 < count).select(row * d.mid_words + j * 4, mid_end)
+        )
         mid_r = rsrc(c["mid"].value, mid_end * 4)
     bvs = []
     for st in range_constexpr(steps):
@@ -1416,7 +1426,9 @@ def run_moe(c, key, bid, before_ug=None):
         publish(c["put"], c["x8rdy"], t, 1, tid == 0)
     stamp(c, 19)
     multi = len(token_tiles(s)) > 1
-    abl_chain = c.get("abl_chain", False)  # ABLATION ONLY: the router does not wait on x
+    abl_chain = c.get(
+        "abl_chain", False
+    )  # ABLATION ONLY: the router does not wait on x
     # ABLATION ONLY (norouter): no router tasks, route reads the logits once
     no_router = c.get("abl_norouter", False)
     r_end = 0 if const_expr(no_router) else router_tasks
@@ -1490,7 +1502,10 @@ def run_moe(c, key, bid, before_ug=None):
         assert multi, "moepool: multi-tile widths only"
         k_max = (DOWN_TASKS + MOE_POOL - 1) // MOE_POOL
         full = DOWN_TASKS - (k_max - 1) * MOE_POOL
-        for k_n, cond in ((k_max, down_task < full), (k_max - 1, (down_task >= full) & (down_task < MOE_POOL))):
+        for k_n, cond in (
+            (k_max, down_task < full),
+            (k_max - 1, (down_task >= full) & (down_task < MOE_POOL)),
+        ):
             if cond:
                 ts = [down_task + k * MOE_POOL for k in range(k_n)]
                 for i in range_constexpr(0, k_n, 2):

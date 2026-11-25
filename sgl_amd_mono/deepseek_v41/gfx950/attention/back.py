@@ -40,12 +40,11 @@ from sgl_amd_mono.common.plan import (
     first_task,
 )
 from sgl_amd_mono.common.stamps import stamp
+from sgl_amd_mono.common.sync import abl_keys
 from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
     ld_f32,
     lds_row,
 )
-
-from sgl_amd_mono.common.sync import abl_keys
 
 from .device import Mailbox, fp8x8_bf16, ld_i32, mx_code, mx_mul, pow2
 from .gemv import (
@@ -756,6 +755,7 @@ def run_back(c, key, bid):
         return bf16_gemv_loads(
             c, a["woa"], a["woa_s"], group_k, woa_t * WOA_ROWS, WOA_SPLIT_K, pred=pw
         )
+
     wob_unit = first_task(bid, WOB0)
     if const_expr(nt == 1):
         # one or two wo_b tasks a CTA, every one on the step's rows
@@ -788,7 +788,6 @@ def run_back(c, key, bid):
             else wob_loads(c, fx.min(t, wob_tasks - 1), pred=t < wob_tasks)
             for k, t in enumerate(wob_ts)
         ]
-
 
     if const_expr("woaearly" in abl):
         ops = woa_loads()

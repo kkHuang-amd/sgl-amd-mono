@@ -69,7 +69,9 @@ def real_key_lists(M, n_req, swa_pages, comp_pages, g):
     for r in range(n_req):
         rows = range(r * M // n_req, (r + 1) * M // n_req)
         comp = torch.randperm(comp_pages * COMP_BLOCK, generator=g)[:TOPK].tolist()
-        base = r * per_req + int(torch.randint(0, per_req - WINDOW - len(rows), (1,), generator=g))
+        base = r * per_req + int(
+            torch.randint(0, per_req - WINDOW - len(rows), (1,), generator=g)
+        )
         for j, _ in enumerate(rows):
             swa = list(range(base + j + WINDOW - 1, base + j - 1, -1))
             lists.append((swa, comp))
@@ -115,7 +117,9 @@ def main():
         gk = torch.Generator().manual_seed(1000 + M)
         if args.real_keys:
             for L in layers:
-                lists = real_key_lists(M, min(args.real_keys, M), swa_pages, comp_pages, gk)
+                lists = real_key_lists(
+                    M, min(args.real_keys, M), swa_pages, comp_pages, gk
+                )
                 L.slot, L.keys = source_keys(M, lists, dev)
         else:
             _, _, lists = key_lists(M, gk, dev)

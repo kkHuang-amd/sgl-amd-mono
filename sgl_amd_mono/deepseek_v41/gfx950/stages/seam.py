@@ -192,7 +192,9 @@ def stage_slice(c, task, pre=None):
     rl, fl = c["rl"], c["fl"]
     c0 = task * COLS
     # ABLATION ONLY (SGLANG_AMD_MONO_ABL): parts of the slice skipped
-    norow, noin, nosq, nomix = (k in c.get("abl", ()) for k in ("norow", "noin", "nosq", "nomix"))
+    norow, noin, nosq, nomix = (
+        k in c.get("abl", ()) for k in ("norow", "noin", "nosq", "nomix")
+    )
     first, fn = (None, slice_fn_loads(c, task)) if pre is None else pre
     if const_expr(not norow):
         batched_rounds(

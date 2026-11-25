@@ -63,6 +63,7 @@ def _report_index_check(exchange, rank: int, every_s: float = 60.0) -> None:
 
     threading.Thread(target=loop, name="index-split-check", daemon=True).start()
 
+
 __all__ = [
     "BLOCKS",
     "MAX_TOKENS",
@@ -386,7 +387,9 @@ class DSV41MonoRunner:
         # SGLANG_AMD_MONO_DSV41_INDEX_SPLIT_CHECK=1: a replicated selection beside the split
         # one (``k2i_check``), compared row by row in the exchange
         # ("full": the split path scores every row too, isolating the reference and the exchange)
-        self.index_check_mode = os.environ.get("SGLANG_AMD_MONO_DSV41_INDEX_SPLIT_CHECK", "0")
+        self.index_check_mode = os.environ.get(
+            "SGLANG_AMD_MONO_DSV41_INDEX_SPLIT_CHECK", "0"
+        )
         self.index_check = self.index_check_mode in ("1", "full")
         self.k2i_check = None
         if self.index_split == "1" and tp >= INDEX_SPLIT_MIN_TP:
@@ -419,7 +422,9 @@ class DSV41MonoRunner:
     def set_deadline(self, seconds: float) -> None:
         """Every wait's deadline (below the server's watchdog timeout)."""
         ticks = guard.deadline_ticks(seconds)
-        exchange = getattr(self, "index_exchange", None)  # None before __init__ builds it
+        exchange = getattr(
+            self, "index_exchange", None
+        )  # None before __init__ builds it
         if exchange is not None:
             exchange.deadline_s = seconds
         lo = ticks & 0xFFFFFFFF
