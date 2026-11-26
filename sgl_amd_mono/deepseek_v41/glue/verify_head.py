@@ -22,9 +22,11 @@ ENV = "SGLANG_AMD_MONO_DSV41_HEAD"
 SHARDS_ENV = ENV + "_SHARDS"
 VERIFY = "sglang.srt.speculative.dspark_components.dspark_verify"
 DEADLINE_S = 10.0
+LEAN_STAGE = flag("SGLANG_AMD_MONO_DSV41_LEAN_STAGE", "0")
 
 # by file under sglang/ (test_contract.py pins them)
 SGLANG_READS = {
+    "kernels/ops/memory/small_field_copy.py": ("SmallFieldCopyPlan",),
     "srt/speculative/dspark_components/dspark_verify.py": (
         "DsparkVerifyEpilogue",
         "_accept_static_greedy",
@@ -194,9 +196,17 @@ class _Head:
                 self._greedy_bs = bs
             return
         self._greedy_bs = None
-        self.temps[:bs].copy_(draft_block.temperatures.view(-1)[:bs])
+        dsts = [self.temps[:bs], self.offset]
+        srcs = [
+            draft_block.temperatures.view(-1)[:bs],
+            draft_block.noise.offset.view(-1)[:1],
+        ]
         if sim_info is not None:
-            self.sim_temps[:bs].copy_(sim_info.temperatures.view(-1)[:bs])
+            dsts.append(self.sim_temps[:bs])
+            srcs.append(sim_info.temperatures.view(-1)[:bs])
+        if not self._stage_copy(bs, dsts, srcs):
+            for d, src in zip(dsts, srcs):
+                d.copy_(src)
         logits = draft_block.corrected_logits
         if logits.data_ptr() != self._draft_ptr:
             self._draft_ptr = logits.data_ptr()
@@ -206,7 +216,19 @@ class _Head:
         if key != self._key:
             self.key.fill_(key)
             self._key = key
-        self.offset.copy_(draft_block.noise.offset.view(-1)[:1])
+
+    def _stage_copy(self, bs, dsts, srcs) -> bool:
+        """The step's staged copies as one small_field_copy launch
+        (SGLANG_AMD_MONO_DSV41_LEAN_STAGE=1); False: copy each."""
+        if not LEAN_STAGE:
+            return False
+        from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
+
+        plans = self.__dict__.setdefault("_stage_plans", {})
+        plan = plans.get((bs, len(dsts)))
+        if plan is None:
+            plan = plans[(bs, len(dsts))] = SmallFieldCopyPlan()
+        return plan(dsts, srcs)
 
 
 def _head(epi):
