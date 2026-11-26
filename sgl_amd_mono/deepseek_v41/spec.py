@@ -1129,14 +1129,33 @@ class _Built:
         if any(e.tp_size == 1 or e._shared for e in embeds):
             return {}
         dim = embeds[0].dim
-        # every layer's ids contiguous in one copy: each layer's rows are a view
-        by_layer = hash_ids.transpose(0, 1).contiguous()
         out = torch.empty(
             (len(engrams), *hash_ids.shape[:1], hash_ids.shape[-1], dim),
             dtype=torch.bfloat16,
             device=hash_ids.device,
         )
+        from sgl_amd_mono.deepseek_v41.engram_rows import MAX_LAYERS, engram_rows
+        from sgl_amd_mono.deepseek_v41.glue import flag
+
+        # SGLANG_AMD_MONO_DSV41_ENGRAM_ONE=1: every layer's rows in one launch, ids read in place
+        if (
+            flag("SGLANG_AMD_MONO_DSV41_ENGRAM_ONE", "0")
+            and len(engrams) <= MAX_LAYERS
+            and all(e.rows > 0 for e in embeds)
+            and hash_ids.dim() == 3
+        ):
+            engram_rows(
+                hash_ids, [(e.layer_hash_index, b) for e, b in zip(engrams, embeds)], out,
+                FP8_BLOCK_SIZE,
+            )  # fmt: skip
+            engrams_gathered = True
+        else:
+            engrams_gathered = False
+            # every layer's ids contiguous in one copy: each layer's rows are a view
+            by_layer = hash_ids.transpose(0, 1).contiguous()
         for k, (engram, embed) in enumerate(zip(engrams, embeds)):
+            if engrams_gathered:
+                break
             rows = out[k].view(-1, dim)
             if embed.rows == 0:
                 rows.zero_()

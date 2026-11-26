@@ -64,6 +64,27 @@ def _post_combine_kernel(
 
 
 @triton.jit
+def _post_combine_norm_kernel(
+    X, R, POST, COMB, PRE, OUT, Y, NW, N, H, EPS, HC: tl.constexpr, BLOCK: tl.constexpr
+):
+    # _post_combine_kernel a row a program, then the RMSNorm of its combine (the draft's last norm)
+    m = tl.program_id(0)
+    h = tl.arange(0, BLOCK)
+    live = h < H
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(HC):
+        vb = _post_stream(X, R, POST, COMB, m, i, h, live, H, HC)
+        tl.store(OUT + m * HC * H + i * H + h, vb, mask=live)
+        acc += tl.load(PRE + m * HC + i).to(tl.float32) * vb.to(tl.float32)
+    yb = acc.to(tl.bfloat16)
+    tl.store(Y + m * H + h, yb, mask=live)
+    y = tl.where(live, yb.to(tl.float32), 0.0)
+    rstd = tl.rsqrt(tl.sum(y * y, 0) / H + EPS)
+    w = tl.load(NW + h, mask=live, other=0.0).to(tl.float32)
+    tl.store(N + m * H + h, (y * rstd * w).to(tl.bfloat16), mask=live)
+
+
+@triton.jit
 def _post_gate_kernel(
     XO,
     R,
@@ -129,6 +150,55 @@ def _post_combine(x, residual, post, comb, pre):
             x, residual, post, comb, pre, out, y, h, HC=hc, BLOCK=block
         )
     return out, y
+
+
+def post_combine_norm(layer, pending, pre, hc: int, norm):
+    """``post_combine`` and ``norm`` (an RMSNorm with ``weight`` / ``variance_epsilon``) of its
+    combine in one launch -> (streams, combine, normed), or None (the caller keeps the separate
+    launches): the normed rows must stay within bf16 rounding of ``norm(combine)`` on every rank."""
+    from sgl_amd_mono.deepseek_v41.glue import agreed
+
+    x, residual, post, comb = pending
+    w = getattr(norm, "weight", None)
+    eps = getattr(norm, "variance_epsilon", getattr(norm, "eps", None))
+    if not (
+        enabled()
+        and _fits(x, residual, post, comb)
+        and pre.dtype == torch.float32
+        and pre.is_contiguous()
+        and w is not None
+        and eps is not None
+        and w.dtype == torch.bfloat16
+        and w.numel() == residual.shape[2]
+    ):
+        return None
+
+    def why():
+        out, y, n = _post_combine_norm(x, residual, post, comb, pre, w, eps)
+        want_out, want_y = _post_combine(x, residual, post, comb, pre)
+        if not (_same(out, want_out) and _same(y, want_y)):
+            return "combine bits differ"
+        want_n = norm(want_y).float()
+        if not ((n.float() - want_n).abs() <= want_n.abs() * 2**-7 + 1e-3).all():
+            return "normed rows past a bf16 rounding"
+        return None
+
+    if not agreed("post_combine_norm", why):
+        return None
+    return _post_combine_norm(x, residual, post, comb, pre, w, eps)
+
+
+def _post_combine_norm(x, residual, post, comb, pre, w, eps):
+    m, hc, h = residual.shape
+    out = torch.empty_like(residual)
+    y = torch.empty((m, h), dtype=residual.dtype, device=residual.device)
+    n = torch.empty_like(y)
+    if m:
+        _post_combine_norm_kernel[(m,)](
+            x, residual, post, comb, pre, out, y, w, n, h, float(eps), HC=hc,
+            BLOCK=triton.next_power_of_2(h),
+        )  # fmt: skip
+    return out, y, n
 
 
 def _post_gate(x, residual, post, comb, kv, engram, input_ids):

@@ -28,7 +28,7 @@ constexpr int ROWS_PER_PASS = THREADS / ROW_LANES;
 constexpr int PASSES        = 4;
 constexpr int BLOCK_ROWS    = ROWS_PER_PASS * PASSES;
 constexpr int FINISH        = 512;
-constexpr int MAX_SEQ       = 4;
+constexpr int MAX_SEQ       = 8;
 constexpr int MAX_TP        = 8;
 constexpr int SLOTS         = 16; // a sequence's packets: two halves by call parity, a rank's slot in each
 // the exchange buffer: every sequence's slots, 16 B each (markov.py's EXCHANGE_BYTES)
@@ -251,6 +251,175 @@ __global__ __launch_bounds__(FINISH) void markov_sample_finish_kernel(const Para
     }
 }
 
+// ---------------------------------------------------------------- the whole block in one launch
+// SGLANG_AMD_MONO_DSV41_MARKOV_PERSIST: every step of a draft block in one launch of PBLOCKS persistent blocks (one a CU,
+// so all resident). A block holds its G row groups of the W2 shard in registers for every step; a step's bests go
+// block -> partial (this GPU) -> the sequence's leader block -> every rank's slot -> every block, as tagged 16 B packets
+// (data and tag in one store; the tag is the launch's call and the step), with no grid barrier and no last-block count.
+constexpr int PBLOCKS = 256;
+
+struct BlockParams {
+    const bfloat16 *logits; // [nseq, gamma, padded]: sequence s's step j row at + s * seq_stride + j * step_stride
+    int64_t         seq_stride, step_stride;
+    const bfloat16 *embed;
+    const bfloat16 *head;
+    const int64_t  *anchor;
+    int64_t         anchor_stride;
+    float          *step_logits; // same layout as logits, f32 (null: none kept)
+    int64_t         sl_seq_stride, sl_step_stride;
+    const float    *temps;
+    int64_t        *offset;
+    uint32_t        key_lo, key_hi;
+    int             vocab_start, width, padded, gamma, nseq, blocks, rank, tp;
+    uint32x4       *partials; // [2][MAX_SEQ][PBLOCKS] this GPU's block bests
+    int64_t        *out;      // sequence s's step j token at out[s * out_stride + j]
+    int64_t         out_stride;
+    int            *calls; // [1] the launches so far
+    void           *recv[MAX_TP]; // every rank's slots [2][MAX_SEQ][MAX_TP]
+    uint64_t        deadline_ticks;
+};
+
+__device__ inline float block_key(const BlockParams &p, int seq, int step, int v, float value) {
+    const float t = p.temps[seq];
+    float       key = value;
+    if (t != 0.0f) {
+        const uint32_t g = static_cast<uint32_t>(p.vocab_start + v);
+        const uint32_t w = philox_word(p.key_lo, p.key_hi, g >> 2, static_cast<uint32_t>(seq),
+                                       static_cast<uint32_t>(step), static_cast<uint32_t>(p.offset[0]),
+                                       static_cast<int>(g & 3u));
+        const float u = (static_cast<float>(w) + 0.5f) * 2.3283064365386963e-10f;
+        key           = value / t - logf(-log1pf(-u));
+    }
+    return key != key ? INFINITY : key;
+}
+
+template <int G> __global__ __launch_bounds__(THREADS) void markov_sample_block_kernel(const BlockParams p) {
+    __shared__ float   sv[BLOCK_ROWS];
+    __shared__ float   rv[PBLOCKS];
+    __shared__ int     ri[PBLOCKS];
+    __shared__ int64_t stok[MAX_SEQ];
+    const int          lane = threadIdx.x % ROW_LANES, grp = threadIdx.x / ROW_LANES;
+    float              e[16], h[G][PASSES][16];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        const int group = blockIdx.x + g * PBLOCKS;
+#pragma unroll
+        for (int ps = 0; ps < PASSES; ++ps) {
+            const int v = group * BLOCK_ROWS + ps * ROWS_PER_PASS + grp;
+            if (group < p.blocks && v < p.width) {
+                load16f(p.head + static_cast<int64_t>(v) * DIM + lane * 16, h[g][ps]);
+            }
+        }
+    }
+    const uint32_t call = static_cast<uint32_t>(p.calls[0]) + 1u;
+    for (int j = 0; j < p.gamma; ++j) {
+        const uint32_t tag = call * 8u + static_cast<uint32_t>(j) + 1u;
+        const int      par = j & 1;
+        for (int seq = 0; seq < p.nseq; ++seq) {
+            const int64_t prev = j == 0 ? p.anchor[seq * p.anchor_stride] : stok[seq];
+            load16f(p.embed + prev * DIM + lane * 16, e);
+            float best = -INFINITY;
+            int   bi   = INT_MAX;
+#pragma unroll
+            for (int g = 0; g < G; ++g) {
+                const int group = blockIdx.x + g * PBLOCKS;
+                if (group >= p.blocks) {
+                    continue; // block-uniform
+                }
+#pragma unroll
+                for (int ps = 0; ps < PASSES; ++ps) {
+                    const int v   = group * BLOCK_ROWS + ps * ROWS_PER_PASS + grp;
+                    float     dot = 0.0f;
+                    if (v < p.width) {
+#pragma unroll
+                        for (int i = 0; i < 16; ++i) {
+                            dot += e[i] * h[g][ps][i];
+                        }
+                    }
+                    dot = lane_sum<ROW_LANES>(dot);
+                    if (lane == 0) {
+                        sv[ps * ROWS_PER_PASS + grp] = dot;
+                    }
+                }
+                __syncthreads();
+                if (threadIdx.x < BLOCK_ROWS) {
+                    const int v = group * BLOCK_ROWS + threadIdx.x;
+                    if (v < p.padded) {
+                        const float bias  = v < p.width ? round_bf16(sv[threadIdx.x]) : 0.0f;
+                        const float value = static_cast<float>(p.logits[seq * p.seq_stride + j * p.step_stride + v]) + bias;
+                        if (p.step_logits != nullptr) {
+                            p.step_logits[seq * p.sl_seq_stride + j * p.sl_step_stride + v] = value;
+                        }
+                        if (v < p.width) {
+                            keep_best(best, bi, block_key(p, seq, j, v, value), v);
+                        }
+                    }
+                }
+                __syncthreads(); // sv free
+            }
+            if (threadIdx.x < BLOCK_ROWS) {
+#pragma unroll
+                for (int m = BLOCK_ROWS / 2; m > 0; m /= 2) {
+                    keep_best(best, bi, __shfl_xor(best, m, BLOCK_ROWS), __shfl_xor(bi, m, BLOCK_ROWS));
+                }
+                if (threadIdx.x == 0) {
+                    const uint32x4 pk{__builtin_bit_cast(uint32_t, best), static_cast<uint32_t>(bi), 0, tag};
+                    store_nt(p.partials + (par * MAX_SEQ + seq) * PBLOCKS + blockIdx.x, pk);
+                }
+            }
+        }
+        // the leader of each sequence: this GPU's best of all blocks, to every rank
+        for (int seq = 0; seq < p.nseq; ++seq) {
+            if (static_cast<int>(blockIdx.x) != seq % PBLOCKS) {
+                continue; // block-uniform
+            }
+            const uint32x4 pk = poll_tag(p.partials + (par * MAX_SEQ + seq) * PBLOCKS + threadIdx.x % PBLOCKS, tag,
+                                         p.deadline_ticks);
+            if (threadIdx.x < PBLOCKS) {
+                rv[threadIdx.x] = __builtin_bit_cast(float, pk.x), ri[threadIdx.x] = static_cast<int>(pk.y);
+            }
+            __syncthreads();
+            for (int half = PBLOCKS / 2; half > 0; half /= 2) {
+                if (threadIdx.x < half) {
+                    keep_best(rv[threadIdx.x], ri[threadIdx.x], rv[threadIdx.x + half], ri[threadIdx.x + half]);
+                }
+                __syncthreads();
+            }
+            if (threadIdx.x == 0) {
+                const uint32x4 mine{__builtin_bit_cast(uint32_t, rv[0]), static_cast<uint32_t>(ri[0] + p.vocab_start), 0,
+                                    tag};
+                for (int r = 0; r < p.tp; ++r) {
+                    store_nt(static_cast<uint32x4 *>(p.recv[r]) + (par * MAX_SEQ + seq) * MAX_TP + p.rank, mine);
+                }
+            }
+            __syncthreads();
+        }
+        // every block: the ranks' bests of every sequence, the best key and the lowest rank on ties
+        if (threadIdx.x < p.nseq) {
+            const int seq = threadIdx.x;
+            float     top = -INFINITY;
+            int64_t   tok = INT_MAX;
+            for (int r = 0; r < p.tp; ++r) {
+                const uint32x4 pk = poll_tag(static_cast<const uint32x4 *>(p.recv[p.rank]) + (par * MAX_SEQ + seq) * MAX_TP + r,
+                                             tag, p.deadline_ticks);
+                const float v = __builtin_bit_cast(float, pk.x);
+                if (r == 0 || v > top) {
+                    top = v, tok = static_cast<int64_t>(pk.y);
+                }
+            }
+            stok[seq] = tok;
+            if (blockIdx.x == 0) {
+                p.out[seq * p.out_stride + j] = tok;
+            }
+        }
+        __syncthreads();
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) { // every block read the call and the counter at its first step
+        p.calls[0] = static_cast<int>(call);
+        p.offset[0] += 1;
+    }
+}
+
 void check(const at::Tensor &t, const at::Tensor &ref, at::ScalarType dtype, const char *name) {
     TORCH_CHECK(t.device() == ref.device() && t.scalar_type() == dtype, name, " must be ", dtype, " on ",
                 ref.device());
@@ -334,6 +503,88 @@ void markov_sample_step(const at::Tensor &logits, const at::Tensor &embed, const
     C10_HIP_KERNEL_LAUNCH_CHECK();
 }
 
+// base [nseq, gamma, padded] bf16, step_logits [nseq, gamma, >= padded] f32 or none, partials [2 * MAX_SEQ * PBLOCKS * 4]
+// int32 (zeroed once), out int64 (s * out_stride + j), calls [1] int32, peers [tp] int64 on the host: every rank's
+// block-exchange buffer (2 * MAX_SEQ * MAX_TP packets)
+void markov_sample_block(const at::Tensor &base, const at::Tensor &embed, const at::Tensor &head,
+                         const at::Tensor &anchor, const std::optional<at::Tensor> &step_logits,
+                         const at::Tensor &temps, at::Tensor &offset, int64_t key, int64_t vocab_start,
+                         at::Tensor &partials, at::Tensor &out, int64_t out_stride, at::Tensor &calls,
+                         const at::Tensor &peers, int64_t rank, double deadline_s) {
+    const int64_t nseq  = base.size(0);
+    const int64_t width = head.size(0);
+    TORCH_CHECK(base.dim() == 3 && nseq >= 1 && nseq <= MAX_SEQ && base.stride(2) == 1,
+                "base [1 .. ", MAX_SEQ, " sequences, gamma, padded]");
+    TORCH_CHECK(head.dim() == 2 && head.size(1) == DIM && head.is_contiguous() && embed.dim() == 2 &&
+                    embed.size(1) == DIM && embed.is_contiguous() && width <= base.size(2),
+                "head [width, 256], embed [vocab, 256] contiguous");
+    check(embed, base, at::kBFloat16, "embed");
+    check(head, base, at::kBFloat16, "head");
+    TORCH_CHECK(base.scalar_type() == at::kBFloat16, "base bf16");
+    TORCH_CHECK(anchor.device() == base.device() && anchor.scalar_type() == at::kLong && anchor.dim() == 1 &&
+                    anchor.size(0) >= nseq,
+                "anchor [nseq] int64 (any stride)");
+    check(temps, base, at::kFloat, "temps");
+    check(offset, base, at::kLong, "offset");
+    check(out, base, at::kLong, "out");
+    check(calls, base, at::kInt, "calls");
+    TORCH_CHECK(partials.device() == base.device() && partials.scalar_type() == at::kInt &&
+                    partials.numel() >= 2 * MAX_SEQ * PBLOCKS * 4,
+                "partials [2 * MAX_SEQ * PBLOCKS * 4] int32");
+    TORCH_CHECK(peers.device().is_cpu() && peers.scalar_type() == at::kLong && peers.numel() >= 1 &&
+                    peers.numel() <= MAX_TP,
+                "peers: every rank's block-exchange buffer (int64, host)");
+    BlockParams p{};
+    p.logits      = static_cast<const bfloat16 *>(base.data_ptr());
+    p.seq_stride  = base.stride(0);
+    p.step_stride = base.stride(1);
+    p.embed       = static_cast<const bfloat16 *>(embed.data_ptr());
+    p.head        = static_cast<const bfloat16 *>(head.data_ptr());
+    p.anchor      = anchor.data_ptr<int64_t>();
+    p.anchor_stride = anchor.stride(0);
+    if (step_logits) {
+        TORCH_CHECK(step_logits->scalar_type() == at::kFloat && step_logits->dim() == 3 &&
+                        step_logits->size(0) >= nseq && step_logits->size(1) >= base.size(1) &&
+                        step_logits->size(2) >= base.size(2) && step_logits->stride(2) == 1,
+                    "step_logits [nseq, gamma, >= padded] f32");
+        p.step_logits    = step_logits->data_ptr<float>();
+        p.sl_seq_stride  = step_logits->stride(0);
+        p.sl_step_stride = step_logits->stride(1);
+    }
+    p.temps       = temps.data_ptr<float>();
+    p.offset      = offset.data_ptr<int64_t>();
+    p.key_lo      = static_cast<uint32_t>(static_cast<uint64_t>(key) & 0xFFFFFFFFull);
+    p.key_hi      = static_cast<uint32_t>(static_cast<uint64_t>(key) >> 32);
+    p.vocab_start = static_cast<int>(vocab_start);
+    p.width       = static_cast<int>(width);
+    p.padded      = static_cast<int>(base.size(2));
+    p.gamma       = static_cast<int>(base.size(1));
+    p.nseq        = static_cast<int>(nseq);
+    p.blocks      = static_cast<int>((base.size(2) + BLOCK_ROWS - 1) / BLOCK_ROWS);
+    p.rank        = static_cast<int>(rank);
+    p.tp          = static_cast<int>(peers.numel());
+    p.partials    = reinterpret_cast<uint32x4 *>(partials.data_ptr<int>());
+    p.out         = out.data_ptr<int64_t>();
+    p.out_stride  = out_stride;
+    p.calls       = calls.data_ptr<int>();
+    p.deadline_ticks = static_cast<uint64_t>(deadline_s * 1e8);
+    for (int r = 0; r < p.tp; ++r) {
+        p.recv[r] = reinterpret_cast<void *>(peers.data_ptr<int64_t>()[r]);
+    }
+    const int groups = (p.blocks + PBLOCKS - 1) / PBLOCKS;
+    TORCH_CHECK(groups <= 4, "a vocab shard of at most ", 4 * PBLOCKS * BLOCK_ROWS, " rows");
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(base.device());
+    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA(base.device().index()).stream();
+    if (groups == 1) {
+        markov_sample_block_kernel<1><<<PBLOCKS, THREADS, 0, stream>>>(p);
+    } else if (groups == 2) {
+        markov_sample_block_kernel<2><<<PBLOCKS, THREADS, 0, stream>>>(p);
+    } else {
+        markov_sample_block_kernel<4><<<PBLOCKS, THREADS, 0, stream>>>(p);
+    }
+    C10_HIP_KERNEL_LAUNCH_CHECK();
+}
+
 } // namespace
 
 #ifndef TORCH_LIBRARY_EXPAND
@@ -346,4 +597,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
           "int out_stride, Tensor(c!) tok, Tensor(d!) calls, Tensor peers, int rank, bool bump_offset, "
           "float deadline_s) -> ()");
     m.impl("markov_sample_step", at::kCUDA, &markov_sample_step);
+    m.def("markov_sample_block(Tensor base, Tensor embed, Tensor head, Tensor anchor, Tensor? step_logits, "
+          "Tensor temps, Tensor(a!) offset, int key, int vocab_start, Tensor(b!) partials, Tensor(c!) out, "
+          "int out_stride, Tensor(d!) calls, Tensor peers, int rank, float deadline_s) -> ()");
+    m.impl("markov_sample_block", at::kCUDA, &markov_sample_block);
 }

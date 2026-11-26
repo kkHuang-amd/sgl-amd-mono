@@ -27,6 +27,9 @@ SGLANG_READS = {
     "srt/models/deepseek_v4_dspark.py": (
         "DSparkV4MarkovHead",
         "compute_base_logits",
+        "collapse_hc_head",
+        "_use_fp32_lm_head",
+        "_opt_markov_w2_tp_shard",
         "markov_head",
         "markov_w1",
         "markov_w2",
@@ -39,7 +42,11 @@ SGLANG_READS = {
         "lm_head",
         "num_embeddings_per_partition",
     ),
-    "srt/models/dspark.py": ("vocab_shard",),
+    "srt/models/dspark.py": (
+        "vocab_shard",
+        "gather_and_crop_vocab",
+        "project_through_lm_head",
+    ),
     "srt/speculative/dspark_components/dspark_draft.py": (
         "draft_markov_block",
         "draft_markov_block(markov_head)",
@@ -146,11 +153,27 @@ class _Sampler:
         self.exchange = markov.Exchange(
             group.cpu_group, group.rank_in_group, group.world_size, device
         )
+        from sgl_amd_mono.deepseek_v41.glue import flag
+
+        # SGLANG_AMD_MONO_DSV41_MARKOV_PERSIST=1: every step of a block in one launch
+        self.persist = None
+        if flag("SGLANG_AMD_MONO_DSV41_MARKOV_PERSIST", "0"):
+            self.persist = markov.BlockExchange(
+                group.cpu_group, group.rank_in_group, group.world_size, device
+            )
         self.ops = markov.ops()
 
     def block(self, base_logits, anchor, temps, noise, out, step_logits):
         """Every step of a [bs, gamma, padded] base logits block: tokens to ``out``
         ([bs * gamma]), the step logits to ``step_logits`` ([bs, gamma, padded])."""
+        if self.persist is not None:
+            b = self.persist
+            self.ops.markov_sample_block(
+                base_logits, self.embed, self.head, anchor, step_logits, temps, noise.offset,
+                int(noise.key), self.vocab_start, b.partials, out, self.gamma, b.calls, b.peers,
+                b.rank, self.deadline_s,
+            )  # fmt: skip
+            return
         x = self.exchange
         for s in range(self.gamma):
             self.ops.markov_sample_step(
@@ -162,7 +185,7 @@ class _Sampler:
 
     def step(self, hidden_states, anchor_tokens):
         """SGLang's base logits and Markov block of a bs-row draft block."""
-        base_logits, confidence_features = self.model.compute_base_logits(hidden_states)
+        base_logits, confidence_features = self._base_logits(hidden_states)
         bs = anchor_tokens.shape[0]
         base = base_logits.view(bs, self.gamma, -1)
         out = self.out[: bs * self.gamma]
@@ -171,6 +194,31 @@ class _Sampler:
             self.step_logits[:bs],
         )  # fmt: skip
         return out.view(bs, self.gamma), confidence_features
+
+    def _base_logits(self, hidden_states):
+        """``compute_base_logits``; from the draft forward's normed rows when it left them
+        (``draft.DRAFT_TAIL``) for these very rows."""
+        from sgl_amd_mono.deepseek_v41.draft import TAIL_KEY
+
+        model = self.model
+        tail = model.__dict__.get(TAIL_KEY)
+        if (
+            tail is None
+            or tail[0].data_ptr() != hidden_states.data_ptr()
+            or tail[0].numel() != hidden_states.numel()
+            or getattr(model, "_use_fp32_lm_head", False)
+        ):
+            return model.compute_base_logits(hidden_states)
+        from sglang.srt.models.dspark import (
+            gather_and_crop_vocab,
+            project_through_lm_head,
+        )
+
+        x_post_hc = model.collapse_hc_head(hidden_states)
+        logits = project_through_lm_head(tail[1].view_as(x_post_hc), model.lm_head)
+        if not model._opt_markov_w2_tp_shard:
+            logits = gather_and_crop_vocab(logits, model.lm_head)
+        return logits, x_post_hc
 
     def disagrees(self, max_bs: int) -> str | None:
         """Why the kernels' block is not SGLang's on random inputs, or None."""
@@ -194,7 +242,9 @@ class _Sampler:
             anchor = torch.randint(
                 0, head.vocab_size, (bs,), generator=g, device=device
             ).long()
-            temps = torch.tensor([1.0, 0.0, 0.7, 1.3][:bs], device=device)
+            temps = torch.tensor(
+                [1.0, 0.0, 0.7, 1.3, 0.5, 1.0, 0.9, 1.1][:bs], device=device
+            )
             offset = torch.randint(0, 1 << 30, (1,), generator=g, device=device)
             want_logits = torch.empty(
                 bs, gamma, width, dtype=torch.float32, device=device
@@ -264,10 +314,20 @@ def _factory(
         why = f"the kernels do not build: {type(e).__name__}: {e}"
     if not agree(sampler is not None):
         return keep(why or "the kernels did not build on another rank")
-    top = min(max_bs, markov.MAX_SEQUENCES)
+    # SGLANG_AMD_MONO_DSV41_MARKOV_MAX_BS: the kernels' batch sizes (up to MAX_SEQUENCES; the step kernel's
+    # time grows with the batch, so at 8 it only matches SGLang's block at TP2: default 4)
+    import os
+
+    top = min(
+        max_bs,
+        markov.MAX_SEQUENCES,
+        int(os.environ.get("SGLANG_AMD_MONO_DSV41_MARKOV_MAX_BS", "4")),
+    )
     why = sampler.disagrees(top)
     if not agree(why is None):
         sampler.exchange.close()
+        if sampler.persist is not None:
+            sampler.persist.close()
         return keep(why or "the kernels disagree with SGLang on another rank")
     if group.rank_in_group == 0:
         _LOGGER.info(

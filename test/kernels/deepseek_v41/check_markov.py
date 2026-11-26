@@ -53,6 +53,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gamma", type=int, default=5)
     ap.add_argument("--replays", type=int, default=20)
+    ap.add_argument(
+        "--persist",
+        action="store_true",
+        help="markov_sample_block: the block in one launch",
+    )
     args = ap.parse_args()
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank)
@@ -69,6 +74,7 @@ def main():
     vocab_start = rank * part
     w2s = w2[vocab_start : vocab_start + part]
     ops, x = markov.ops(), markov.Exchange(cpu, rank, tp, dev)
+    bx = markov.BlockExchange(cpu, rank, tp, dev) if args.persist else None
     scratch = torch.empty(
         markov.MAX_SEQUENCES, markov.blocks(padded), 2, dtype=torch.float32, device=dev
     )
@@ -83,7 +89,7 @@ def main():
             device=dev,
             generator=torch.Generator(device=dev).manual_seed(bs),
         )
-        temps = torch.tensor([1.0, 0.0, 0.7, 1.3][:bs], device=dev)
+        temps = torch.tensor([1.0, 0.0, 0.7, 1.3, 0.5, 1.0, 0.9, 1.1][:bs], device=dev)
         offset0 = 17 * bs
         want, want_logits = reference(
             base, w1, w2s, anchor, temps, key, offset0, vocab_start, None
@@ -93,6 +99,12 @@ def main():
         logits = torch.zeros(bs, gamma, padded, dtype=torch.float32, device=dev)
 
         def block():
+            if bx is not None:
+                ops.markov_sample_block(
+                    base, w1, w2s, anchor, logits, temps, offset, key, vocab_start, bx.partials,
+                    out, gamma, bx.calls, bx.peers, rank, 20.0,
+                )  # fmt: skip
+                return
             for s in range(gamma):
                 ops.markov_sample_step(
                     base[:, s], w1, w2s, anchor, logits[:, s], temps, offset, key,
@@ -119,6 +131,16 @@ def main():
             graph.replay()
             torch.cuda.synchronize()
             bad_replay += int((out.view(bs, gamma) != want).sum())
+        t0, t1 = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        t0.record()
+        for _ in range(args.replays):
+            graph.replay()
+        t1.record()
+        torch.cuda.synchronize()
+        us = t0.elapsed_time(t1) / args.replays * 1e3
         every = [torch.empty_like(out) for _ in range(tp)]
         dist.all_gather(every, out)
         alike = all(torch.equal(every[0], e) for e in every)
@@ -128,12 +150,14 @@ def main():
                 f"bs={bs} {'PASS' if ok else 'FAIL'} | tokens differing {bad_tok} of "
                 f"{bs * gamma} | step logits past a bias rounding {bad_logit} | max "
                 f"{apart.max().item():.3g} | counter {counter} | replays differing "
-                f"{bad_replay} | ranks alike {alike}",
+                f"{bad_replay} | ranks alike {alike} | {us:.1f} us a block (graph)",
                 flush=True,
             )
         if not ok:
             fails.append(bs)
     x.close()
+    if bx is not None:
+        bx.close()
     dist.barrier()
     if rank == 0:
         print("ALL PASS" if not fails else f"FAIL at {fails}", flush=True)
