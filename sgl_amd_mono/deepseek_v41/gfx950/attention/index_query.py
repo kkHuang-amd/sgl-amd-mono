@@ -327,6 +327,87 @@ def run_iw(c, a, rows, iw0, lds, row0=0, push=None):
         )  # fmt: skip
 
 
+def iw_scratch(s: int) -> dict:
+    """The split head weights' partials ``run_iw_split``: [pair][split][16][16] f32,
+    then a flag a task."""
+    pairs = 2 * -(-s // 16)
+    part = pairs * IW_SPLITS * 256 * 4
+    return {"iwp": (0, part), "iwr": (part, pairs * IW_SPLITS * 8)}
+
+
+@flyc.jit
+def run_iw_split(c, a, rows, base, row0=0):
+    """``run_iw``'s partials a (token tile, 16-head tile, split) a CTA from CTA ``base``,
+    wave 0 running the split's chain as ``stage_iw`` does, to IWP / IWR."""
+    tid, lds = c["tid"], c["xl"]
+    tiles = -(-rows // 16)
+    for task in range(first_task(c["bid"], base), 2 * tiles * IW_SPLITS, BLOCKS):
+        pair, sp = task // IW_SPLITS, task % IW_SPLITS
+        t0 = (pair // 2) * 16
+        n = fx.min(fx.Int32(16), rows - t0)
+        gpu.barrier()
+        if tid < 2 * n:
+            c["mb"].poll([(c["xrdy"], 2 * t0 + fx.min(tid, 2 * n - 1), 1)])
+        gpu.barrier()
+        if c["wave"] == 0:
+            _iw_chains(
+                c, a["normed_out"], a["iw_w"], plus(row0, t0), n, [sp], pair % 2, lds
+            )
+        gpu.barrier()
+        if tid < 256:
+            v = fx.ptr_load(lds + (sp * 256 + tid)).bitcast(fx.Float32)
+            bo.buffer_store(
+                v, rsrc(c["iwp"]), task * 256 + tid, cache_modifier=CM_DEV
+            )
+        from .front import publish
+
+        publish(c, c["iwr"], task)
+
+
+@flyc.jit
+def run_iw_reduce(c, a, rows, base, n_ctas, row0=0, push=None):
+    """``stage_iw``'s sum of ``run_iw_split``'s partials in split order, a (token tile,
+    16-head tile) a CTA on the n_ctas CTAs from ``base``: bit for bit ``run_iw``."""
+    tid = c["tid"]
+    tiles = -(-rows // 16)
+    first = first_task(c["bid"], base)
+    if first < n_ctas:
+        for pair in range(first, 2 * tiles, n_ctas):
+            t0 = (pair // 2) * 16
+            n = fx.min(fx.Int32(16), rows - t0)
+            ht = pair % 2
+            if tid < IW_SPLITS:
+                c["mb"].poll([(c["iwr"], pair * IW_SPLITS + fx.min(tid, IW_SPLITS - 1), 1)])
+            gpu.barrier()
+            if tid < n * 8:
+                r, h = tid // 8, 2 * (tid % 8)
+                ws = []
+                for d in range_constexpr(2):
+                    acc = None
+                    for sp in range_constexpr(IW_SPLITS):
+                        v = fx.Float32(
+                            bo.buffer_load(
+                                rsrc(c["iwp"]),
+                                (pair * IW_SPLITS + sp) * 256 + r * 16 + h + d,
+                                vec_width=1,
+                                dtype=T.f32,
+                                cache_modifier=CM_DEV,
+                            )
+                        )
+                        acc = v if acc is None else acc + v
+                    ws.append(bf16_round(bf16_round(acc) * a["iw_scale"]))
+                word = (
+                    fx.Vector.from_elements(ws, fx.Float32)
+                    .to(fx.BFloat16)
+                    .bitcast(fx.Int32)[0]
+                )
+                row = plus(row0, plus(t0, r))
+                bo.buffer_store(word, rsrc(a["iw_out"]), (row * HEADS + 16 * ht + h) // 2)
+                if const_expr(push is not None):
+                    push(row, 16 * ht + h, ws[0], ws[1])
+            gpu.barrier()
+
+
 @flyc.jit
 def run_iquant(c, a, s):
     """Every (token, head), a wave each, once its head's 8 IQ tasks published."""

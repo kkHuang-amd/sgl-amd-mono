@@ -22,6 +22,8 @@ TOKEN_PAR_FROM = 12
 QX_WORDS = Q_RANK // 4  # the q latent's e4m3 words
 QX_GROUPS = Q_RANK // 32
 KG_WORDS = DATA // 4 + 2  # a window record's data words, then its two scale words
+COMP_RING_WORDS = 1024  # a ring pair: kv, then score (f32)
+COMP_KEY_WORDS = 34  # an index key: 32 (head byte, tail byte) words, then 2 exponent words
 LINE = 128  # every peer region starts on a cache line
 
 # a row's bytes in each per-row seam argument (``own_view``)
@@ -60,7 +62,9 @@ def peer_layout(s: int, tp: int) -> dict[str, tuple[int, int]]:
     ATTN and FFN hold the sublayers' partials ``[source rank][row][hidden / 2]``; the
     token-parallel gathers follow, ``[row][..]`` each: XG the MoE input rows, QG / QGS
     the q latent's MXFP8 words / codes, KG the window records, NBG and QRG an index
-    source's normed rows and qr, and IWG its index head weights (bf16 pairs)."""
+    source's normed rows and qr, and IWG its index head weights (bf16 pairs); a KV
+    source's compressor in K1 (``attention.compressor``): CRG a parking row's ring
+    pair, CPG a completing row's V4 record, CIG its index key."""
     row = s * HIDDEN // 2
     return pair_layout(
         [
@@ -73,6 +77,9 @@ def peer_layout(s: int, tp: int) -> dict[str, tuple[int, int]]:
             ("nbg", row),
             ("qrg", s * Q_RANK // 2),
             ("iwg", s * 16),
+            ("crg", s * COMP_RING_WORDS),
+            ("cpg", s * KG_WORDS),
+            ("cig", s * COMP_KEY_WORDS),
         ],
         align=LINE,
     )

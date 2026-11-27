@@ -44,7 +44,9 @@ the reserved dummy slot, as the normal path does.
 from __future__ import annotations
 
 import importlib.util
+import logging
 import re
+import struct
 from typing import Any
 
 import msgspec
@@ -73,6 +75,8 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
 
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.deepseek_v41 import CANDIDATES, HF_CONFIG, fused
+
+logger = logging.getLogger(__name__)
 
 MAX_ROWS = 48  # the rows a launch takes at most (``layer.MAX_TOKENS``)
 
@@ -129,6 +133,7 @@ SGLANG_READS = {
     "kernels/ops/layernorm/mhc.py": ("hc_broadcast", "mhc_combine"),
     "kernels/ops/layernorm/mhc_boundary_hip.py": ("tensors",),
     "srt/arg_groups/fields/*.py": (
+        "speculative_num_draft_tokens",
         "kv_cache_dtype",
         "moe_runner_backend",
         "speculative_algorithm",
@@ -157,6 +162,16 @@ SGLANG_READS = {
         "forward_low_ratio_sources(positions)",
         "forward_low_ratio_sources(forward_batch)",
         "forward_low_ratio_sources(run_indexer)",
+        # K1's compressor (``_comp_args``): when SGLang's fused one would run,
+        "read_ragged_verify_mode",
+        "RaggedVerifyMode",
+        "is_dspark_draft",
+        "speculative_num_draft_tokens",
+        "tail_source_kv_layer_id",
+        "core_metadata",
+        "low_ratio_req_indices",
+        "raw_out_loc",
+        "c2_out_loc",
     ),
     "srt/layers/attention/deepseek_v4_backend_hip_radix.py": (
         "forward_low_ratio_sources",
@@ -198,6 +213,12 @@ SGLANG_READS = {
         "weights_proj_hip_max_tokens",
         "rope_head_dim",
         "head_weight_scale",
+        "use_fused_gate",
+        "use_fused_compress",
+        "wkv_gate",
+        "owns_k",
+        "wk",
+        "k_norm",
     ),
     "srt/layers/quantization/fp8.py": (
         "aiter_bpreshuffled",
@@ -225,6 +246,11 @@ SGLANG_READS = {
         "get_index_k_fp4_scale_buffer",
         "low_ratio_index_k_is_split",
         "get_index_k_page_size",
+        "get_attention_compress_states",
+        "ring_size",
+        "uniform_fp8",
+        "get_extra_key_layout",
+        "low_ratio_index_k_page8",
     ),
     "srt/model_executor/forward_context.py": (
         "get_attn_backend",
@@ -327,8 +353,13 @@ SGLANG_READS = {
         '"tp_rank"',
         '"tp_size"',
         '"tp_group"',
+        "get_spec",
     ),
     "srt/utils/common.py": ("get_bool_env_var",),
+    "kernels/ops/attention/dsv4/kv_layout.py": ("KVLayout", '"v4"'),
+    "srt/speculative/ragged_verify.py": ("COMPACT",),
+    "srt/mem_cache/deepseek_v4_compress_state.py": ("kv_score_buffer", "kv_score"),
+    "srt/model_executor/forward_batch_info.py": ("encoder_swa_replay",),
 }
 
 # each launch's output against the normal path on the same GPU (the kernel tests)
@@ -572,6 +603,8 @@ class _Layer(msgspec.Struct):
     comp: Any = None  # the compressed cache, the same layout
     comp_block: int = 0
     plane: Any = None  # an indexer's FP4 index plane: (payload, scales)
+    # a KV source's ratio-2 compressor, for K1's (``_comp_args``): its tensors, or None
+    cw: Any = None
 
 
 def _keep(copies: dict, t: torch.Tensor, *key) -> torch.Tensor:
@@ -701,7 +734,46 @@ def _weights(copies: dict, tables: list, layer, i: int) -> _Layer:
         getattr(a, "compressor", None) is not None
         or getattr(a, "indexer", None) is not None
     )
+    L.cw = _comp_weights(a, i)
     return L
+
+
+def _comp_weights(a, i: int) -> dict | None:
+    """A ratio-2 KV source's compressor tensors as K1 reads them (in place), or None
+    where K1 cannot run it (SGLang's then runs between K1 and K2)."""
+    comp, ix = getattr(a, "compressor", None), getattr(a, "indexer", None)
+    if not (
+        comp is not None
+        and a.compress_ratio == 2
+        and getattr(comp, "use_fused_gate", False)
+        and getattr(comp, "use_fused_compress", False)
+    ):
+        return None
+    bf = torch.bfloat16
+    # the real / imag interleaved view SGLang's c2 reads (a view: freqs_cis is contiguous)
+    freqs = torch.view_as_real(a.freqs_cis).flatten(-2)
+    out = dict(
+        w=comp.wkv_gate.weight, nw=comp.norm.weight, eps=float(comp.norm.eps),
+        freqs=freqs,
+    )  # fmt: skip
+    want = {"w": ((1024, 5120), bf), "nw": ((512,), bf), "freqs": (None, torch.float32)}
+    if ix is not None and ix.owns_k:
+        out |= dict(wk=ix.wk.weight, kn=ix.k_norm.weight, keps=float(ix.k_norm.eps))
+        want |= {"wk": ((128, 512), bf), "kn": ((128,), bf)}
+    for name, (shape, dtype) in want.items():
+        t = out[name]
+        if not (
+            t.dtype == dtype
+            and t.is_contiguous()
+            and (shape is None or tuple(t.shape) == shape)
+            and (shape is not None or t.shape[-1] == 64)
+        ):
+            logger.warning(
+                "monokernel: layer %d keeps SGLang's compressor: %s %s %s",
+                i, name, tuple(t.shape), t.dtype,
+            )  # fmt: skip
+            return None
+    return out
 
 
 def _boundary_out(layer, defer_post, x, residual, post, comb, pre):
@@ -762,15 +834,16 @@ def _launch(
         residual = residual.contiguous()  # the broadcast embedding may be a view
         if prev_pre is None:
             prev_pre = runner.first_pre[:M]
+    comp = _comp_args(runner, L, plan, backend, forward_batch, M, tok_par)
     runner.k1(
         L.k1, x, residual, post, comb, prev_pre, pos, slot, L.swa, L.swa_block,
         keys, index=L.index, tok_par=tok_par,
-        aux=None if capture is None else capture(L, M),
+        aux=None if capture is None else capture(L, M), comp=comp,
     )  # fmt: skip
     if L.index:
         _select(
             runner=runner, L=L, plan=plan, backend=backend, positions=positions,
-            pos=pos, forward_batch=forward_batch, M=M,
+            pos=pos, forward_batch=forward_batch, M=M, comp_done=comp is not None,
         )  # fmt: skip
     # K2 reads K1's outputs from the runner's buffers
     return runner.k2(
@@ -779,11 +852,107 @@ def _launch(
     )  # fmt: skip
 
 
-def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> None:
+def _f32_bits(v: float) -> int:
+    return struct.unpack("<i", struct.pack("<f", v))[0]
+
+
+def _comp_args(runner, L, plan, backend, forward_batch, M, tok_par):
+    """K1's compressor of a ratio-2 KV source (``attention.compressor``): (rows a
+    request, owns_k, ``layer.COMP_ARGS*``), or None where SGLang's runs after K1 --
+    as ``_low_ratio_compress`` dispatches, its fused kernels on a decode or a static
+    verify step only."""
+    if L.cw is None or not runner.comp_on:
+        return None
+    from sglang.srt.layers.attention.deepseek_v4_backend import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+    from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+
+    mode, per_req = forward_batch.forward_mode, plan.key.tokens_per_request
+    if mode.is_decode():
+        ok = per_req == 1
+    else:
+        ok = (
+            mode.is_target_verify()
+            and not backend.is_dspark_draft
+            and read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT
+            and backend.speculative_num_draft_tokens == per_req > 1
+            and M == forward_batch.batch_size * per_req
+        )
+    meta = backend.forward_metadata
+    req = getattr(meta, "low_ratio_req_indices", None)
+    if not (
+        ok
+        and L.i != backend.tail_source_kv_layer_id
+        and not forward_batch.encoder_swa_replay
+        and req is not None
+        and req.shape[0] >= M
+        and req.dtype == torch.int64
+        and runner.comp_ok(M, per_req, tok_par, L.k1.iq_w is not None)
+    ):
+        return None
+    key = ("comp", L.i)
+    if key not in plan.state:
+        plan.state[key] = _comp_bind(L, meta, req, get_token_to_kv_pool())
+    bound = plan.state[key]
+    if bound is None:
+        return None
+    return (per_req, "wk" in L.cw, bound)
+
+
+def _comp_bind(L, meta, req, pool):
+    """``_comp_args``' pointers of one step: SGLang's ring, V4 pool, split index plane
+    and the step's rows; None where the caches are not the layouts K1 writes."""
+    from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+
+    from sgl_amd_mono.deepseek_v41.gfx950.runner import slot_words
+
+    core, cw = meta.core_metadata, L.cw
+    raw, iloc = core.raw_out_loc, core.c2_out_loc
+    state = pool.get_attention_compress_states(L.i)
+    ring = state.kv_score_buffer.kv_score
+    reasons = []
+    if pool.uniform_fp8 or pool.get_extra_key_layout(L.i) != KVLayout.V4:
+        reasons.append("the compressed cache is not V4")
+    if not (ring.dtype == torch.float32 and ring.is_contiguous() and ring.shape[-1] == 1024):
+        reasons.append(f"a ring of {tuple(ring.shape)} {ring.dtype}")
+    if iloc is None or iloc.dtype != torch.int64 or raw is None or not raw.is_contiguous():
+        reasons.append("no int64 c2_out_loc / raw_out_loc")
+    wk = cw.get("wk")
+    if wk is not None and not (
+        pool.low_ratio_index_k_is_split(L.i)
+        and not pool.low_ratio_index_k_page8(L.i)
+        and pool.get_index_k_page_size(L.ratio) == 64
+    ):
+        reasons.append("the index keys are not in the 64-row split FP4 plane")
+    if reasons:
+        logger.warning(
+            "monokernel: layer %d keeps SGLang's compressor: %s", L.i, "; ".join(reasons)
+        )
+        return None
+    pay = scale = None
+    if wk is not None:
+        pay = pool.get_index_k_fp4_payload_buffer(L.i).view(torch.uint8)
+        scale = pool.get_index_k_fp4_scale_buffer(L.i)
+    ptr = lambda t: 0 if t is None else t.data_ptr()  # noqa: E731
+    return (
+        cw["w"].data_ptr(), cw["nw"].data_ptr(), cw["freqs"].data_ptr(), req.data_ptr(),
+        raw.data_ptr(), iloc.data_ptr(), ring.data_ptr(), L.comp.data_ptr(),
+        L.comp.stride(0), ptr(wk), ptr(cw.get("kn")), ptr(pay), ptr(scale),
+        slot_words(raw), int(state.ring_size), L.comp_block, _f32_bits(cw["eps"]),
+        _f32_bits(cw.get("keps", 0.0)),
+    )  # fmt: skip
+
+
+def _select(
+    *, runner, L, plan, backend, positions, pos, forward_batch, M, comp_done=False
+) -> None:
     """An index source between K1 and K2.
 
     A KV source's compressor runs on K1's normed input, as SGLang's low-ratio path
-    runs it before the attention (the other index sources read its keys). The top-512
+    runs it before the attention (the other index sources read its keys) -- in K1
+    itself where ``comp_done`` (``_comp_args``). The top-512
     then lands in SGLang's sparse indices of the ratio as SGLang's decode indexer
     (``low_ratio_index_topk_hip_decode``) decides, asking SGLang's own functions (a
     captured variant's answer under a graph): every row in order where SGLang scores
@@ -797,7 +966,7 @@ def _select(*, runner, L, plan, backend, positions, pos, forward_batch, M) -> No
     )
 
     attn, r = L.module.self_attn, L.ratio
-    if attn.compressor is not None:
+    if attn.compressor is not None and not comp_done:
         backend.forward_low_ratio_sources(
             layer=attn,
             x=runner.normed[:M],
@@ -1291,6 +1460,18 @@ def _build(model, hf_config, ctx) -> _Built:
         for L in layers.values()
         for fold in (True, False)
     }
+    if runner.comp_on:
+        # a KV source's compressor in K1: decode steps, and DSpark's static verify blocks
+        from sglang.srt.runtime_context import get_spec
+
+        per_reqs = {1, get_spec().speculative_num_draft_tokens or 1}
+        k1 |= {
+            (fold, True, L.k1.iq_w is not None, n, "wk" in L.cw)
+            for L in layers.values()
+            if L.cw is not None
+            for fold in (True, False)
+            for n in per_reqs
+        }
     k2 = {(L.ratio > 0, L.index) for L in layers.values()}
     # ranks share FlyDSL's disk cache (a lock per kernel), so each starts at its own slice
     widths = list(ctx.widths)

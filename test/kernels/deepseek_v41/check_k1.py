@@ -146,6 +146,168 @@ def k1_timeline(M, tl) -> str:
     return "\n".join(lines)
 
 
+E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+C_BLOCK, C_PAGES, RING, REQS, PLANE = 64, 16, 8, 64, 64
+
+
+class CompCase:
+    """A KV source's compressor in K1 (``attention.compressor``) against SGLang's chain on
+    the normed rows K1 wrote: ``project_fused`` (``linear_bf16_fp32``), c2's decode or
+    static-verify kernel (V4 records), ``wk`` and the split index-K store, on random rings."""
+
+    def __init__(self, M, per_req, dev, g):
+        from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+
+        self.M, self.per_req, self.dev, self.g = M, per_req, dev, g
+        bf = torch.bfloat16
+        self.w = (torch.randn(1024, HIDDEN, generator=g, device=dev) * 0.02).to(bf)
+        self.nw = (torch.rand(512, generator=g, device=dev) + 0.5).to(bf)
+        self.wk = (torch.randn(128, 512, generator=g, device=dev) * 0.05).to(bf)
+        self.kn = (torch.rand(128, generator=g, device=dev) + 0.5).to(bf)
+        self.eps, self.keps = 1e-6, 1e-6
+        self.stride = KVLayout.V4.page_bytes(C_BLOCK)
+        self.pool = torch.full((C_PAGES, self.stride), 255, dtype=torch.uint8, device=dev)
+        self.ring = torch.empty(REQS * RING, 1024, dtype=torch.float32, device=dev)
+        self.pay = torch.zeros(C_PAGES, 1, 4, PLANE, 16, dtype=torch.uint8, device=dev)
+        self.isc = torch.zeros(C_PAGES, 1, 4, PLANE, dtype=torch.uint8, device=dev)
+        self.req = torch.zeros(M, dtype=torch.int64, device=dev)
+        self.loc = torch.zeros(M, dtype=torch.int64, device=dev)
+        self.iloc = torch.zeros(M, dtype=torch.int64, device=dev)
+
+    def args(self, freqs):
+        f32 = lambda v: struct.unpack("<i", struct.pack("<f", v))[0]  # noqa: E731
+        return (
+            self.w.data_ptr(), self.nw.data_ptr(), freqs.data_ptr(), self.req.data_ptr(),
+            self.loc.data_ptr(), self.iloc.data_ptr(), self.ring.data_ptr(),
+            self.pool.data_ptr(), self.stride, self.wk.data_ptr(), self.kn.data_ptr(),
+            self.pay.data_ptr(), self.isc.data_ptr(), 2, RING, C_BLOCK, f32(self.eps),
+            f32(self.keps),
+        )  # fmt: skip
+
+    def inputs(self, pos, trial):
+        """Requests of per_req consecutive positions (one padded row on odd trials)."""
+        M, pr, g, dev = self.M, self.per_req, self.g, self.dev
+        nreq = M // pr
+        reqs = torch.randperm(REQS, generator=g, device=dev)[:nreq]
+        base = torch.randint(1, POSITIONS - pr - 1, (nreq,), generator=g, device=dev)
+        self.req.copy_(reqs.repeat_interleave(pr))
+        pos.copy_((base[:, None] + torch.arange(pr, device=dev)).flatten())
+        slots = torch.randperm(C_PAGES * C_BLOCK - 1, generator=g, device=dev)[:M] + 1
+        self.loc.copy_(2 * slots + (pos % 2 == 0))  # raw slots: >> 1 is the record
+        if trial % 2:
+            self.loc[-1] = 0
+        self.iloc.copy_(torch.where((pos + 1) % 2 == 0, self.loc >> 1, -1))
+        self.iloc[self.loc == 0] = 0
+        self.ring.copy_(torch.randn(self.ring.shape, generator=g, device=dev))
+        self.pool.fill_(255)
+        self.pay.zero_()
+        self.isc.zero_()
+
+    def outputs(self):
+        return [t.clone() for t in (self.pool, self.ring, self.pay, self.isc)]
+
+    def restore(self, ring0):
+        self.ring.copy_(ring0)
+        self.pool.fill_(255)
+        self.pay.zero_()
+        self.isc.zero_()
+
+    def reference(self, normed, pos, freqs, ring0):
+        """SGLang's chain on copies: (pool, ring, payload, scale)."""
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
+            index_k_norm_rope_pack_store_split,
+        )
+        from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
+            c2_decode_norm_rope_store,
+        )
+        from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
+
+        pool = torch.full_like(self.pool, 255)
+        ring = ring0.clone()
+        self.ring0 = ring0
+        pay, isc = torch.zeros_like(self.pay), torch.zeros_like(self.isc)
+        latent = c2_decode_norm_rope_store(
+            linear_bf16_fp32(normed, self.w), ring, self.nw, pos, self.req, self.loc,
+            self.eps, freqs, pool, page_size=C_BLOCK, ring_size=RING,
+            draft_len=self.per_req, layout="v4",
+        )  # fmt: skip
+        index_k_norm_rope_pack_store_split(
+            torch.nn.functional.linear(latent, self.wk), self.kn, self.keps, freqs, pos,
+            self.iloc, pay, isc, ratio=2,
+        )  # fmt: skip
+        return [pool, ring, pay, isc]
+
+    def records(self, pool):
+        """The dequantized V4 records [M, 512] at each completing row's slot."""
+        live = (self.iloc > 0).nonzero().flatten()
+        s = self.loc[live] >> 1
+        page, off = s // C_BLOCK, s % C_BLOCK
+        cols = off[:, None] * 576 + torch.arange(576, device=self.dev)
+        data = pool[page[:, None].expand_as(cols), cols]
+        scol = C_BLOCK * 576 + off[:, None] * 8 + torch.arange(7, device=self.dev)
+        sc = pool[page[:, None].expand_as(scol), scol].float() - 127
+        nope = data[:, :448].view(torch.float8_e4m3fn).float() * torch.exp2(
+            sc.repeat_interleave(64, 1)
+        )
+        rope = data[:, 448:].contiguous().view(torch.bfloat16).float()
+        return torch.cat([nope, rope], 1)
+
+    def keys(self, pay, isc):
+        """The dequantized index keys [rows, 128] at each completing row's slot."""
+        s = self.iloc[self.iloc > 0]
+        page, slot = s // PLANE, s % PLANE
+        b = pay[page, 0, :, slot, :].reshape(-1, 64).long()  # byte j: chunk j // 16
+        tab = torch.tensor(E2M1, device=self.dev)
+        val = lambda c: tab[c & 7] * (1 - 2 * ((c >> 3) & 1))  # noqa: E731
+        v = torch.stack([val(b & 15), val(b >> 4)], -1).reshape(-1, 128)
+        e = isc[page, 0, :, (slot % 16) * 4 + slot // 16].float() - 127
+        return v * torch.exp2(e).repeat_interleave(32, 1)
+
+    def compare(self, got, want) -> dict:
+        """cosine and differing fraction of records and keys, max rel of the ring."""
+        out = {}
+        for name, a, b in (
+            ("rec", self.records(got[0]), self.records(want[0])),
+            ("key", self.keys(got[2], got[3]), self.keys(want[2], want[3])),
+        ):
+            if b.numel() == 0:
+                out[name] = (1.0, 0.0)
+                continue
+            cos = torch.nn.functional.cosine_similarity(
+                a.flatten().double(), b.flatten().double(), dim=0
+            ).item()
+            out[name] = (cos, (a != b).float().mean().item())
+        d = (got[1] - want[1]).abs().max() / want[1].abs().max()
+        out["ring"] = d.item()
+        out["rows"] = int((self.iloc > 0).sum())
+        # the even rows' pairs parked, not left as they were
+        parked = (want[1] != self.ring0).any(1).sum()
+        out["parked"] = int(parked)
+        return out
+
+
+def time_launches(launch, reps: int, trials: int) -> float:
+    """Median us a launch over ``trials`` replays of a graph of ``reps`` launches."""
+    graph = torch.cuda.CUDAGraph()
+    launch()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        for _ in range(reps):
+            launch()
+    graph.replay()
+    torch.cuda.synchronize()
+    ts = []
+    for _ in range(max(trials, 5)):
+        e0, e1 = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+        e0.record()
+        graph.replay()
+        e1.record()
+        torch.cuda.synchronize()
+        ts.append(e0.elapsed_time(e1) * 1e3 / reps)
+    del graph
+    return sorted(ts)[len(ts) // 2]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--widths", default=WIDTHS)
@@ -160,6 +322,24 @@ def main():
     )
     # K1 reads wqkv and wq_b in aiter's (16, 16) preshuffle; the references keep row-major
     ap.add_argument("--shuffled", action="store_true")
+    ap.add_argument(
+        "--delays",
+        default="",
+        help="timing only: K1's us a launch under each delay slot:us:base:n "
+        "(``layer.parse_delay``; 0: none), comma separated, instead of the checks",
+    )
+    ap.add_argument("--sweep-variants", default="index,index:tp")
+    ap.add_argument("--reps", type=int, default=20, help="launches a timed graph")
+    ap.add_argument(
+        "--comp-per-req",
+        default="1,6",
+        help="the compressor variants' rows a request (1: decode, else static verify)",
+    )
+    ap.add_argument("--comp-k", type=int, default=1, help="the compressor's index keys too")
+    ap.add_argument(
+        "--iw-split", type=int, default=1,
+        help="the head weights split: 0 off, 1 on the compressor variants, 2 on every index one",
+    )
     args = ap.parse_args()
     rank, tp = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank)
@@ -183,8 +363,12 @@ def main():
 
     from sgl_amd_mono.deepseek_v41.gfx950.attention.index_query import fused as iq_fused
     from sgl_amd_mono.deepseek_v41.gfx950.layer import (
+        NO_COMP,
         MonoBuild,
         build_mono_k1,
+        comp_fits,
+        iw_split_fits,
+        parse_delay,
         scratch_layout,
     )
     from sgl_amd_mono.deepseek_v41.gfx950.runner import (
@@ -269,15 +453,38 @@ def main():
         for M, v, _ in list(runs)
         if v[0] in TOKEN_PAR_VARIANTS and token_par(M, tp)
     ]
+    # a KV source's compressor in K1, at the widths whose grid has its CTAs
+    runs += [
+        (M, (f"comp{pr}", True, True, False), tp_)
+        for M in widths
+        if M in variants_at
+        for pr in (int(v) for v in args.comp_per_req.split(","))
+        for tp_ in (False, True)
+        if (not tp_ or token_par(M, tp))
+        and (M // tp if tp_ else M) % pr == 0
+        and comp_fits(M, tp, tp_)
+    ]
+    freqs_il = torch.view_as_real(
+        torch.complex(cos_sin[:, :32], cos_sin[:, 32:])
+    ).flatten(-2).contiguous()  # fmt: skip
     for M, (vname, fold, index, first), tok_par in runs:
         ok, route = check_wqkv_route(M)
         route = r.route_at(M)
         tl = r.timeline_on
         iq = index and iq_fused(M, tok_par)
+        pr = int(vname[4:]) if vname.startswith("comp") else 0
+        # the split head weights on the compressor's layers (and "index:is" alone)
+        iws = bool(
+            args.iw_split and iq and (pr or args.iw_split == 2)
+            and iw_split_fits(M, tp, tok_par)
+        )  # fmt: skip
+        cc = CompCase(M, pr, dev, g) if pr else None
+        comp_args = cc.args(freqs_il) if pr else NO_COMP
         k1 = build_mono_k1(
             MonoBuild(
                 M, tp, fold=fold, index=index, timeline=tl, tok_par=tok_par, iq=iq,
-                shuffled=args.shuffled,
+                shuffled=args.shuffled, comp=pr, comp_k=bool(pr and args.comp_k),
+                iw_split=iws,
                 **route,
             )
         )  # fmt: skip
@@ -314,19 +521,51 @@ def main():
                 slot.data_ptr(), 1, swa.data_ptr(), swa.stride(0), BLOCK, 0, 0, 0, 0, 0, 0, r.q.data_ptr(),
                 r.normed.data_ptr(), r.qr.data_ptr(), kw["iq_w"].data_ptr(), iq_ws.data_ptr(),
                 iw_w.data_ptr(), iw_bits, cos_sin.shape[0], r.iq.data_ptr(),
-                r.iqs.data_ptr(), r.iw.data_ptr(), sc.data_ptr(),
+                r.iqs.data_ptr(), r.iw.data_ptr(), *comp_args, sc.data_ptr(),
                 r.peer.local, r.peer.addresses.data_ptr(), r.rank, r.epoch.data_ptr(),
                 stream=torch.cuda.current_stream(),
             )  # fmt: skip
 
+        if args.delays:
+            if vname not in args.sweep_variants.split(","):
+                continue
+            for spec in args.delays.split(","):
+                k1 = build_mono_k1(
+                    MonoBuild(
+                        M, tp, fold=fold, index=index, timeline=tl, tok_par=tok_par,
+                        iq=iq, shuffled=args.shuffled, comp=pr, comp_k=bool(pr and args.comp_k),
+                iw_split=iws,
+                        **parse_delay(spec), **route,
+                    )
+                )  # fmt: skip
+                if pr:
+                    cc.inputs(static[5], 0)
+                us = time_launches(launch, args.reps, args.trials)
+                span = ""
+                if tl:
+                    launch()
+                    torch.cuda.synchronize()
+                    span = " | " + k1_timeline(M, r.timeline(M).cpu()).split(";")[0]
+                if rank == 0:
+                    print(f"M={M:2d} {vname:8s} delay {spec:12s} K1 {us:7.2f} us a launch{span}", flush=True)  # fmt: skip
+            continue
+        if pr:
+            cc.inputs(pos, 0)
         launch()
         torch.cuda.synchronize()
-        if args.timeline and vname in ("fold", "fold:tp"):
+        if args.timeline and (
+            vname in ("fold", "fold:tp", "index", "index:tp") or pr
+        ):
             for _ in range(5):
                 launch()
             torch.cuda.synchronize()
             if rank == 0:
                 print(k1_timeline(M, r.timeline(M).cpu()), flush=True)
+                if os.environ.get("TL_SAVE_DIR"):
+                    torch.save(
+                        r.timeline(M).cpu(),
+                        f"{os.environ['TL_SAVE_DIR']}/k1_M{M}_{vname.replace(':', '_')}.pt",
+                    )
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             launch()
@@ -335,13 +574,31 @@ def main():
         )
         if iq:
             diff |= dict(iq=0, iqs=0, iw=0)
+        if pr:
+            diff |= dict(creplay=0)
+        cst = dict(rec=(1.0, 0.0), key=(1.0, 0.0), ring=0.0)
+        crows = [0, 0]
         mix, q_cos, q_rel, qr_rel = 0.0, 1.0, 0.0, 0.0
-        for _ in range(args.trials):
+        for trial in range(args.trials):
             for t, v in zip(static, inputs(M)):
                 t.copy_(v)
+            if pr:
+                cc.inputs(pos, trial)
+                ring0 = cc.ring.clone()
             swa.fill_(255)
             launch()
             torch.cuda.synchronize()
+            if pr:
+                comp_eager = cc.outputs()
+                want = cc.reference(r.normed[:M], pos, freqs_il, ring0)
+                got = cc.compare(comp_eager, want)
+                crows = [crows[0] + got.pop("rows"), crows[1] + got.pop("parked")]
+                cst = {
+                    k: (min(cst[k][0], got[k][0]), max(cst[k][1], got[k][1]))
+                    if k != "ring" else max(cst[k], got[k])
+                    for k in cst
+                }  # fmt: skip
+                cc.restore(ring0)
             o = lay["x8"][0]
             x8 = sc[o : o + n * HIDDEN].clone()
             o = lay["x8s"][0]
@@ -369,6 +626,10 @@ def main():
             swa.fill_(255)
             graph.replay()
             torch.cuda.synchronize()
+            if pr:
+                diff["creplay"] += sum(
+                    int((u != v).sum()) for u, v in zip(comp_eager, cc.outputs())
+                )
             replayed = [
                 t[:M] for t in (r.q, r.res_mid, r.post_a, r.comb_a, r.pre_a)
             ] + [records(swa, slot.long())]
@@ -489,6 +750,21 @@ def main():
             ["q"] if q_cos < Q_COS or q_rel > Q_REL else []
         )
         bad += ["qr"] if qr_rel > QR_REL else []
+        if pr:
+            # one fp4 / fp8 step flips where the GEMM's sum order moves a value across a
+            # rounding edge: a few elements off, the rows otherwise SGLang's
+            bad += ["comp rec"] if cst["rec"][0] < 0.999 or cst["rec"][1] > 0.02 else []
+            bad += ["comp key"] if cst["key"][0] < 0.99 or cst["key"][1] > 0.05 else []
+            bad += ["comp ring"] if cst["ring"] > 1e-4 else []
+            bad += ["comp rows"] if not (crows[0] and crows[1]) else []
+            if rank == 0:
+                print(
+                    f"M={M:2d} {vname:8s} compressor: record cos {cst['rec'][0]:.6f} "
+                    f"differing {cst['rec'][1]:.4f} | index key cos {cst['key'][0]:.6f} "
+                    f"differing {cst['key'][1]:.4f} | ring max rel {cst['ring']:.1e} | "
+                    f"{crows[0]} records, {crows[1]} ring rows parked",
+                    flush=True,
+                )
         if rank == 0:
             print(f"M={M:2d} {vname:7s} {'PASS' if not bad else 'FAIL ' + ','.join(bad)} | qr rel {qr_rel:.1e} | wqkv_a {route} | differing: "
                   f"{diff} | pre/post/comb max|d| {mix:.2e} (bound {MIX_TOL:.0e}) | q cos {q_cos:.7f} "

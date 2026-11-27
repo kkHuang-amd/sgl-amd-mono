@@ -530,9 +530,14 @@ def run_front(
     after_wqkv=None,
     before_wqb=None,
     qkv_first=0,
+    after_wqb=None,
+    prefetch=None,
 ):
     """Run the front's stages on this CTA; the seam publishes X8 before them.
-    ``qkv_first``: the first CTA of the q / kv norms."""
+    ``qkv_first``: the first CTA of the q / kv norms; ``after_wqb``: work past
+    wq_b and the index query's tiles, before the index quant; ``prefetch(seen)``:
+    loads to issue behind the wqkv's weights (``seen`` None), then behind its X8
+    rows (which return first; ``seen``: whether this CTA saw every row's XRDY)."""
     s = key.tokens
     # the wqkv GEMV takes all of K from X8, which the seam publishes
     assert x8_given
@@ -596,6 +601,8 @@ def run_front(
     kops = chain_loads(
         c, a["wqkv"], a["wqkv_s"], HIDDEN, task * ROWS, slots, has_wqkv, c["shuffled"]
     )
+    if const_expr(prefetch is not None):
+        prefetch(None)  # weights only: they land through the wait on the norms
     if const_expr(after_wqkv is not None):
         after_wqkv()
     # one token tile: the wq_b weights here on a CTA without a wqkv tile (the qkv stage's polls
@@ -649,6 +656,8 @@ def run_front(
         t0, n = wtiles[0]
         await_flags(c, c["xrdy"], WQKV_KPARTS * own, lambda u: u)
         regs = x_loads(t0, n)
+        if const_expr(prefetch is not None):
+            prefetch(True)  # every CTA saw every row's XRDY
         x_store(regs, n)
         accs = stage_wqkv(c, kops, slots, n, halves)
         wqkv_publish(
@@ -676,6 +685,8 @@ def run_front(
                     n,
                     has_wqkv,
                 )
+        if const_expr(prefetch is not None):
+            prefetch(False)  # a CTA saw its own tiles' XRDY only
         # the wq_b weights in flight through the wait on q
         bops = wqb_weights()
 
@@ -749,6 +760,8 @@ def run_front(
                 regs = rows_loads(c, *qx, *tiles[ti + 1])
             stage_wqb(c, wqb_task, bops, t0, n, ropes[ti])
             index_tile(ti, t0, n)
+    if const_expr(after_wqb is not None):
+        after_wqb()
     if const_expr(chains is not None):
         index_query.run_iquant(c, a, s)
     stamp(c, 39)

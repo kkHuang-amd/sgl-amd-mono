@@ -38,6 +38,7 @@ from sgl_amd_mono.common.stamps import TL_POINTS, stamp, timeline_row
 from sgl_amd_mono.common.sync import Mailbox, preg, publish, sreg
 
 from .attention import back as mb_back
+from .attention import compressor
 from .attention import front as mb_front
 from .attention import index_query
 from .attention.plan import (
@@ -103,6 +104,38 @@ class MonoBuild(msgspec.Struct, frozen=True):
     iq: bool = False
     # wqkv, wq_b and wo_b in SGLANG_ROCM_MXFP8_AITER_PRESHUFFLE's (16, 16) layout; wo_a row-major
     shuffled: bool = False
+    # SGLANG_AMD_MONO_DSV41_K1_DELAY (timing only): K1's CTAs delay_base .. + delay_n busy
+    # for delay_us at slot 1 (q's wait, past the gates) or 2 (past wq_b, before the index quant)
+    delay_slot: int = 0
+    delay_us: int = 0
+    delay_base: int = 0
+    delay_n: int = 0
+    # SGLANG_AMD_MONO_DSV41_FUSED_COMPRESSOR: an index source's ratio-2 compressor in K1
+    # (``attention.compressor``) on steps of ``comp`` rows a request (0: SGLang's, after K1)
+    comp: int = 0
+    comp_k: bool = False  # and its index keys, where the layer owns them
+    # SGLANG_AMD_MONO_DSV41_IW_SPLIT: the index head weights a (tile, split) a CTA, summed
+    # in the tail (``index_query.run_iw_split``), not a tile's every split on one CTA
+    iw_split: bool = False
+
+
+# K1's compressor arguments (``attention.compressor``), 0 where the launch has none
+COMP_ARGS64 = (
+    "comp_w", "comp_nw", "comp_freqs", "comp_req", "comp_loc", "comp_iloc", "comp_ring",
+    "comp_pool", "comp_pool_stride", "comp_wk", "comp_kn", "comp_ipay", "comp_iscale",
+)  # fmt: skip
+COMP_ARGS32 = ("comp_loc_words", "comp_ring_size", "comp_block", "comp_eps", "comp_keps")
+NO_COMP = (0,) * (len(COMP_ARGS64) + len(COMP_ARGS32))
+
+
+def parse_delay(spec: str) -> dict:
+    """``slot:us:base:n`` -> MonoBuild's delay fields ("" or "0": none)."""
+    if spec in ("", "0"):
+        return {}
+    slot, us, base, n = (int(v) for v in spec.split(":"))
+    if slot not in (1, 2) or us < 0 or not 0 <= base < BLOCKS or not 0 < n <= BLOCKS:
+        raise ValueError(f"K1 delay is slot(1|2):us:base:n, got {spec!r}")
+    return dict(delay_slot=slot, delay_us=us, delay_base=base, delay_n=n)
 
 
 ROUTE = ("experts", "topk", "ug_groups", "swa_width")
@@ -122,6 +155,14 @@ def _variant(key: MonoBuild) -> dict:
         | ({"tl": 1} if key.timeline else {})
         | ({"p": 1} if key.tok_par else {})
         | ({"sh": 1} if key.shuffled else {})
+        | ({"c": key.comp} if key.comp else {})
+        | ({"ck": 1} if key.comp_k else {})
+        | ({"is": 1} if key.iw_split else {})
+        | (
+            {"dl": f"{key.delay_slot}x{key.delay_us}x{key.delay_base}x{key.delay_n}"}
+            if key.delay_slot
+            else {}
+        )
     )
 
 
@@ -166,6 +207,8 @@ def scratch_layout(s: int, tp: int, timeline: bool = False, **route) -> dict:
     place({n: (o - lo, n_) for n, (o, n_) in mr.items()})
     place({"normed": (0, s * HIDDEN * 2), "xrdy_moe": (s * HIDDEN * 2 + 256, s * 8)})
     place({"krdy": (0, s * 8)})  # an index source's key table, a flag a token
+    place(compressor.comp_scratch(s))
+    place(index_query.iw_scratch(s))
     if timeline:
         place({"timeline": (0, BLOCKS * TL_POINTS * 8)})
     return out
@@ -222,17 +265,63 @@ def publish_x8(c, t):
     gpu.barrier()
 
 
+@flyc.jit
+def spin_ctas(bid, base, n, us):
+    """Timing only: CTAs base .. base + n stay busy for ``us`` microseconds."""
+    if first_task(bid, base) < n:
+        t0 = guard.clock()
+        while (guard.clock() - t0) < fx.Int64(us * (guard.CLOCK_HZ // 1_000_000)):
+            rocdl.s_sleep(1)
+    gpu.barrier()
+
+
+def k1_ctas(s: int, tp: int, tok_par: bool, iq: bool) -> dict:
+    """K1's first CTAs of the norms, gates, head weights, qkv and the compressor's rows."""
+    # token parallel: the seam, wqkv and qkv on this rank's rows
+    own_n = s // tp if tok_par else s
+    # the norms past the slices' CTAs (the wqkv waits on them), and past a split wqkv's
+    NORM0 = 2 * WQKV_TASKS if wqkv_split(s, own_n) else SLICES
+    GATE0 = NORM0 + own_n
+    IW0 = (GATE0 + own_n) % BLOCKS  # the head weights' CTAs, past the gates'
+    iw = 2 * -(-own_n // 16) if iq else 0
+    QKV0 = IW0 + iw if GATE0 + 2 * own_n + iw <= BLOCKS else 0
+    # ``iw_split``: the split head weights just below the norms' CTAs, summed past the
+    # compressor's rows
+    iws = 2 * -(-own_n // 16) * index_query.IW_SPLITS
+    return dict(
+        own_n=own_n, NORM0=NORM0, GATE0=GATE0, IW0=IW0, iw=iw, QKV0=QKV0,
+        FIN0=QKV0 + own_n, IWS0=NORM0 - iws, RED0=QKV0 + 2 * own_n,
+    )  # fmt: skip
+
+
+def iw_split_fits(s: int, tp: int, tok_par: bool) -> bool:
+    """Whether an s-row index source's K1 has the split head weights' CTAs."""
+    if not index_query.fused(s, tok_par):
+        return False
+    k = k1_ctas(s, tp, tok_par, True)
+    return k["QKV0"] > 0 and k["RED0"] < BLOCKS and k["IWS0"] >= compressor.GEMM_TASKS
+
+
+def comp_fits(s: int, tp: int, tok_par: bool, iq: bool | None = None) -> bool:
+    """Whether an s-row index source's K1 (``iq``: with its index query; None: where
+    fused) has the compressor's CTAs: its GEMM's on CTAs 0 .., its rows' past the qkv
+    CTAs."""
+    k = k1_ctas(s, tp, tok_par, index_query.fused(s, tok_par) if iq is None else iq)
+    return (
+        k["GATE0"] + k["own_n"] <= BLOCKS
+        and k["QKV0"] > 0
+        and compressor.GEMM_TASKS <= k["FIN0"] < BLOCKS
+    )
+
+
 def build_mono_k1(key: MonoBuild):
     s, tp = key.tokens, key.tp
     assert 1 <= s <= MAX_TOKENS
     layout = scratch_layout(s, tp, key.timeline, **route_of(key))
     fkey = _front_key(key)
     FrontLds = mb_front.front_lds(s, Dims(tp))
-    # token parallel: the seam, wqkv and qkv on this rank's rows
-    own_n = s // tp if key.tok_par else s
-    # the norms past the slices' CTAs (the wqkv waits on them), and past a split wqkv's
-    NORM0 = 2 * WQKV_TASKS if wqkv_split(s, own_n) else SLICES
-    GATE0 = NORM0 + own_n
+    ctas = k1_ctas(s, tp, key.tok_par, key.iq)
+    own_n, NORM0, GATE0 = ctas["own_n"], ctas["NORM0"], ctas["GATE0"]
     assert GATE0 + own_n <= BLOCKS
 
     @fx.struct
@@ -248,9 +337,16 @@ def build_mono_k1(key: MonoBuild):
 
     # the index query here (``index_query``) only where it is reproduced
     assert not key.iq or (key.index and index_query.fused(s, key.tok_par)), key
-    IW0 = (GATE0 + own_n) % BLOCKS  # the head weights' CTAs, past the gates'
-    iw = 2 * -(-own_n // 16) if key.iq else 0
-    QKV0 = IW0 + iw if GATE0 + 2 * own_n + iw <= BLOCKS else 0
+    IW0, QKV0 = ctas["IW0"], ctas["QKV0"]
+    # the compressor's GEMM on CTAs 0 .., its rows' finish on the CTAs past the qkv's
+    FIN0 = ctas["FIN0"]
+    NFIN = BLOCKS - FIN0
+    # token parallel: the other ranks' compressor rows past the window copies' CTAs
+    COMP_FROM0 = 2 * MAX_TOKENS
+    assert not key.comp or (key.index and comp_fits(s, tp, key.tok_par, key.iq)), key
+    assert not key.comp or not key.tok_par or own_n % key.comp == 0, key
+    assert not key.iw_split or (key.iq and iw_split_fits(s, tp, key.tok_par)), key
+    IWS0, RED0 = ctas["IWS0"], ctas["RED0"]
     name = kernel_symbol(
         "dsv41_mono_k1",
         s=s,
@@ -311,6 +407,24 @@ def build_mono_k1(key: MonoBuild):
         iq_out: Int64,
         iqs_out: Int64,
         iw_out: Int64,
+        comp_w: Int64,
+        comp_nw: Int64,
+        comp_freqs: Int64,
+        comp_req: Int64,
+        comp_loc: Int64,
+        comp_iloc: Int64,
+        comp_ring: Int64,
+        comp_pool: Int64,
+        comp_pool_stride: Int64,
+        comp_wk: Int64,
+        comp_kn: Int64,
+        comp_ipay: Int64,
+        comp_iscale: Int64,
+        comp_loc_words: Int32,
+        comp_ring_size: Int32,
+        comp_block: Int32,
+        comp_eps: Int32,
+        comp_keps: Int32,
         scratch: Int64,
         sym: Int64,
         peers: Int64,
@@ -370,10 +484,37 @@ def build_mono_k1(key: MonoBuild):
                 "iqs_out": iqs_out,
                 "iw_out": iw_out,
             }
+            if const_expr(key.comp):
+                fargs |= {
+                    "comp_w": comp_w,
+                    "comp_nw": comp_nw,
+                    "comp_freqs": comp_freqs,
+                    "comp_req": comp_req,
+                    "comp_loc": comp_loc,
+                    "comp_iloc": comp_iloc,
+                    "comp_ring": comp_ring,
+                    "comp_pool": comp_pool,
+                    "comp_pool_stride": comp_pool_stride,
+                    "comp_wk": comp_wk,
+                    "comp_kn": comp_kn,
+                    "comp_ipay": comp_ipay,
+                    "comp_iscale": comp_iscale,
+                    "comp_loc_words": comp_loc_words,
+                    "comp_ring_size": comp_ring_size,
+                    "comp_block": comp_block,
+                    "comp_eps": comp_eps.bitcast(fx.Float32),
+                    "comp_keps": comp_keps.bitcast(fx.Float32),
+                }
             flayout = {n: layout[n] for n in front_scratch(s, Dims(tp))}
             c = mb_front.front_context(
                 fkey, lds.front.peek(), fargs, scratch, tag, flayout
             )
+            if const_expr(key.comp):
+                for region in ("cpart", "cprdy"):
+                    c[region] = scratch + fx.Int64(layout[region][0])
+            if const_expr(key.iw_split):
+                for region in ("iwp", "iwr"):
+                    c[region] = scratch + fx.Int64(layout[region][0])
             c["index"] = key.index
             if const_expr(key.iq):
                 c["iq_chains"] = index_query.iq_chains(s)
@@ -431,6 +572,10 @@ def build_mono_k1(key: MonoBuild):
                 bases = [b + par for b in peer_bases(peers, tp)]
                 pl = peer_offsets(s, tp)
                 mb_front.token_par_context(c, own_n, t0, rank, bases, sym + par, pl)
+                if const_expr(key.comp):
+                    regions = ("crg", "cpg", "cig")
+                    c["comp_dsts"] = {r: [preg(b, pl[r], r) for b in bases] for r in regions}
+                    c["comp_srcs"] = {r: preg(sym + par, pl[r], r) for r in regions}
 
             def seam_slice():
                 stamp(c, 32)
@@ -461,13 +606,67 @@ def build_mono_k1(key: MonoBuild):
                     seam.stage_gate(ca, t)
                 if const_expr(key.iq):
                     # the head weights fill the same wait: the wqkv's LDS is free by now
-                    push = None
+                    if const_expr(key.iw_split):
+                        index_query.run_iw_split(c, c["args"], own_n, IWS0, t0)
+                    else:
+                        index_query.run_iw(
+                            c, c["args"], own_n, IW0, c["xl"], t0, iw_push()
+                        )
+                if const_expr(key.comp):
+                    # read past this launch only: the GEMM fills q's wait too
+                    compressor.run_gemm(c, c["args"], own_n, t0, 0, early["comp_w"])
+                    # the rows' wk operands in flight through wq_b
+                    early["wk"] = (
+                        compressor.wk_weights(c, c["args"], FIN0, NFIN)
+                        if key.comp_k
+                        else None
+                    )
                     if const_expr(key.tok_par):
-                        cp = {"put_bf": amb.put_bf, "rank": rank, "d": ca["d"]}
-                        push = lambda row, h, w0, w1: push_head_pair(  # noqa: E731
+                        # the tail waits on the gathers: the rows (and their pushes)
+                        # here, where the CTAs past the qkv's wait on q longest
+                        finish()
+                if const_expr(key.delay_slot == 1):
+                    spin_ctas(bid, key.delay_base, key.delay_n, key.delay_us)
+
+            def iw_push():
+                """Token parallel: a head pair on to the other ranks' IWG."""
+                cp = {"put_bf": amb.put_bf, "rank": rank, "d": ca["d"]}
+                return (
+                    (
+                        lambda row, h, w0, w1: push_head_pair(
                             cp, bases, pl["iwg"], row, h, [w0, w1]
                         )
-                    index_query.run_iw(c, c["args"], own_n, IW0, c["xl"], t0, push)
+                    )
+                    if key.tok_par
+                    else None
+                )
+
+            def finish():
+                compressor.run_finish(
+                    c, c["args"], own_n, t0, FIN0, NFIN, key.comp, early["wk"]
+                )
+
+            def tail():
+                if const_expr(key.iw_split):
+                    index_query.run_iw_reduce(
+                        c, c["args"], own_n, RED0, BLOCKS - RED0, t0, iw_push()
+                    )
+                if const_expr(key.comp and not key.tok_par):
+                    # past their wq_b, which every CTA runs: the rows wait on the GEMM
+                    finish()
+                if const_expr(key.delay_slot == 2):
+                    spin_ctas(bid, key.delay_base, key.delay_n, key.delay_us)
+
+            early = {}
+
+            def prefetch(seen):
+                if const_expr(seen is None):
+                    early["w"] = compressor.gemm_weights(c, c["args"], 0)
+                else:
+                    rows = None
+                    if const_expr(seen):
+                        rows = compressor.gemm_rows(c, c["args"], 0, own_n, t0)
+                    early["comp_w"] = (early["w"], rows)
 
             mb_front.run_front(
                 c,
@@ -477,6 +676,10 @@ def build_mono_k1(key: MonoBuild):
                 before_wqkv=seam_slice,
                 after_wqkv=seam_norm,
                 before_wqb=seam_gate,
+                after_wqb=tail
+                if key.comp or key.iw_split or key.delay_slot == 2
+                else None,
+                prefetch=prefetch if key.comp else None,
                 # past the slices, norms and gates where the grid has room: a slice CTA
                 # issues its weights after its slice, and the norms' publish (vmcnt(0))
                 # waited for them to land
@@ -493,6 +696,11 @@ def build_mono_k1(key: MonoBuild):
                             mb_front.qr_from(c, preg(own, pl["qrg"], "qrg"), t)
                         if const_expr(key.iq):
                             index_query.iw_from(c, preg(own, pl["iwg"], "iwg"), t)
+                if const_expr(key.comp):
+                    # the other ranks' compressor rows, on CTAs past the copies above
+                    for t in range(first_task(bid, COMP_FROM0), s, BLOCKS):
+                        if t // own_n != rank:
+                            compressor.comp_from(c, c["args"], t, key.comp_k)
             stamp(c, 40)
 
     @flyc.jit
@@ -542,6 +750,24 @@ def build_mono_k1(key: MonoBuild):
         iq_out: Int64,
         iqs_out: Int64,
         iw_out: Int64,
+        comp_w: Int64,
+        comp_nw: Int64,
+        comp_freqs: Int64,
+        comp_req: Int64,
+        comp_loc: Int64,
+        comp_iloc: Int64,
+        comp_ring: Int64,
+        comp_pool: Int64,
+        comp_pool_stride: Int64,
+        comp_wk: Int64,
+        comp_kn: Int64,
+        comp_ipay: Int64,
+        comp_iscale: Int64,
+        comp_loc_words: Int32,
+        comp_ring_size: Int32,
+        comp_block: Int32,
+        comp_eps: Int32,
+        comp_keps: Int32,
         scratch: Int64,
         sym: Int64,
         peers: Int64,
@@ -596,6 +822,24 @@ def build_mono_k1(key: MonoBuild):
             iq_out,
             iqs_out,
             iw_out,
+            comp_w,
+            comp_nw,
+            comp_freqs,
+            comp_req,
+            comp_loc,
+            comp_iloc,
+            comp_ring,
+            comp_pool,
+            comp_pool_stride,
+            comp_wk,
+            comp_kn,
+            comp_ipay,
+            comp_iscale,
+            comp_loc_words,
+            comp_ring_size,
+            comp_block,
+            comp_eps,
+            comp_keps,
             scratch,
             sym,
             peers,
