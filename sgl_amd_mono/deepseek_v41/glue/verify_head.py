@@ -52,7 +52,7 @@ SGLANG_READS = {
         "TargetVerifyExecutor",
         "accept_and_finalize",
         "verify_epilogue",
-        "folded_accept",
+        "TargetVerifyExecutor.accept_and_finalize(folded_accept)",
     ),
     "srt/speculative/dspark_components/dspark_draft.py": (
         "DraftBlockResult",
@@ -74,7 +74,7 @@ SGLANG_READS = {
         "need_top_k_sampling",
         "need_top_p_sampling",
         "need_min_p_sampling",
-        "has_watermark_candidates",
+        "watermark",
         "sampling_mask_batch_indices",
     ),
 }
@@ -182,7 +182,7 @@ class _Head:
         info = sampling_info
         if info.is_any_greedy or info.need_top_k_sampling or info.need_top_p_sampling:
             return "greedy rows or top-k / top-p"
-        if info.need_min_p_sampling or info.has_watermark_candidates:
+        if info.need_min_p_sampling or info.watermark is not None:
             return "min-p or watermark"
         if info.sampling_mask_batch_indices is not None:
             return "sampling masks"
