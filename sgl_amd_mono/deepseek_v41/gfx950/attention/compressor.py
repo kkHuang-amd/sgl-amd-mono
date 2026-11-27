@@ -19,8 +19,9 @@ hipBLASLt's GEMMs."""
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, gpu
 from flydsl.expr import math as fmath
+from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.epoch import gstore
@@ -51,7 +52,9 @@ TILES = COLS // 16
 KSPLITS = 3
 GEMM_TASKS = TILES * KSPLITS  # 192
 STEPS = HIDDEN // 32  # 32-K MFMA steps
-WAVE_STEPS = -(-(-(-STEPS // KSPLITS)) // WAVES)  # a wave's steps of a split, the last masked
+WAVE_STEPS = -(
+    -(-(-STEPS // KSPLITS)) // WAVES
+)  # a wave's steps of a split, the last masked
 ROPE_D = DIM - NOPE  # 64
 IDX = 128  # an index key
 FT = DIM // 2  # the finish threads, two dims each (flash_c2_decode_kernel's CTA)
@@ -98,7 +101,11 @@ def _x_loads(c, a, lo, rows, t0, nb=0xFFFFFFFF):
                 fx.Vector(
                     bo.buffer_load(
                         rsrc(a["normed_out"], nb),
-                        (plus(t0, fx.min(rt * 16 + c["lane"] % 16, rows - 1)) * HIDDEN + k)
+                        (
+                            plus(t0, fx.min(rt * 16 + c["lane"] % 16, rows - 1))
+                            * HIDDEN
+                            + k
+                        )
                         // 2,
                         vec_width=4,
                         dtype=T.i32,
@@ -212,7 +219,9 @@ def _pair(c, row, col):
 
 def _ring_pair(a, rrow, col):
     v = fx.Vector(
-        bo.buffer_load(rsrc(a["comp_ring"]), rrow * COLS + col, vec_width=2, dtype=T.f32)
+        bo.buffer_load(
+            rsrc(a["comp_ring"]), rrow * COLS + col, vec_width=2, dtype=T.f32
+        )
     )
     return [v[0], v[1]]
 
@@ -286,19 +295,26 @@ def stage_index_key(c, a, L, wks):
             bf16_round(fma(tail[0], fim, tail[1] * fre)),
         ]
         for h in range_constexpr(2):
-            amax = butterfly(fx.max(abs(data[2 * h]), abs(data[2 * h + 1])), (1, 2, 4, 8), fx.max)
+            amax = butterfly(
+                fx.max(abs(data[2 * h]), abs(data[2 * h + 1])), (1, 2, 4, 8), fx.max
+            )
             e = ceil_exp(fx.max(amax, fx.Float32(FP4_AMAX_FLOOR)) * fx.Float32(INV6))
             scale, sinv = _pow2_bits(e), _pow2_bits(254 - e)
             data[2 * h] = _fake_fp4(data[2 * h], scale, sinv)
             data[2 * h + 1] = _fake_fp4(data[2 * h + 1], scale, sinv)
         bytes_, exps = [], []
         for h in range_constexpr(2):
-            amax = butterfly(fx.max(abs(data[2 * h]), abs(data[2 * h + 1])), (1, 2, 4, 8), fx.max)
-            sf = fx.max(div_rn(amax, fx.Float32(6.0), fx.Float32(INV6)), fx.Float32(1.0e-4))
+            amax = butterfly(
+                fx.max(abs(data[2 * h]), abs(data[2 * h + 1])), (1, 2, 4, 8), fx.max
+            )
+            sf = fx.max(
+                div_rn(amax, fx.Float32(6.0), fx.Float32(INV6)), fx.Float32(1.0e-4)
+            )
             se = fx.min(fx.max(ceil_exp(sf), fx.Int32(1)), fx.Int32(254))
             sinv = _pow2_bits(254 - se)
             bytes_.append(
-                _e2m1_code(data[2 * h] * sinv) | (_e2m1_code(data[2 * h + 1] * sinv) << 4)
+                _e2m1_code(data[2 * h] * sinv)
+                | (_e2m1_code(data[2 * h + 1] * sinv) << 4)
             )
             exps.append(se)
         if (lane < 32) & (iloc > 0):
@@ -353,7 +369,9 @@ def finish_loads(c, a, t, t0, per_req, owns_k):
             for i in (2 * lane32, 2 * lane32 + 1, IDX // 2 + 2 * lane32, IDX // 2 + 2 * lane32 + 1)
         ]  # fmt: skip
         ifb = (pos & fx.Int32(-2)) * ROPE_D + 2 * lane32
-        L |= dict(ifre=ld_f32(a["comp_freqs"], ifb), ifim=ld_f32(a["comp_freqs"], ifb + 1))
+        L |= dict(
+            ifre=ld_f32(a["comp_freqs"], ifb), ifim=ld_f32(a["comp_freqs"], ifb + 1)
+        )
     return L
 
 
@@ -408,9 +426,7 @@ def stage_finish(c, a, t, t0, per_req, wks):
             fx.ptr_load(red + 3)
         )
         nf = hw_rsq(tot * fx.Float32(1.0 / DIM) + a["comp_eps"])
-        out = [
-            bf16_round((stg[i] * nf) * L["nw"][i]) for i in range(2)
-        ]
+        out = [bf16_round((stg[i] * nf) * L["nw"][i]) for i in range(2)]
         if mine:
             for i in range_constexpr(2):
                 fx.ptr_store(out[i].bitcast(fx.Int32), lds + (LAT + d0 + i))
@@ -432,7 +448,9 @@ def stage_finish(c, a, t, t0, per_req, wks):
         amax = butterfly(fx.max(abs(v[0]), abs(v[1])), (1, 2, 4, 8, 16), fx.max)
         rcode = ceil_exp(
             div_rn(
-                fx.max(amax, fx.Float32(1e-4)), fx.Float32(448.0), fx.Float32(1.0 / 448.0)
+                fx.max(amax, fx.Float32(1e-4)),
+                fx.Float32(448.0),
+                fx.Float32(1.0 / 448.0),
             )
         )
         inv = mx_mul(rcode)
@@ -443,7 +461,9 @@ def stage_finish(c, a, t, t0, per_req, wks):
         )
         out_loc = loc >> 1
         blk = a["comp_block"]
-        base = a["comp_pool"] + fx.Int64(out_loc // blk) * fx.Int64(a["comp_pool_stride"])
+        base = a["comp_pool"] + fx.Int64(out_loc // blk) * fx.Int64(
+            a["comp_pool_stride"]
+        )
         off = out_loc % blk
         rec = base + fx.Int64(off * DATA)
         if mine & (tx % 32 == 0) & (tx < NOPE_T):
@@ -537,12 +557,16 @@ def comp_from(c, a, t, owns_k):
     if live & ((pos & 1) == 1):
         out_loc = loc >> 1
         blk = a["comp_block"]
-        base = a["comp_pool"] + fx.Int64(out_loc // blk) * fx.Int64(a["comp_pool_stride"])
+        base = a["comp_pool"] + fx.Int64(out_loc // blk) * fx.Int64(
+            a["comp_pool_stride"]
+        )
         off = out_loc % blk
         if tid < REC_WORDS:
             (w,) = c["mb"].poll([(src["cpg"], t * REC_WORDS + tid, 1)])
             data = tid < DATA // 4
-            at = data.select(off * DATA + 4 * tid, blk * DATA + off * 8 + 4 * (tid - DATA // 4))
+            at = data.select(
+                off * DATA + 4 * tid, blk * DATA + off * 8 + 4 * (tid - DATA // 4)
+            )
             gstore(base + fx.Int64(at), w[0], words=1)
         if const_expr(owns_k):
             iloc = ld_i32(a["comp_iloc"], 2 * t)

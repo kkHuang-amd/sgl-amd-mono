@@ -23,7 +23,9 @@ QX_WORDS = Q_RANK // 4  # the q latent's e4m3 words
 QX_GROUPS = Q_RANK // 32
 KG_WORDS = DATA // 4 + 2  # a window record's data words, then its two scale words
 COMP_RING_WORDS = 1024  # a ring pair: kv, then score (f32)
-COMP_KEY_WORDS = 34  # an index key: 32 (head byte, tail byte) words, then 2 exponent words
+COMP_KEY_WORDS = (
+    34  # an index key: 32 (head byte, tail byte) words, then 2 exponent words
+)
 LINE = 128  # every peer region starts on a cache line
 
 # a row's bytes in each per-row seam argument (``own_view``)

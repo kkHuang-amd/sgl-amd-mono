@@ -166,7 +166,9 @@ class CompCase:
         self.kn = (torch.rand(128, generator=g, device=dev) + 0.5).to(bf)
         self.eps, self.keps = 1e-6, 1e-6
         self.stride = KVLayout.V4.page_bytes(C_BLOCK)
-        self.pool = torch.full((C_PAGES, self.stride), 255, dtype=torch.uint8, device=dev)
+        self.pool = torch.full(
+            (C_PAGES, self.stride), 255, dtype=torch.uint8, device=dev
+        )
         self.ring = torch.empty(REQS * RING, 1024, dtype=torch.float32, device=dev)
         self.pay = torch.zeros(C_PAGES, 1, 4, PLANE, 16, dtype=torch.uint8, device=dev)
         self.isc = torch.zeros(C_PAGES, 1, 4, PLANE, dtype=torch.uint8, device=dev)
@@ -335,9 +337,13 @@ def main():
         default="1,6",
         help="the compressor variants' rows a request (1: decode, else static verify)",
     )
-    ap.add_argument("--comp-k", type=int, default=1, help="the compressor's index keys too")
     ap.add_argument(
-        "--iw-split", type=int, default=1,
+        "--comp-k", type=int, default=1, help="the compressor's index keys too"
+    )
+    ap.add_argument(
+        "--iw-split",
+        type=int,
+        default=1,
         help="the head weights split: 0 off, 1 on the compressor variants, 2 on every index one",
     )
     args = ap.parse_args()
@@ -553,9 +559,7 @@ def main():
             cc.inputs(pos, 0)
         launch()
         torch.cuda.synchronize()
-        if args.timeline and (
-            vname in ("fold", "fold:tp", "index", "index:tp") or pr
-        ):
+        if args.timeline and (vname in ("fold", "fold:tp", "index", "index:tp") or pr):
             for _ in range(5):
                 launch()
             torch.cuda.synchronize()

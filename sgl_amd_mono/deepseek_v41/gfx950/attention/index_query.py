@@ -356,9 +356,7 @@ def run_iw_split(c, a, rows, base, row0=0):
         gpu.barrier()
         if tid < 256:
             v = fx.ptr_load(lds + (sp * 256 + tid)).bitcast(fx.Float32)
-            bo.buffer_store(
-                v, rsrc(c["iwp"]), task * 256 + tid, cache_modifier=CM_DEV
-            )
+            bo.buffer_store(v, rsrc(c["iwp"]), task * 256 + tid, cache_modifier=CM_DEV)
         from .front import publish
 
         publish(c, c["iwr"], task)
@@ -377,7 +375,9 @@ def run_iw_reduce(c, a, rows, base, n_ctas, row0=0, push=None):
             n = fx.min(fx.Int32(16), rows - t0)
             ht = pair % 2
             if tid < IW_SPLITS:
-                c["mb"].poll([(c["iwr"], pair * IW_SPLITS + fx.min(tid, IW_SPLITS - 1), 1)])
+                c["mb"].poll(
+                    [(c["iwr"], pair * IW_SPLITS + fx.min(tid, IW_SPLITS - 1), 1)]
+                )
             gpu.barrier()
             if tid < n * 8:
                 r, h = tid // 8, 2 * (tid % 8)
@@ -402,7 +402,9 @@ def run_iw_reduce(c, a, rows, base, n_ctas, row0=0, push=None):
                     .bitcast(fx.Int32)[0]
                 )
                 row = plus(row0, plus(t0, r))
-                bo.buffer_store(word, rsrc(a["iw_out"]), (row * HEADS + 16 * ht + h) // 2)
+                bo.buffer_store(
+                    word, rsrc(a["iw_out"]), (row * HEADS + 16 * ht + h) // 2
+                )
                 if const_expr(push is not None):
                     push(row, 16 * ht + h, ws[0], ws[1])
             gpu.barrier()

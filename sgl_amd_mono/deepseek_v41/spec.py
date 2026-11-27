@@ -915,9 +915,16 @@ def _comp_bind(L, meta, req, pool):
     reasons = []
     if pool.uniform_fp8 or pool.get_extra_key_layout(L.i) != KVLayout.V4:
         reasons.append("the compressed cache is not V4")
-    if not (ring.dtype == torch.float32 and ring.is_contiguous() and ring.shape[-1] == 1024):
+    if not (
+        ring.dtype == torch.float32 and ring.is_contiguous() and ring.shape[-1] == 1024
+    ):
         reasons.append(f"a ring of {tuple(ring.shape)} {ring.dtype}")
-    if iloc is None or iloc.dtype != torch.int64 or raw is None or not raw.is_contiguous():
+    if (
+        iloc is None
+        or iloc.dtype != torch.int64
+        or raw is None
+        or not raw.is_contiguous()
+    ):
         reasons.append("no int64 c2_out_loc / raw_out_loc")
     wk = cw.get("wk")
     if wk is not None and not (
@@ -928,7 +935,9 @@ def _comp_bind(L, meta, req, pool):
         reasons.append("the index keys are not in the 64-row split FP4 plane")
     if reasons:
         logger.warning(
-            "monokernel: layer %d keeps SGLang's compressor: %s", L.i, "; ".join(reasons)
+            "monokernel: layer %d keeps SGLang's compressor: %s",
+            L.i,
+            "; ".join(reasons),
         )
         return None
     pay = scale = None
@@ -1037,7 +1046,9 @@ def _select(
     if ranges is not None and runner.index_exchange is not None:
         runner.index_exchange(raw_idx, page_idx, ranges)
         if ref is not None:
-            runner.index_exchange.compare((raw_idx, page_idx), ref, M, ranges[runner.rank])
+            runner.index_exchange.compare(
+                (raw_idx, page_idx), ref, M, ranges[runner.rank]
+            )
 
 
 def _select_rows(
@@ -1065,7 +1076,8 @@ def _select_rows(
         # the candidate source's blocks of this step, for the layers after it
         candidates=plan.state[tag + "k2i candidates"] if kind == "reindex" else None,
         # the step's REINDEX layers share one table (same blocks, page table, bounds)
-        reindex_table_built=kind == "reindex" and (tag + "k2i reindex", r) in plan.state,
+        reindex_table_built=kind == "reindex"
+        and (tag + "k2i reindex", r) in plan.state,
     )
     if kind == "reindex":
         plan.state[tag + "k2i reindex", r] = True

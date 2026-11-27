@@ -113,14 +113,18 @@ class _Head:
         assert self.max_bs <= head.MAX_BS and self.slots <= head.MAX_SLOTS
         self.padded = int(getattr(lm_head, "num_embeddings_per_partition", self.width))
         f32 = dict(dtype=torch.float32, device=device)
-        self.part = torch.empty(head.part_words(self.max_bs, self.slots, self.width), **f32)
+        self.part = torch.empty(
+            head.part_words(self.max_bs, self.slots, self.width), **f32
+        )
         self.temps = torch.zeros(self.max_bs, **f32)
         self.sim_temps = torch.zeros(self.max_bs, **f32)
         self.draft = torch.zeros(self.max_bs, self.slots - 1, self.padded, **f32)
         # the head reads the draft's logits where they are: their address, kept alive in _draft_ref
         self._draft_ptr = self.draft.data_ptr()
         self._draft_ref = self.draft
-        self.draft_addr = torch.full((1,), self._draft_ptr, dtype=torch.int64, device=device)
+        self.draft_addr = torch.full(
+            (1,), self._draft_ptr, dtype=torch.int64, device=device
+        )
         self.key = torch.zeros(1, dtype=torch.int64, device=device)
         self.offset = torch.zeros(1, dtype=torch.int64, device=device)
         self._key = None
@@ -150,14 +154,19 @@ class _Head:
         )  # fmt: skip
         return e.gated_commit_lens_buf[:bs] if gated else None
 
-    def serves(self, sampling_info, draft_block, block_verification: bool) -> str | None:
+    def serves(
+        self, sampling_info, draft_block, block_verification: bool
+    ) -> str | None:
         """Why the head cannot take this all-sampled step, or None."""
         if block_verification:
             return "block verification"
         if draft_block.greedy_draft or draft_block.noise is None:
             return "a greedy draft"
         shard = draft_block.vocab_shard
-        if shard is None or (int(shard.start), int(shard.width)) != (self.start, self.width):
+        if shard is None or (int(shard.start), int(shard.width)) != (
+            self.start,
+            self.width,
+        ):
             return "the draft's vocab is not this head's shard"
         logits = draft_block.corrected_logits
         if (
@@ -356,14 +365,23 @@ def _accept_and_finalize(orig, self, **kw):
     eager accept on the same logits, compared with the head's."""
     got = orig(self, **kw)
     epi = self.verify_epilogue
-    if not kw["folded_accept"] or _CHECK["left"] <= 0 or epi is None or _head(epi) is None:
+    if (
+        not kw["folded_accept"]
+        or _CHECK["left"] <= 0
+        or epi is None
+        or _head(epi) is None
+    ):
         return got
     if getattr(epi, "shard_step", False):
         return got  # SGLang's eager accept reads full logits
     _CHECK["left"] -= 1
     want = orig(self, **{**kw, "folded_accept": False})
     names = ("correct_len", "bonus", "commit_lens", "new_seq_lens", "out_tokens")
-    bad = [n for n in names if not torch.equal(getattr(want, n).long(), getattr(got, n).long())]
+    bad = [
+        n
+        for n in names
+        if not torch.equal(getattr(want, n).long(), getattr(got, n).long())
+    ]
     h = _head(epi)
     _CHECK["steps"] += 1
     _CHECK["same"] += not bad

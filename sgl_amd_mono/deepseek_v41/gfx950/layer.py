@@ -124,7 +124,13 @@ COMP_ARGS64 = (
     "comp_w", "comp_nw", "comp_freqs", "comp_req", "comp_loc", "comp_iloc", "comp_ring",
     "comp_pool", "comp_pool_stride", "comp_wk", "comp_kn", "comp_ipay", "comp_iscale",
 )  # fmt: skip
-COMP_ARGS32 = ("comp_loc_words", "comp_ring_size", "comp_block", "comp_eps", "comp_keps")
+COMP_ARGS32 = (
+    "comp_loc_words",
+    "comp_ring_size",
+    "comp_block",
+    "comp_eps",
+    "comp_keps",
+)
 NO_COMP = (0,) * (len(COMP_ARGS64) + len(COMP_ARGS32))
 
 
@@ -574,7 +580,9 @@ def build_mono_k1(key: MonoBuild):
                 mb_front.token_par_context(c, own_n, t0, rank, bases, sym + par, pl)
                 if const_expr(key.comp):
                     regions = ("crg", "cpg", "cig")
-                    c["comp_dsts"] = {r: [preg(b, pl[r], r) for b in bases] for r in regions}
+                    c["comp_dsts"] = {
+                        r: [preg(b, pl[r], r) for b in bases] for r in regions
+                    }
                     c["comp_srcs"] = {r: preg(sym + par, pl[r], r) for r in regions}
 
             def seam_slice():

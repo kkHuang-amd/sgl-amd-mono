@@ -29,7 +29,11 @@ class Case:
         per = vocab // tp
         self.start, self.width = rank * per, per
         # bf16 values: the shard case reads the same logits as the bf16 LM head output
-        target = (torch.randn(bs * slots, vocab, generator=g, device=device) * 4).bfloat16().float()
+        target = (
+            (torch.randn(bs * slots, vocab, generator=g, device=device) * 4)
+            .bfloat16()
+            .float()
+        )
         draft = target[: bs * slots].view(bs, slots, vocab)[:, :gamma] + torch.randn(
             bs, gamma, vocab, generator=g, device=device
         )
@@ -43,7 +47,9 @@ class Case:
         self.target, self.cand = target, cand
         self.shard = target[:, self.start : self.start + per].bfloat16().contiguous()
         self.draft = draft[:, :, self.start : self.start + per].contiguous()
-        temps = torch.tensor([1.0, 0.7, 1.3, 1.0, 0.9, 1.1, 1.0, 0.8] * 8, device=device)[:bs]
+        temps = torch.tensor(
+            [1.0, 0.7, 1.3, 1.0, 0.9, 1.1, 1.0, 0.8] * 8, device=device
+        )[:bs]
         self.temps = torch.zeros(bs, device=device) if greedy else temps
         self.sim_temps = self.temps.clone()
         self.sim_len = None
@@ -107,7 +113,9 @@ class Head:
         n = head.part_words(max_bs, slots, width)
         self.part = torch.empty(n, dtype=torch.float32, device=device)
         # the case's draft is read through draft_addr; this buffer only carries the layout
-        self.draft = torch.zeros(max_bs, slots - 1, width, dtype=torch.float32, device=device)
+        self.draft = torch.zeros(
+            max_bs, slots - 1, width, dtype=torch.float32, device=device
+        )
         self.draft_addr = torch.zeros(1, dtype=torch.int64, device=device)
         self.out = dict(
             correct=torch.zeros(max_bs, dtype=torch.int64, device=device),
@@ -135,7 +143,9 @@ class Head:
             self.ex.calls, self.ex.peers, self.ex.rank, 5.0,
         )  # fmt: skip
         bs = c.bs
-        return {k: o[k][:bs] for k in ("correct", "bonus", "commit", "new_seq", "tokens")}
+        return {
+            k: o[k][:bs] for k in ("correct", "bonus", "commit", "new_seq", "tokens")
+        }
 
 
 def same(a: dict, b: dict) -> list[str]:
@@ -179,9 +189,9 @@ def main() -> None:
                     else:
                         sampled_total += bs
                         sampled_agree += int(
-                            (want["correct"] == got["correct"]).logical_and(
-                                want["bonus"] == got["bonus"]
-                            ).sum()
+                            (want["correct"] == got["correct"])
+                            .logical_and(want["bonus"] == got["bonus"])
+                            .sum()
                         )
     # a graph replay: the call tags advance on the device
     c = Case(g, 8, S, V, rank, tp, device, greedy=False, sim_len=2, hit=0.7)

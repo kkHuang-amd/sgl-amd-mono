@@ -23,10 +23,10 @@ from .layer import (
     EPOCH_WORDS,
     HIDDEN,
     MAX_TOKENS,
+    NO_COMP,
     MonoBuild,
     build_mono_ffn,
     build_mono_k1,
-    NO_COMP,
     build_mono_k2,
     comp_fits,
     iw_split_fits,
@@ -66,6 +66,7 @@ def _report_index_check(exchange, rank: int, every_s: float = 60.0) -> None:
                 )  # fmt: skip
 
     threading.Thread(target=loop, name="index-split-check", daemon=True).start()
+
 
 __all__ = [
     "BLOCKS",
@@ -327,7 +328,9 @@ class DSV41MonoRunner:
         self.timeline_on = os.environ.get("SGLANG_AMD_MONO_TIMELINE") == "1"
         self.token_par_on = os.environ.get("SGLANG_AMD_MONO_TOKEN_PAR", "1") == "1"
         # timing only: an index source's K1 spins some CTAs (``layer.parse_delay``)
-        self.k1_delay = parse_delay(os.environ.get("SGLANG_AMD_MONO_DSV41_K1_DELAY", ""))
+        self.k1_delay = parse_delay(
+            os.environ.get("SGLANG_AMD_MONO_DSV41_K1_DELAY", "")
+        )
         # a KV source's ratio-2 compressor in K1 (``attention.compressor``), where it fits
         self.comp_on = (
             os.environ.get("SGLANG_AMD_MONO_DSV41_FUSED_COMPRESSOR", "0") == "1"
@@ -403,7 +406,9 @@ class DSV41MonoRunner:
         # SGLANG_AMD_MONO_DSV41_INDEX_SPLIT_CHECK=1: a replicated selection beside the split
         # one (``k2i_check``), compared row by row in the exchange
         # ("full": the split path scores every row too, isolating the reference and the exchange)
-        self.index_check_mode = os.environ.get("SGLANG_AMD_MONO_DSV41_INDEX_SPLIT_CHECK", "0")
+        self.index_check_mode = os.environ.get(
+            "SGLANG_AMD_MONO_DSV41_INDEX_SPLIT_CHECK", "0"
+        )
         self.index_check = self.index_check_mode in ("1", "full")
         self.k2i_check = None
         if self.index_split == "1" and tp >= INDEX_SPLIT_MIN_TP:
@@ -436,7 +441,9 @@ class DSV41MonoRunner:
     def set_deadline(self, seconds: float) -> None:
         """Every wait's deadline (below the server's watchdog timeout)."""
         ticks = guard.deadline_ticks(seconds)
-        exchange = getattr(self, "index_exchange", None)  # None before __init__ builds it
+        exchange = getattr(
+            self, "index_exchange", None
+        )  # None before __init__ builds it
         if exchange is not None:
             exchange.deadline_s = seconds
         lo = ticks & 0xFFFFFFFF
