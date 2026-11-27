@@ -27,6 +27,9 @@ SGLANG_READS = {
     "srt/models/deepseek_v4_dspark.py": (
         "DSparkV4MarkovHead",
         "compute_base_logits",
+        "collapse_hc_head",
+        "_use_fp32_lm_head",
+        "_opt_markov_w2_tp_shard",
         "markov_head",
         "markov_w1",
         "markov_w2",
@@ -39,7 +42,11 @@ SGLANG_READS = {
         "lm_head",
         "num_embeddings_per_partition",
     ),
-    "srt/models/dspark.py": ("vocab_shard",),
+    "srt/models/dspark.py": (
+        "vocab_shard",
+        "gather_and_crop_vocab",
+        "project_through_lm_head",
+    ),
     "srt/speculative/dspark_components/dspark_draft.py": (
         "draft_markov_block",
         "draft_markov_block(markov_head)",
@@ -162,7 +169,7 @@ class _Sampler:
 
     def step(self, hidden_states, anchor_tokens):
         """SGLang's base logits and Markov block of a bs-row draft block."""
-        base_logits, confidence_features = self.model.compute_base_logits(hidden_states)
+        base_logits, confidence_features = self._base_logits(hidden_states)
         bs = anchor_tokens.shape[0]
         base = base_logits.view(bs, self.gamma, -1)
         out = self.out[: bs * self.gamma]
@@ -171,6 +178,31 @@ class _Sampler:
             self.step_logits[:bs],
         )  # fmt: skip
         return out.view(bs, self.gamma), confidence_features
+
+    def _base_logits(self, hidden_states):
+        """``compute_base_logits``; from the draft forward's normed rows when it left them
+        (``draft.DRAFT_TAIL``) for these very rows."""
+        from sgl_amd_mono.deepseek_v41.draft import TAIL_KEY
+
+        model = self.model
+        tail = model.__dict__.get(TAIL_KEY)
+        if (
+            tail is None
+            or tail[0].data_ptr() != hidden_states.data_ptr()
+            or tail[0].numel() != hidden_states.numel()
+            or getattr(model, "_use_fp32_lm_head", False)
+        ):
+            return model.compute_base_logits(hidden_states)
+        from sglang.srt.models.dspark import (
+            gather_and_crop_vocab,
+            project_through_lm_head,
+        )
+
+        x_post_hc = model.collapse_hc_head(hidden_states)
+        logits = project_through_lm_head(tail[1].view_as(x_post_hc), model.lm_head)
+        if not model._opt_markov_w2_tp_shard:
+            logits = gather_and_crop_vocab(logits, model.lm_head)
+        return logits, x_post_hc
 
     def disagrees(self, max_bs: int) -> str | None:
         """Why the kernels' block is not SGLang's on random inputs, or None."""

@@ -173,6 +173,19 @@ def _load_tensor(copies: dict, model, name: str, tensor: torch.Tensor) -> None:
     copies["shared expert fp8", i, proj, m["kind"]] = shard.contiguous()
 
 
+# SGLANG_AMD_MONO_DSV41_DRAFT_TAIL=1: the last stage's post + combine and the draft's last norm in one launch
+TAIL_KEY = "_sgl_amd_mono_draft_tail"
+
+
+def _draft_tail() -> bool:
+    from sgl_amd_mono.deepseek_v41.glue import flag
+
+    return flag("SGLANG_AMD_MONO_DSV41_DRAFT_TAIL", "0")
+
+
+DRAFT_TAIL = _draft_tail()
+
+
 class _Draft:
     """One rank's draft monokernels: its runner, each stage's weights, the forward."""
 
@@ -211,7 +224,19 @@ class _Draft:
             # mhc_combine widens x on load: no f32 copy first
             x = mhc_combine(x.flatten(1), pre, lm.hc_mult, x.dtype)
         else:
-            _, x = fused.post_combine(self.stages[-1].module, pending, pre, lm.hc_mult)
+            got = None
+            if DRAFT_TAIL:
+                got = fused.post_combine_norm(
+                    self.stages[-1].module, pending, pre, lm.hc_mult, lm.stages[-1].norm
+                )
+            if got is None:
+                _, x = fused.post_combine(
+                    self.stages[-1].module, pending, pre, lm.hc_mult
+                )
+            else:
+                # the draft sampler's base logits read ``normed`` (``draft_sampler._Sampler.step``)
+                _, x, normed = got
+                lm.__dict__[TAIL_KEY] = (x, normed)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
 
